@@ -14,9 +14,14 @@ dependencies = []
 train = ["torch>=2.3"]
 
 [project.scripts]
+route-rl-export = "route_rl.submission:main"
+route-rl-submission-check = "route_rl.submission_check:main"
 route-rl-check = "route_rl.check:main"
 route-rl-train = "route_rl.training:main"
 route-rl-evaluate = "route_rl.evaluate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+route_rl = ["inference.c"]

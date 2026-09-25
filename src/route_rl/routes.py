@@ -1,225 +1,272 @@
-"""Small, executable, multi-turn routes. No future market-price oracle is used."""
+"""Autoregressive same-day planning with shared resource reservations."""
 from __future__ import annotations
-
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 
 CROPS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
-ANIMALS = {"GOOSE": ("COOP", 300), "COW": ("PASTURE", 400),
-           "SHEEP": ("PASTURE", 500)}
+SEED_COST = dict(zip(CROPS, (10, 20, 50, 100, 80)))
+FIRST_YIELD = dict(zip(CROPS, (2, 2, 8, 10, 10)))
+MAX_DAY = dict(zip(CROPS, (4, 3, 8, 10, 12)))
+MAX_YIELD = dict(zip(CROPS, (6, 4, 4, 4, 6)))
+ANIMALS = {"GOOSE": ("COOP", 300), "COW": ("PASTURE", 400), "SHEEP": ("PASTURE", 500)}
+PRODUCT = {"GOOSE": "EGG", "COW": "MILK", "SHEEP": "WOOL"}
+PRODUCTS = CROPS + ("EGG", "MILK", "WOOL", "FERTILIZER")
+ITEMS = PRODUCTS + tuple(ANIMALS)
 SHEDS = ((4, 4), (5, 4), (4, 5), (5, 5))
-FIRST_YIELD = {"WHEAT": 2, "CARROT": 2, "TOMATO": 8,
-               "STRAWBERRY": 10, "MELON": 10}
+MARKET_OPS = ("SELL", "BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "HIRE", "BUY_LAND")
+OPS = ("END", "WAIT", "HARVEST", "PLANT", "WATER", "FERTILIZE",
+       "COLLECT_FERTILIZER", "FEED", "CARE", "DIG", "BUILD_COOP",
+       "BUILD_PASTURE", "PICKUP", "PLACE", "DROP") + MARKET_OPS
 
+def farm_of(obs):
+    return obs["farms"][obs["player"]]
 
-@dataclass(frozen=True)
-class Stop:
-    pos: tuple[int, int]
-    op: tuple
+def tile_at(obs, pos):
+    return farm_of(obs)["tiles"][pos[1]][pos[0]]
 
-
-@dataclass(frozen=True)
-class Route:
-    actor: int
-    kind: str
-    stops: tuple[Stop, ...]
-    buy: tuple | None = None
-    sell: str | None = None
-
-    def distance(self, start):
-        total, at = 0, start
-        for stop in self.stops:
-            total += abs(at[0] - stop.pos[0]) + abs(at[1] - stop.pos[1]) + 1
-            at = stop.pos
-        return total
-
-
-def _tile(farm, pos):
-    return farm["tiles"][pos[1]][pos[0]]
-
-
-def _animal(tile):
+def animal(tile):
     return isinstance(tile, dict) and tile.get("animal") in ANIMALS
 
+def positions(obs):
+    farm = farm_of(obs)
+    return [tuple(farm["farmer"])] + [tuple(p) for p in farm["hands"]]
 
-def _ripe(tile, day):
-    if not isinstance(tile, dict) or tile.get("yield_units", 0) <= 0:
-        return False
-    if tile.get("kind") == "PLANT":
-        return day - tile.get("planted_day", day) >= FIRST_YIELD.get(tile.get("crop"), 99)
-    return _animal(tile)
+def ripe(tile, day):
+    return (isinstance(tile, dict) and tile.get("yield_units", 0) > 0 and
+            (animal(tile) or (tile.get("kind") == "PLANT" and
+             day - tile["planted_day"] >= FIRST_YIELD[tile["crop"]])))
 
+def cost(obs, op):
+    if op[0] == "BUY_SEED":
+        return SEED_COST[op[1]] * op[2]
+    if op[0] == "BUY_ANIMAL":
+        return ANIMALS[op[1]][1] * op[2]
+    if op[0] == "BUY_PRODUCT":
+        return max(1, obs["market"]["prices"].get(op[1], 1)) * op[2]
+    if op[0] == "HIRE":
+        a, b = 1, 1
+        for _ in range(farm_of(obs).get("hires_today", 0)):
+            a, b = b, a + b
+        return a
+    if op[0] == "BUY_LAND":
+        n = len(farm_of(obs)["unlocked_quadrants"]) - 1
+        return (1000, 2000, 4000)[n] if n < 3 else float("inf")
+    return 0
 
-def _owned(farm):
-    for y, row in enumerate(farm["tiles"]):
-        for x, tile in enumerate(row):
-            if tile != "LOCKED":
-                yield (x, y), tile
+@dataclass(frozen=True)
+class Job:
+    actor: int
+    pos: tuple[int, int]
+    op: tuple
+    id: int = -1
+    deps: tuple[int, ...] = ()
+    finish: int = 0
 
+    @property
+    def market(self):
+        return self.op[0] in MARKET_OPS
 
-def _nearest_shed(pos):
-    return min(SHEDS, key=lambda p: abs(pos[0] - p[0]) + abs(pos[1] - p[1]))
+def resources(job):
+    """Read/write locks serialize conflicting tasks, not independent travel."""
+    op = job.op[0]
+    keys = [("actor", job.actor)]
+    if op not in MARKET_OPS + ("END", "WAIT", "DROP", "PICKUP"):
+        keys.append(("tile", *job.pos))
+    if op in ("DROP", "PICKUP", "SELL", "BUY_PRODUCT", "BUY_ANIMAL"):
+        keys.append(("shed",))
+    if op in ("BUY_SEED", "PLANT"):
+        keys.append(("seed", job.op[1]))
+    if job.market:
+        keys.append(("cash",))
+    return keys
 
-
-def generate(obs, max_routes=24, cash_credit=0.0):
-    """Complete 2-4 stop programs; route zero is always the incumbent.
-
-    The actor chooses an entire sequence. Purchase/placement dependencies are
-    checked against observed inventory at execution time. Other workers keep
-    operating under the incumbent until a route for them is committed.
-    """
-    farm = obs["farms"][obs["player"]]
-    priv = obs["private"]
-    pos = [tuple(farm["farmer"])] + [tuple(p) for p in farm["hands"]]
-    bags = priv.get("inventories", [])
-    shed = priv.get("shed", {})
-    seeds = priv.get("seeds", {})
-    day = obs["day"]
-    money = farm["money"] + cash_credit
-    sites = list(_owned(farm))
-    empty = [p for p, t in sites if t is None]
-    crops = [(p, t) for p, t in sites if isinstance(t, dict) and t.get("kind") == "PLANT"]
-    animals = [(p, t) for p, t in sites if _animal(t)]
-    routes = [Route(-1, "BASELINE", ())]
-    pool = []
-
-    for actor, start in enumerate(pos):
-        bag = bags[actor] if actor < len(bags) else {}
-        local = []
-        # Harvest is followed by a new investment on the same freed plot,
-        # then a return to the shed. This includes the cash-turnover path.
-        for site, tile in sites:
-            if not _ripe(tile, day):
-                continue
-            product = tile.get("crop") if tile.get("kind") == "PLANT" else {
-                "GOOSE": "EGG", "COW": "MILK", "SHEEP": "WOOL"}.get(
-                    tile["animal"])
-            if product is None:
-                continue
-            base = (Stop(site, ("HARVEST",)),)
-            if tile.get("kind") == "PLANT" and tile.get("crop") in ("WHEAT", "CARROT", "MELON"):
-                for crop in CROPS:
-                    if day + FIRST_YIELD[crop] >= 30:
-                        continue
-                    buy = None if seeds.get(crop, 0) else ("BUY_SEED", crop, 1)
-                    if buy and money < 150 + {"WHEAT": 10, "CARROT": 20,
-                                               "TOMATO": 50, "STRAWBERRY": 100,
-                                               "MELON": 80}[crop]:
-                        continue
-                    stops = base + (Stop(site, ("PLANT", crop)), Stop(site, ("WATER",)),
-                                    Stop(_nearest_shed(site), ("DROP",)))
-                    local.append(Route(actor, "HARVEST_PLANT_" + crop, stops, buy, product))
-            local.append(Route(actor, "HARVEST_SELL", base +
-                               (Stop(_nearest_shed(site), ("DROP",)),), None, product))
-
-        # One animal and a nearby crop share one physical work trip. Fertilizer
-        # is collected before it is applied; no purchased fertilizer is assumed.
-        for a_pos, a in animals:
-            fert = a.get("fertilizer_available", 0)
-            nearby = sorted((p for p, c in crops
-                             if c.get("fertilized_until_day", -1) < day),
-                            key=lambda p: abs(p[0] - a_pos[0]) + abs(p[1] - a_pos[1]))
-            if fert and nearby:
-                crop_pos = nearby[0]
-                local.append(Route(actor, "MANURE_CROP", (
-                    Stop(a_pos, ("COLLECT_FERTILIZER",)),
-                    Stop(crop_pos, ("FERTILIZE",)),
-                    Stop(_nearest_shed(crop_pos), ("DROP",)))))
-            if not a.get("fed_today") and (bag.get("WHEAT", 0) or shed.get("WHEAT", 0)):
-                prefix = () if bag.get("WHEAT", 0) else (
-                    Stop(_nearest_shed(start), ("PICKUP", "WHEAT", 1)),)
-                local.append(Route(actor, "FEED_CARE", prefix + (
-                    Stop(a_pos, ("FEED",)), Stop(a_pos, ("CARE",)))))
-
-        # Empty land can receive any crop; select routes, not an irrevocable
-        # tile allocation. Expansion into animals includes the transport chain.
-        for site in empty:
-            for crop in CROPS:
-                if day + FIRST_YIELD[crop] >= 30:
-                    continue
-                buy = None if seeds.get(crop, 0) else ("BUY_SEED", crop, 1)
-                if buy and money < 150 + {"WHEAT": 10, "CARROT": 20,
-                                           "TOMATO": 50, "STRAWBERRY": 100,
-                                           "MELON": 80}[crop]:
-                    continue
-                local.append(Route(actor, "PLANT_" + crop, (
-                    Stop(site, ("PLANT", crop)), Stop(site, ("WATER",))), buy))
-            for animal, (structure, cost) in ANIMALS.items():
-                if day + {"GOOSE": 4, "COW": 8, "SHEEP": 6}[animal] >= 30:
-                    continue
-                buy = None if shed.get(animal, 0) or bag.get(animal, 0) else (
-                    "BUY_ANIMAL", animal, 1)
-                if buy and money < cost + 300:
-                    continue
-                pickup = () if bag.get(animal, 0) else (
-                    Stop(_nearest_shed(site), ("PICKUP", animal, 1)),)
-                local.append(Route(actor, "RAISE_" + animal, (
-                    Stop(site, ("BUILD_" + structure,)),) + pickup +
-                    (Stop(site, ("PLACE", animal)),), buy))
-
-        pool.extend(local)
-    # Keep a representative of each route type, then fill by walking cost.
-    # This preserves cow/sheep and every crop in the menu even on busy farms.
-    pool.sort(key=lambda r: (r.distance(pos[r.actor]), r.kind, r.actor))
-    seen = set()
-    for route in pool:
-        if route.kind not in seen and len(routes) < max_routes:
-            routes.append(route)
-            seen.add(route.kind)
-    for route in pool:
-        if len(routes) >= max_routes:
-            break
-        if route not in routes:
-            routes.append(route)
-    return routes
-
-
-def valid_stop(obs, route, index):
-    """Check the next job against the real post-step observation."""
-    if index >= len(route.stops):
-        return False
-    farm = obs["farms"][obs["player"]]
-    priv = obs["private"]
-    stop = route.stops[index]
-    op = stop.op[0]
-    tile = _tile(farm, stop.pos)
-    bag = priv.get("inventories", [])
-    bag = bag[route.actor] if route.actor < len(bag) else {}
-    if op == "HARVEST":
-        return _ripe(tile, obs["day"])
+def legal(obs, job):
+    farm, priv = farm_of(obs), obs["private"]
+    op = job.op[0]
+    bag, shed = priv["inventories"][job.actor], priv["shed"]
+    tile = tile_at(obs, job.pos)
+    if op in ("END", "WAIT"):
+        return True
+    if job.market:
+        if op == "SELL":
+            return job.op[1] in PRODUCTS and shed.get(job.op[1], 0) >= job.op[2]
+        return (farm["money"] >= cost(obs, job.op) and
+                (op not in ("BUY_PRODUCT", "BUY_ANIMAL") or sum(shed.values()) < 100))
+    if op == "DROP":
+        return job.pos in SHEDS and 0 < sum(bag.values()) <= 100 - sum(shed.values())
+    if op == "PICKUP":
+        return job.pos in SHEDS and shed.get(job.op[1], 0) >= job.op[2]
     if op == "PLANT":
-        return tile is None and priv.get("seeds", {}).get(stop.op[1], 0) > 0
-    if op == "WATER":
-        return isinstance(tile, dict) and tile.get("kind") == "PLANT" and not tile.get("watered_today")
-    if op == "FERTILIZE":
-        return isinstance(tile, dict) and tile.get("kind") == "PLANT" and bag.get("FERTILIZER", 0) > 0
-    if op == "COLLECT_FERTILIZER":
-        return _animal(tile) and tile.get("fertilizer_available", 0) > 0
-    if op == "FEED":
-        return _animal(tile) and not tile.get("fed_today") and bag.get("WHEAT", 0) > 0
-    if op == "CARE":
-        return _animal(tile) and not tile.get("cared_today")
+        return tile is None and priv["seeds"].get(job.op[1], 0) > 0
     if op.startswith("BUILD_"):
         return tile is None
-    if op == "PICKUP":
-        return priv.get("shed", {}).get(stop.op[1], 0) > 0
+    if op == "DIG":
+        return tile is not None and tile != "LOCKED" and not animal(tile)
+    if op == "HARVEST":
+        return ripe(tile, obs["day"])
     if op == "PLACE":
-        structure = ANIMALS[stop.op[1]][0]
-        return (isinstance(tile, dict) and tile.get("kind") == structure
-                and not tile.get("animal") and bag.get(stop.op[1], 0) > 0)
-    if op == "DROP":
-        return sum(bag.values()) > 0
-    return False
+        return (isinstance(tile, dict) and tile.get("kind") == ANIMALS[job.op[1]][0]
+                and not animal(tile) and bag.get(job.op[1], 0) > 0)
+    if op in ("WATER", "FERTILIZE"):
+        return (isinstance(tile, dict) and tile.get("kind") == "PLANT" and
+                (not tile.get("watered_today") if op == "WATER" else bag.get("FERTILIZER", 0) > 0))
+    if not animal(tile):
+        return False
+    if op == "FEED":
+        return not tile.get("fed_today") and bag.get("WHEAT", 0) > 0
+    if op == "CARE":
+        return not tile.get("cared_today")
+    return op == "COLLECT_FERTILIZER" and bool(tile.get("fertilizer_available"))
 
+def project(obs, job):
+    """Apply an immediate job to a private copy. Market cash is an estimate."""
+    farm, priv = farm_of(obs), obs["private"]
+    bag, shed = priv["inventories"][job.actor], priv["shed"]
+    op, tile = job.op[0], tile_at(obs, job.pos)
+    x, y = job.pos
+    if not job.market:
+        if job.actor == 0:
+            farm["farmer"] = list(job.pos)
+        else:
+            farm["hands"][job.actor - 1] = list(job.pos)
+    def add(inv, item, n):
+        inv[item] = inv.get(item, 0) + n
+    if op in ("END", "WAIT"):
+        return
+    if op == "SELL":
+        add(shed, job.op[1], -job.op[2])
+        farm["money"] += job.op[2] * obs["market"]["prices"].get(job.op[1], 1)
+    elif job.market:
+        farm["money"] -= cost(obs, job.op)
+        if op == "BUY_SEED":
+            add(priv["seeds"], job.op[1], job.op[2])
+        elif op in ("BUY_ANIMAL", "BUY_PRODUCT"):
+            add(shed, job.op[1], job.op[2])
+        # New workers / land become available only after actual receipt.
+    elif op == "DROP":
+        for item, n in bag.items():
+            add(shed, item, n)
+        bag.clear()
+    elif op == "PICKUP":
+        add(shed, job.op[1], -job.op[2])
+        add(bag, job.op[1], job.op[2])
+    elif op == "PLANT":
+        add(priv["seeds"], job.op[1], -1)
+        farm["tiles"][y][x] = dict(kind="PLANT", crop=job.op[1], planted_day=obs["day"],
+            yield_units=0 if job.op[1] in ("TOMATO", "STRAWBERRY") else 1,
+            watered_today=False, fertilized_until_day=-1, consecutive_unwatered=1)
+    elif op.startswith("BUILD_"):
+        farm["tiles"][y][x] = {"kind": op[6:]}
+    elif op == "DIG":
+        farm["tiles"][y][x] = None
+    elif op == "PLACE":
+        add(bag, job.op[1], -1)
+        tile.update(animal=job.op[1], placed_day=obs["day"], yield_units=0,
+                    fed_today=False, cared_today=False, fertilizer_available=False,
+                    consecutive_unfed=0, pending_care_bonus=0)
+    elif op == "HARVEST":
+        item = PRODUCT[tile["animal"]] if animal(tile) else tile["crop"]
+        add(bag, item, tile["yield_units"])
+        tile["yield_units"] = 0
+        if tile.get("kind") == "PLANT" and item not in ("TOMATO", "STRAWBERRY"):
+            farm["tiles"][y][x] = None
+    elif op == "WATER":
+        tile["watered_today"] = True
+        crop, age = tile["crop"], obs["day"] - tile["planted_day"]
+        if crop not in ("TOMATO", "STRAWBERRY") and (MAX_DAY[crop] + 1) // 2 <= age <= MAX_DAY[crop]:
+            bonus = 2 if tile.get("fertilized_until_day", -1) >= obs["day"] else 1
+            tile["yield_units"] = min(MAX_YIELD[crop], tile["yield_units"] + bonus)
+    elif op == "FERTILIZE":
+        add(bag, "FERTILIZER", -1)
+        tile["fertilized_until_day"] = max(tile.get("fertilized_until_day", -1), obs["day"] + 2)
+    elif op == "FEED":
+        add(bag, "WHEAT", -1)
+        tile["fed_today"] = True
+    elif op == "CARE":
+        tile["cared_today"] = True
+    elif op == "COLLECT_FERTILIZER":
+        tile["fertilizer_available"] = False
+        add(bag, "FERTILIZER", 1)
+
+class PlanningState:
+    def __init__(self, obs, horizon=24):
+        self.obs = copy.deepcopy(obs)
+        self.limit = min(horizon, 24 - obs["hour"], 719 - obs["step"])
+        self.elapsed = [0] * len(positions(obs))
+        self.ended, self.jobs, self.owners, self.expansion = set(), [], {}, set()
+        self.sale_credit = 0.0
+
+    def schedule(self, job):
+        deps = tuple(sorted({self.owners[k] for k in resources(job) if k in self.owners}))
+        start = positions(self.obs)[job.actor]
+        distance = 0 if job.market else abs(start[0] - job.pos[0]) + abs(start[1] - job.pos[1])
+        finish = max(self.elapsed[job.actor] + distance,
+                     max((self.jobs[d].finish for d in deps), default=0)) + 1
+        return replace(job, deps=deps, finish=finish)
+
+    def candidates(self, actor):
+        obs, start = self.obs, positions(self.obs)[actor]
+        candidates = [Job(actor, start, ("END",)), Job(actor, start, ("WAIT",))]
+        for y, row in enumerate(farm_of(obs)["tiles"]):
+            for x, tile in enumerate(row):
+                if tile is None:
+                    ops = [("PLANT", c) for c in CROPS] + [("BUILD_COOP",), ("BUILD_PASTURE",)]
+                elif isinstance(tile, dict) and tile.get("kind") == "PLANT":
+                    ops = [("WATER",), ("HARVEST",), ("FERTILIZE",), ("DIG",)]
+                elif animal(tile):
+                    ops = [("FEED",), ("CARE",), ("HARVEST",), ("COLLECT_FERTILIZER",)]
+                elif tile != "LOCKED":
+                    ops = [("DIG",)] + [("PLACE", a) for a in ANIMALS]
+                else:
+                    ops = []
+                candidates.extend(Job(actor, (x, y), op) for op in ops)
+        for pos in SHEDS:
+            candidates.append(Job(actor, pos, ("DROP",)))
+            for item, n in obs["private"]["shed"].items():
+                if n > 0:
+                    candidates.append(Job(actor, pos, ("PICKUP", item, 1)))
+                    if n > 1:
+                        candidates.append(Job(actor, pos, ("PICKUP", item, n)))
+        market = [("BUY_SEED", c, 1) for c in CROPS]
+        market += [("BUY_ANIMAL", a, 1) for a in ANIMALS]
+        market += [("BUY_PRODUCT", p, 1) for p in ("WHEAT", "FERTILIZER")]
+        for item, n in obs["private"]["shed"].items():
+            if item in PRODUCTS and n > 0:
+                market.append(("SELL", item, 1))
+                if n > 1:
+                    market.append(("SELL", item, n))
+        market += [(op,) for op in ("HIRE", "BUY_LAND") if op not in self.expansion]
+        candidates.extend(Job(actor, start, op) for op in market)
+        result = []
+        for job in candidates:
+            if legal(obs, job):
+                job = self.schedule(job)
+                if job.op[0] == "END" or job.finish <= self.limit:
+                    result.append(job)
+        return result
+
+    def commit(self, job):
+        if job.op[0] == "END":
+            self.ended.add(job.actor)
+            return
+        job = replace(job, id=len(self.jobs))
+        if job.op[0] == "SELL":
+            self.sale_credit += job.op[2] * self.obs["market"]["prices"].get(job.op[1], 1)
+        project(self.obs, job)
+        self.elapsed[job.actor] = job.finish
+        self.jobs.append(job)
+        for key in resources(job):
+            self.owners[key] = job.id
+        if job.op[0] in ("HIRE", "BUY_LAND"):
+            self.expansion.add(job.op[0])
+        if job.finish >= self.limit:
+            self.ended.add(job.actor)
 
 def command_toward(current, target):
     x, y = current
     tx, ty = target
-    if x < tx:
-        return ["EAST"]
-    if x > tx:
-        return ["WEST"]
-    if y < ty:
-        return ["SOUTH"]
-    if y > ty:
-        return ["NORTH"]
+    if x != tx:
+        return ["EAST" if x < tx else "WEST"]
+    if y != ty:
+        return ["SOUTH" if y < ty else "NORTH"]
     return None
