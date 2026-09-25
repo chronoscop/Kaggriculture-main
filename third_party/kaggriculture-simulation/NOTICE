@@ -1,0 +1,16 @@
+kaggriculture-simulation
+Copyright 2026 The kaggriculture-simulation contributors
+
+This product includes a Rust port of the Kaggriculture environment from
+kaggle-environments (https://github.com/Kaggle/kaggle-environments),
+Copyright 2020 Kaggle Inc, licensed under the Apache License, Version 2.0.
+The files under src-rust/kagg-engine/src/ are a derivative work of
+kaggle_environments/envs/kaggriculture/kaggriculture.py (release 1.32.7):
+the game rules, constants, price curves and step order are reproduced from
+it. kaggle-environments itself is not redistributed here; it is an optional
+dependency used only to verify fidelity.
+
+src-rust/kagg-engine/src/mt19937.rs is an independent Rust implementation of
+the Mersenne Twister MT19937 algorithm by Makoto Matsumoto and Takuji
+Nishimura (including the `init_by_array` seeding of mt19937ar), written to
+reproduce the output of CPython's `random` module bit for bit.

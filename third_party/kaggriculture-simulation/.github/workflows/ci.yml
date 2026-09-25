@@ -1,0 +1,125 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"   # nightly: large differential suite
+  workflow_dispatch:
+    inputs:
+      episodes:
+        description: "differential episodes"
+        default: "500"
+
+env:
+  CARGO_TERM_COLOR: always
+  # The Cargo workspace lives in src-rust/; build into the repo-level target/.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  # The pinned official engine the Rust port is certified against.
+  KAGGLE_ENVIRONMENTS_VERSION: "1.32.7"
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --manifest-path src-rust/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path src-rust/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-rust/Cargo.toml --all
+      - run: cargo build --manifest-path src-rust/Cargo.toml --release
+      - name: Scrub / secret audit
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/scrub_audit.py
+
+  python:
+    name: python differential (${{ matrix.os }}, py${{ matrix.python }})
+    needs: rust
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --manifest-path src-rust/Cargo.toml --release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the pinned official engine (import-only deps)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-deps "kaggle-environments==${{ env.KAGGLE_ENVIRONMENTS_VERSION }}"
+          python -m pip install jsonschema requests pytest
+          python -m pip install -e .
+      - name: Tests (engine hash pin enforced)
+        env:
+          KAGGSIM_REQUIRE_OFFICIAL: "1"
+          KAGGSIM_DIFF_EPISODES: "50"
+        run: python -m pytest -q
+
+  nightly-differential:
+    name: nightly differential (large)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --manifest-path src-rust/Cargo.toml --release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --no-deps "kaggle-environments==${{ env.KAGGLE_ENVIRONMENTS_VERSION }}"
+          python -m pip install jsonschema requests pytest
+      - name: Differential suite
+        env:
+          KAGGSIM_REQUIRE_OFFICIAL: "1"
+          KAGGSIM_DIFF_EPISODES: ${{ github.event.inputs.episodes || '500' }}
+          KAGGSIM_DIFF_BASE_SEED: ${{ github.run_number }}
+        run: python -m pytest -q tests/differential
+
+  release:
+    name: release binaries (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [rust, python]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, exe: kagg }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, exe: kagg.exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, exe: kagg }
+          - { os: macos-13, target: x86_64-apple-darwin, exe: kagg }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --manifest-path src-rust/Cargo.toml --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/${{ matrix.exe }} dist/
+          cp LICENSE NOTICE README.md dist/
+          cd dist && tar czf ../kagg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz *
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: kagg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz

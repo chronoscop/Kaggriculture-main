@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pt
+runs/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+third_party/kaggriculture-simulation/src-rust/target/
+third_party/kaggriculture-simulation/.pinwork/
+third_party/kaggriculture-simulation/.scratch/
+third_party/kaggriculture-simulation/tournaments/
+third_party/kaggriculture-simulation/selfplay/
+third_party/kaggriculture-simulation/gauntlets/

@@ -1,0 +1,14 @@
+[package]
+name = "kagg-sim"
+description = "Parallel tournaments, self-play and data export on the Kaggriculture engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "kagg_sim"
+path = "src/lib.rs"
+
+[dependencies]
+kagg-engine = { path = "../kagg-engine" }

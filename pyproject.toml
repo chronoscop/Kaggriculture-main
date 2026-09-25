@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaggriculture-route-rl"
+version = "0.1.0"
+description = "Route-level reinforcement learning scaffold for Kaggriculture"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+train = ["torch>=2.3"]
+
+[project.scripts]
+route-rl-check = "route_rl.check:main"
+route-rl-train = "route_rl.training:main"
+route-rl-evaluate = "route_rl.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

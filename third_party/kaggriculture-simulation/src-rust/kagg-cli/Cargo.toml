@@ -1,0 +1,15 @@
+[package]
+name = "kagg-cli"
+description = "kagg: batch rollouts, stdio serve env, episode digests and benchmarks on the Kaggriculture engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kagg"
+path = "src/main.rs"
+
+[dependencies]
+kagg-engine = { path = "../kagg-engine" }
+kagg-sim = { path = "../kagg-sim" }

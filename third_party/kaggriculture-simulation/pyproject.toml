@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaggsim"
+version = "0.1.0"
+description = "Python toolkit for the kagg Rust port of the Kaggle Kaggriculture engine: serve client, gym-style env, tapes, worlds, fidelity certifier"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/debmalyaroy/kaggriculture-simulation"
+Issues = "https://github.com/debmalyaroy/kaggriculture-simulation/issues"
+
+[project.optional-dependencies]
+# The official engine, needed only for fidelity checks, economy and forced.
+official = ["kaggle-environments==1.32.7"]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src-python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "official: needs the pinned official engine (kaggle-environments==1.32.7)",
+    "slow: long-running differential episodes",
+]

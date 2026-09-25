@@ -1,0 +1,15 @@
+/target/
+/src-rust/target/
+/.pinwork/
+/.scratch/
+__pycache__/
+*.pyc
+*.egg-info/
+/build/
+/dist/
+.pytest_cache/
+/.internal/
+/tournaments/
+/selfplay/
+/gauntlets/
+/.scrub_terms.txt
