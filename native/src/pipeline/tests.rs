@@ -680,7 +680,7 @@ fn profitable_experience_is_bounded_resumable_and_learned_separately() {
             Experience::from_episode(seed, 0, 100. + seed as f64, 3, &[row.clone()]).unwrap(),
         );
     }
-    assert_eq!(bank.episodes.len(), 2);
+    assert_eq!(bank.episodes.len(), 4);
     assert!(bank.episodes.len() <= CAPACITY);
     let j = bank.json();
     let restored = ExperienceBank::restore(&j).unwrap();
@@ -700,4 +700,184 @@ fn profitable_experience_is_bounded_resumable_and_learned_separately() {
         after > before,
         "successful action probability must increase"
     );
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn probe_assignment_covers_all_opponent_types_in_each_32_game_batch() {
+    use super::rollout::probe_schedule;
+    use crate::learning::policy::Rng;
+    for seed in 0..64 {
+        for offset in 0..4 {
+            let mask = probe_schedule(16, &mut Rng(seed));
+            let mut counts = [[0; 2]; 3];
+            for (i, probe) in mask.iter().enumerate() {
+                let kind = match (i + offset) % 4 {
+                    0 => 0,
+                    1 => 1,
+                    _ => 2,
+                };
+                counts[kind][usize::from(*probe)] += 2;
+            }
+            assert_eq!(counts, [[6, 2], [6, 2], [12, 4]]);
+        }
+        for size in 0..33 {
+            assert_eq!(
+                probe_schedule(size, &mut Rng(seed))
+                    .iter()
+                    .filter(|v| **v)
+                    .count(),
+                size / 4
+            );
+        }
+    }
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn competitive_pool_entry_does_not_replace_or_evict_champion() {
+    use super::league::{qualifies, qualifies_for_pool, League, Score, Snapshot, CAPACITY};
+    use kagg_engine::json::Json;
+    let champion = Score {
+        games: 8,
+        cash: 60000.,
+        margin: 54000.,
+        win_rate: 1.,
+        work: 800.,
+        harvest: 200.,
+        idle_fraction: 0.1,
+        inactive_games: 0,
+    };
+    let mut candidate = champion.clone();
+    candidate.margin -= 326.;
+    let mut duel = champion.clone();
+    duel.margin = 5026.;
+    duel.win_rate = 0.75;
+    assert!(!qualifies(&candidate, &champion, &duel));
+    assert!(qualifies_for_pool(&candidate, &duel));
+    duel.inactive_games = 1;
+    assert!(!qualifies_for_pool(&candidate, &duel));
+    let legacy = Json::Arr(vec![Json::Obj(vec![
+        ("iteration".into(), Json::Str("1025".into())),
+        ("weights".into(), Json::Obj(vec![])),
+    ])]);
+    let mut league = League::restore(&legacy).unwrap();
+    for iteration in 1026..1040 {
+        league.admit(
+            Snapshot {
+                iteration,
+                weights: Json::Obj(vec![]),
+            },
+            false,
+        );
+    }
+    assert_eq!(league.snapshots.len(), CAPACITY);
+    assert_eq!(league.snapshots[league.champion_index()].iteration, 1025);
+    let restored = League::restore(&league.json()).unwrap();
+    assert_eq!(restored.champion_iteration, 1025);
+    assert_eq!(restored.json(), league.json());
+    league.admit(
+        Snapshot {
+            iteration: 1040,
+            weights: Json::Obj(vec![]),
+        },
+        true,
+    );
+    assert_eq!(league.snapshots[league.champion_index()].iteration, 1040);
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn experience_retains_recent_routes_and_balances_opponent_sources() {
+    use crate::learning::{
+        experience::{Experience, ExperienceBank, PER_SOURCE},
+        policy::{Rng, Sample},
+    };
+    let mut row = Sample {
+        context: vec![0.; 96],
+        features: vec![vec![0.; 32]],
+        mc_return: 2.,
+        ..Sample::default()
+    };
+    row.features[0][31] = 2.;
+    let make = |seed: i64, source: &str, style: u32, profit: f64| {
+        let mut e = Experience::from_episode(seed, 0, profit, 2, &[row.clone()]).unwrap();
+        e.opponent = source.into();
+        e.style = style;
+        e.collected_iteration = seed as u64;
+        e.learner_seat = Some(0);
+        e.rows[0].context[0] = match source {
+            "heuristic" => 0.,
+            "historical" => 1.,
+            _ => 2.,
+        };
+        e
+    };
+    let mut bank = ExperienceBank::default();
+    for seed in 1..20 {
+        bank.insert(make(seed, "heuristic", 1, 10000. - seed as f64));
+    }
+    assert!(bank.episodes.iter().any(|e| e.seed == 1));
+    assert!(bank.episodes.iter().any(|e| e.seed == 19));
+    assert!(bank.episodes.iter().any(|e| e.seed == 18));
+    for style in 2..50 {
+        bank.insert(make(100 + style as i64, "heuristic", style, 100000.));
+    }
+    for seed in 200..208 {
+        bank.insert(make(seed, "historical", seed as u32, 100.));
+    }
+    for seed in 300..308 {
+        bank.insert(make(seed, "current", seed as u32, 100.));
+    }
+    assert!(
+        bank.episodes
+            .iter()
+            .filter(|e| e.opponent == "heuristic")
+            .count()
+            <= PER_SOURCE
+    );
+    assert_eq!(
+        bank.episodes
+            .iter()
+            .filter(|e| e.opponent == "historical")
+            .count(),
+        8
+    );
+    let mut counts = [0; 3];
+    for r in bank.sample(6000, &mut Rng(10)) {
+        counts[r.context[0] as usize] += 1;
+    }
+    assert!(
+        counts.iter().all(|n| (1700..2300).contains(n)),
+        "{counts:?}"
+    );
+    let mut a = make(999, "historical", 999, 100.);
+    bank.insert(a.clone());
+    a.learner_seat = Some(1);
+    bank.insert(a);
+    assert_eq!(bank.episodes.iter().filter(|e| e.seed == 999).count(), 2);
+    let restored = ExperienceBank::restore(&bank.json()).unwrap();
+    assert_eq!(bank.json(), restored.json());
+    assert_eq!(
+        bank.sample(10, &mut Rng(5))
+            .iter()
+            .map(Sample::json)
+            .collect::<Vec<_>>(),
+        restored
+            .sample(10, &mut Rng(5))
+            .iter()
+            .map(Sample::json)
+            .collect::<Vec<_>>()
+    );
+    let mut legacy = make(0, "heuristic", 1, 100.).json();
+    if let kagg_engine::json::Json::Obj(ref mut fields) = legacy {
+        fields.retain(|(k, _)| {
+            !["opponent", "learner_seat", "collected_iteration"].contains(&k.as_str())
+        });
+    }
+    let old = ExperienceBank::restore(&kagg_engine::json::Json::Arr(vec![legacy])).unwrap();
+    assert_eq!(old.episodes[0].opponent, "legacy");
+    assert_eq!(old.episodes[0].learner_seat, None);
+    bank.insert(old.episodes[0].clone());
+    assert!(!bank.episodes.iter().any(|e| e.opponent == "legacy"));
 }

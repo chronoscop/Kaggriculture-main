@@ -228,13 +228,22 @@ impl Game {
             let mut rows = std::mem::take(&mut self.rows[seat]);
             let cash = self.state.farms[seat].money;
             cash_returns(&mut rows, 719, (cash / 10000.) as f32, 0.997);
-            if let Some(e) = Experience::from_episode(
+            if let Some(mut e) = Experience::from_episode(
                 self.seed,
                 seat,
                 cash - 3000.,
                 self.agents[seat].stats.harvested_units,
                 &rows,
             ) {
+                e.learner_seat = Some(self.learner);
+                e.opponent = if seat != self.learner || self.opponent == Opponent::SelfPlay {
+                    "current"
+                } else if self.opponent == Opponent::Heuristic {
+                    "heuristic"
+                } else {
+                    "historical"
+                }
+                .into();
                 self.experiences.push(e);
             }
             if !self.greedy_probe && (seat == self.learner || self.opponent == Opponent::SelfPlay) {
@@ -414,6 +423,20 @@ pub fn collect_exploring(
         true,
     )
 }
+/// One probe per full block of four seed pairs. Across four blocks, each
+/// opponent-schedule residue gets exactly one probe (2/2/4 games at batch=32).
+pub(crate) fn probe_schedule(count: usize, rng: &mut Rng) -> Vec<bool> {
+    let mut mask = vec![false; count];
+    let mut residues = [0, 1, 2, 3];
+    for block in 0..count / 4 {
+        if block % 4 == 0 {
+            rng.shuffle(&mut residues);
+        }
+        mask[block * 4 + residues[block % 4]] = true;
+    }
+    mask
+}
+
 fn collect_impl(
     policy: &Policy,
     seeds: &[i64],
@@ -439,6 +462,11 @@ fn collect_impl(
     }
     let mut games = Vec::new();
     let offset = (rng.uniform() * 4.) as usize;
+    let probe_mask = if probes && !deterministic {
+        probe_schedule(seeds.len(), rng)
+    } else {
+        vec![false; seeds.len()]
+    };
     for (index, &seed) in seeds.iter().enumerate() {
         let selected = if opponent == Opponent::League {
             match (index + offset) % 4 {
@@ -454,7 +482,7 @@ fn collect_impl(
         };
         for seat in 0..2 {
             let mut game = Game::new(seed, seat, selected, record);
-            game.greedy_probe = probes && !deterministic && index % 4 == 3;
+            game.greedy_probe = probes && !deterministic && probe_mask[index];
             game.exploration = if deterministic || game.greedy_probe {
                 0.
             } else {

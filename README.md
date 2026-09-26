@@ -1,5 +1,7 @@
 # Kaggriculture：Rust 混合生产半 RL
 
+> 当前训练机制修订见 [经验与对手保留修订](docs/mixed_v7_retention.md)：对手入池与冠军分离、分组经验库、分层探测采样。下文原 v7 的容量与采样说明以修订文档为准；旧模型可续训。
+
 当前训练 pipeline：**mixed-production-v7**。Rust 采集、LibTorch CPU/CUDA 学习；farm2945 仅用于独立评估。
 
 ## 本版改动

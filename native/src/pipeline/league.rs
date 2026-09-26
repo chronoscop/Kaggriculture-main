@@ -3,13 +3,14 @@ use super::rollout::{self, Collection, Opponent};
 use crate::learning::policy::{Policy, Rng};
 use kagg_engine::json::Json;
 
-pub const CAPACITY: usize = 4;
+pub const CAPACITY: usize = 8;
 pub struct Snapshot {
     pub iteration: u64,
     pub weights: Json,
 }
 pub struct League {
     pub snapshots: Vec<Snapshot>,
+    pub champion_iteration: u64,
 }
 #[derive(Clone, Debug)]
 pub struct Score {
@@ -76,9 +77,19 @@ pub fn qualifies(candidate: &Score, champion: &Score, head_to_head: &Score) -> b
         && head_to_head.margin > 0.
         && head_to_head.win_rate > 0.5
 }
+/// Pool admission is separate from best-model promotion.
+pub fn qualifies_for_pool(candidate: &Score, duel: &Score) -> bool {
+    candidate.inactive_games == 0
+        && candidate.cash > 3000.
+        && duel.inactive_games == 0
+        && duel.cash > 3000.
+        && duel.margin > 0.
+        && duel.win_rate > 0.5
+}
 impl League {
     pub fn new(policy: &Policy) -> Result<Self, String> {
         Ok(Self {
+            champion_iteration: 0,
             snapshots: vec![Snapshot {
                 iteration: 0,
                 weights: policy.weights_json()?,
@@ -108,7 +119,25 @@ impl League {
                 weights: item.get("weights").clone(),
             });
         }
-        Ok(Self { snapshots })
+        let marked: Vec<_> = j
+            .arr()
+            .iter()
+            .filter(|s| s.get("champion").bool())
+            .collect();
+        if marked.len() > 1
+            || (marked.is_empty() && j.arr().iter().any(|s| !s.get("champion").is_null()))
+        {
+            return Err("invalid champion marker".into());
+        }
+        // Legacy v7 pools kept the champion last.
+        let champion_iteration = marked
+            .first()
+            .map(|s| s.get("iteration").str().parse::<u64>().unwrap())
+            .unwrap_or_else(|| snapshots.last().unwrap().iteration);
+        Ok(Self {
+            snapshots,
+            champion_iteration,
+        })
     }
     pub fn json(&self) -> Json {
         Json::Arr(
@@ -117,6 +146,10 @@ impl League {
                 .map(|s| {
                     Json::Obj(vec![
                         ("iteration".into(), Json::Str(s.iteration.to_string())),
+                        (
+                            "champion".into(),
+                            Json::Bool(s.iteration == self.champion_iteration),
+                        ),
                         ("weights".into(), s.weights.clone()),
                     ])
                 })
@@ -133,6 +166,26 @@ impl League {
             })
             .collect()
     }
+    pub fn champion_index(&self) -> usize {
+        self.snapshots
+            .iter()
+            .position(|s| s.iteration == self.champion_iteration)
+            .expect("champion must remain in training pool")
+    }
+    pub(crate) fn admit(&mut self, snapshot: Snapshot, promoted: bool) {
+        if promoted {
+            self.champion_iteration = snapshot.iteration;
+        }
+        self.snapshots.push(snapshot);
+        if self.snapshots.len() > CAPACITY {
+            let oldest = self
+                .snapshots
+                .iter()
+                .position(|s| s.iteration != self.champion_iteration)
+                .unwrap();
+            self.snapshots.remove(oldest);
+        }
+    }
     pub fn evaluate_and_promote(
         &mut self,
         candidate: &Policy,
@@ -143,7 +196,7 @@ impl League {
     ) -> Result<(bool, Json), String> {
         let started = std::time::Instant::now();
         let pool = self.policies(candidate.device)?;
-        let champion_index = pool.len() - 1;
+        let champion_index = self.champion_index();
         let champion_iteration = self.snapshots[champion_index].iteration;
         let anchor = |p: &Policy, deterministic: bool| -> Result<Score, String> {
             Ok(Score::from_collection(&rollout::collect(
@@ -170,14 +223,15 @@ impl League {
             false,
         )?);
         let promoted = qualifies(&greedy, &champion, &duel);
-        if promoted {
-            self.snapshots.push(Snapshot {
-                iteration,
-                weights: candidate.weights_json()?,
-            });
-            if self.snapshots.len() > CAPACITY {
-                self.snapshots.remove(0);
-            }
+        let admitted = promoted || qualifies_for_pool(&greedy, &duel);
+        if admitted {
+            self.admit(
+                Snapshot {
+                    iteration,
+                    weights: candidate.weights_json()?,
+                },
+                promoted,
+            );
         }
         Ok((
             promoted,
@@ -192,6 +246,7 @@ impl League {
                     Json::Num(champion_iteration as f64),
                 ),
                 ("promoted".into(), Json::Bool(promoted)),
+                ("pool_admitted".into(), Json::Bool(admitted)),
                 ("pool_size".into(), Json::Num(self.snapshots.len() as f64)),
                 ("greedy_vs_heuristic".into(), greedy.json()),
                 ("sampled_vs_heuristic".into(), stochastic.json()),

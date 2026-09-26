@@ -177,6 +177,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
 
         if !evaluate {
             let config = checkpoint.get("run");
+            if !config.get("training_revision").is_null()
+                && config.get("training_revision").str() != "v7-retention-2"
+            {
+                return Err("unsupported training revision; use a matching trainer".into());
+            }
             if config.get("seed").str() != seed.to_string()
                 || config.get("games_per_update").i64() != games as i64
                 || config.get("opponent").str() != opponent.name()
@@ -199,7 +204,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if first > iterations && !evaluate {
         return Err("iterations is cumulative and must exceed checkpoint iteration".into());
     }
-    let config=Json::Obj(vec![("schema".into(),Json::Str(pipeline::SCHEMA.into())),("seed".into(),Json::Str(seed.to_string())),("games_per_update".into(),Json::Num(games as f64)),("workers".into(),Json::Num(workers as f64)),("opponent".into(),Json::Str(opponent.name().into())),("epochs".into(),Json::Num(epochs as f64)),("batch_size".into(),Json::Num(batch as f64)),("eval_every".into(),Json::Num(eval_every as f64)),("eval_games".into(),Json::Num(eval_games as f64)),("eval_seed".into(),Json::Str(eval_seed.to_string())),("exploration".into(),Json::Num(exploration as f64)),("imitation_weight".into(),Json::Num(imitation_weight)),("greedy_probe_fraction".into(),Json::Num(0.25)),("gae_lambda_per_step".into(),Json::Num(0.997)),("reward".into(),Json::Str("actual own cash changes / 10000; gamma=1, time-aware GAE; terminal value=0".into())),("planner".into(),Json::Str("bounded mixed route insertion; committed production dispatch; rule sale settlement; learned project/route choices".into()))]);
+    let mut config=Json::Obj(vec![("schema".into(),Json::Str(pipeline::SCHEMA.into())),("seed".into(),Json::Str(seed.to_string())),("games_per_update".into(),Json::Num(games as f64)),("workers".into(),Json::Num(workers as f64)),("opponent".into(),Json::Str(opponent.name().into())),("epochs".into(),Json::Num(epochs as f64)),("batch_size".into(),Json::Num(batch as f64)),("eval_every".into(),Json::Num(eval_every as f64)),("eval_games".into(),Json::Num(eval_games as f64)),("eval_seed".into(),Json::Str(eval_seed.to_string())),("exploration".into(),Json::Num(exploration as f64)),("imitation_weight".into(),Json::Num(imitation_weight)),("greedy_probe_fraction".into(),Json::Num(0.25)),("gae_lambda_per_step".into(),Json::Num(0.997)),("reward".into(),Json::Str("actual own cash changes / 10000; gamma=1, time-aware GAE; terminal value=0".into())),("planner".into(),Json::Str("bounded mixed route insertion; committed production dispatch; rule sale settlement; learned project/route choices".into()))]);
+    config.set_path("training_revision", Json::Str("v7-retention-2".into()));
+    config.set_path("opponent_pool_capacity", Json::Num(8.));
+    config.set_path("experience_capacity", Json::Num(128.));
+    config.set_path(
+        "resume_from",
+        get("--resume")
+            .map(|s| Json::Str(s.into()))
+            .unwrap_or(Json::Null),
+    );
     write(&out.join("manifest.json"), &config)?;
     let mut metrics = OpenOptions::new()
         .append(true)
@@ -209,7 +223,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let eval_seeds: Vec<_> = (0..eval_games / 2)
         .map(|i| (eval_seed + i as u64) as i64)
         .collect();
-    // Frozen models stay on the coordinator device and are rebuilt only after promotion.
+    // Frozen models stay on the coordinator device and are rebuilt after pool admission.
     let mut pool = league.policies(device)?;
     for iteration in first..=if evaluate { first } else { iterations } {
         let seeds: Vec<_> = (0..games / 2)
@@ -250,7 +264,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         let mut imitation = (0, 0.);
         if !evaluate {
             for e in &result.experiences {
-                bank.insert(e.clone());
+                let mut e = e.clone();
+                e.collected_iteration = iteration as u64;
+                bank.insert(e);
             }
             let replay = bank.sample(batch.min(256), &mut rng);
             imitation = policy.imitate(&replay, imitation_weight)?;
@@ -278,7 +294,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
                 writeln!(evaluations, "{}", report.dump()).map_err(|e| e.to_string())?;
                 println!("{}", report.dump());
-                if promoted {
+                if report.get("pool_admitted").bool() {
                     pool = league.policies(device)?;
                 }
             }
@@ -325,6 +341,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 ),
             ),
             ("opponent_pool_before".into(), pool_before),
+            (
+                "training_revision".into(),
+                Json::Str("v7-retention-2".into()),
+            ),
+            (
+                "champion_iteration".into(),
+                Json::Num(league.champion_iteration as f64),
+            ),
+            ("experience_composition".into(), bank.summary()),
             ("samples".into(), Json::Num(result.samples.len() as f64)),
             ("rollout_seconds".into(), Json::Num(result.seconds)),
             (
