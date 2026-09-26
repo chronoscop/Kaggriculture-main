@@ -19,6 +19,59 @@ pub enum Choice {
         cost: f64,
     },
 }
+impl Choice {
+    /// Stable category ids are part of the policy/checkpoint contract.
+    pub fn category(&self, e: &Executor) -> usize {
+        match self {
+            Self::Continue => 0,
+            Self::Route { route, .. } => {
+                if route.crop_jobs > 0 && route.animal_jobs > 0 {
+                    if route.reused_fertilizer > 0 {
+                        14
+                    } else {
+                        11
+                    }
+                } else if route.replants > 0 {
+                    15
+                } else if route.harvested > 0 {
+                    if route.animal_jobs > 0 {
+                        13
+                    } else {
+                        12
+                    }
+                } else if route.crop_jobs > 0 {
+                    9
+                } else if route.animal_jobs > 0 {
+                    10
+                } else {
+                    8
+                }
+            }
+            Self::Invest {
+                site,
+                production,
+                orders,
+                ..
+            } => match production {
+                Some(Production::Vacant) => 5,
+                Some(kind) => {
+                    if site.and_then(|p| e.projects.get(&p)).is_some_and(|p| {
+                        p.production != Production::Vacant && &p.production != kind
+                    }) {
+                        4
+                    } else if matches!(kind, Production::Crop(_)) {
+                        2
+                    } else {
+                        3
+                    }
+                }
+                None if orders.iter().any(|o| o[0] == "HIRE") => 6,
+                None if orders.iter().any(|o| o[0] == "BUY_LAND") => 7,
+                None => 1,
+            },
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Problem {
     pub actor: Option<usize>,
@@ -42,9 +95,14 @@ impl Problem {
                 site,
                 production,
                 orders,
-                ..
+                cost,
             } => {
                 if let (Some(p), Some(kind)) = (site, production) {
+                    if *kind != Production::Vacant {
+                        e.expansion_spent += cost;
+                        e.new_projects_today += 1;
+                        e.stats.projects_requested += 1;
+                    }
                     e.projects.insert(
                         *p,
                         Project {
@@ -504,6 +562,12 @@ pub fn route_problem(o: &Observation, e: &Executor, actor: usize) -> Problem {
             }
         }
     }
+    // An approved project is a commitment: choose how to service it, not whether
+    // to silently abandon it. Continue remains legal only when no route can run.
+    // Investment decisions still permit waiting, switching production and exiting.
+    if choices.len() > 1 {
+        choices.remove(0);
+    }
     Problem {
         actor: Some(actor),
         choices,
@@ -556,9 +620,23 @@ pub fn investment_problem(o: &Observation, e: &Executor) -> Problem {
         }
         (total <= cash).then_some(total)
     };
-    let mut add = |site, production, orders: Vec<Vec<String>>| {
+    let pending_projects = e
+        .projects
+        .values()
+        .filter(|p| !p.confirmed && p.production != Production::Vacant)
+        .count();
+    let mut add = |site, production: Option<Production>, orders: Vec<Vec<String>>| {
         if orders.len() <= 10 {
             if let Some(cost) = funding(&orders) {
+                if production
+                    .as_ref()
+                    .is_some_and(|p| *p != Production::Vacant)
+                    && (pending_projects >= 2
+                        || e.new_projects_today >= 2
+                        || e.expansion_spent + cost > e.expansion_budget)
+                {
+                    return;
+                }
                 choices.push(Choice::Invest {
                     site,
                     production,
@@ -569,7 +647,7 @@ pub fn investment_problem(o: &Observation, e: &Executor) -> Problem {
         }
     };
     let load = e.labor_load();
-    let potential_workers = (load / 14 + 2).min(8);
+    let potential_workers = load.div_ceil(14).clamp(1, 8);
     if o.step % 24 <= 8 && o.farm.hands.len() + 1 < potential_workers && load > 0 {
         add(None, None, vec![vec!["HIRE".into()]]);
     }
@@ -610,7 +688,13 @@ pub fn investment_problem(o: &Observation, e: &Executor) -> Problem {
     for y in 0..10 {
         for x in 0..10 {
             let p = (x, y);
-            if reserved.contains(&p) {
+            if reserved.contains(&p)
+                || e.projects.get(&p).is_some_and(|pr| {
+                    !pr.confirmed
+                        && pr.production != Production::Vacant
+                        && o.step - pr.requested <= 24
+                })
+            {
                 continue;
             }
             match tile(&o.farm, p) {
@@ -705,7 +789,10 @@ pub fn investment_problem(o: &Observation, e: &Executor) -> Problem {
         }
     }
     for (p, project) in &e.projects {
-        if !reserved.contains(p) && project.production != Production::Vacant {
+        if !reserved.contains(p)
+            && project.production != Production::Vacant
+            && (project.confirmed || o.step - project.requested > 24)
+        {
             add(Some(*p), Some(Production::Vacant), vec![]);
         }
     }

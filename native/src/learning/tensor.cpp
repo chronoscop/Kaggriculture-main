@@ -81,6 +81,21 @@ Tensor* ft_op(int op,const Tensor* const* in,int count,const int64_t* ints,int n
  case 38:return new Tensor(a.reciprocal());
  case 39:return new Tensor(at::addcdiv(a,*in[1],*in[2],scalars[0]));
  case 40:return new Tensor(a.lerp(*in[1],scalars[0]));
+ // Hierarchical categorical distribution: category head and conditional candidates.
+ case 44:{
+ auto groups=*in[2];auto mask=*in[3];auto head=*in[1];
+ auto ids=at::arange(head.size(1),groups.options());
+ auto membership=groups.unsqueeze(-1).eq(ids).logical_and(mask.unsqueeze(-1));
+ auto legal=membership.any(1);
+ auto glp=head.masked_fill(legal.logical_not(),-1e9).log_softmax(-1);
+ auto expanded=a.unsqueeze(-1).expand_as(membership);
+ auto denom=expanded.masked_fill(membership.logical_not(),-1e9).logsumexp(1);
+ auto lp=a-denom.gather(1,groups)+glp.gather(1,groups);
+ return new Tensor(lp.masked_fill(mask.logical_not(),-1e9));
+ }
+ // Actual exploration behavior distribution; used identically at sampling and PPO update.
+ case 45:{auto q=*in[1];auto eps=*in[2];auto mask=*in[3];
+ return new Tensor(((1.-eps)*a.exp()+eps*q).clamp_min(1e-30).log().masked_fill(mask.logical_not(),-1e9));}
  case 41:return new Tensor(at::addcmul(a,*in[1],*in[2],scalars[0]));
  default:throw std::runtime_error("unknown tensor operation");
  }

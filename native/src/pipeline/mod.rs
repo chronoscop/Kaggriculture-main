@@ -4,8 +4,10 @@ pub mod executor;
 pub mod planner;
 #[cfg(feature = "train")]
 pub mod rollout;
-pub const SCHEMA: &str = "mixed-production-v5";
-pub const ENCODING: &str = "mixed-routes-96x32-v1";
+#[cfg(feature = "train")]
+pub mod league;
+pub const SCHEMA: &str = "mixed-production-v7";
+pub const ENCODING: &str = "mixed-routes-96x32-hierarchy-cash-v3";
 
 #[cfg(test)]
 mod tests;

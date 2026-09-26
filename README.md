@@ -1,74 +1,111 @@
-# Kaggriculture：独立 Rust 混合生产半 RL
+# Kaggriculture：Rust 混合生产半 RL
 
-当前唯一训练 pipeline：**mixed-production-v5**。
+当前训练 pipeline：**mixed-production-v7**。Rust 采集、LibTorch CPU/CUDA 学习；farm2945 仅用于独立评估。
 
-- 生产项目持续存在；项目生成任务，工人用连续路线服务多个动物与作物。
-- Rust 规划器模拟沿途背包变化，预留种子、物料和地格，核对实际执行回执。
-- RL 选择路线、生产项目、续种/转换、采购与雇工；销售结算目前使用规则。
-- Rust 多局采集 → GPU 批量推理 → PPO 更新 → 完整检查点，全程不调用 Python baseline。
-- `farm2945_resilient_response` 原版仅用于独立对战评估；旧 v4 和完整 baseline 移植链路已删除。
+## 本版改动
 
-## 构建与训练
+- **分层策略**：先选经营/路线类别，再选具体方案；随机训练与确定性执行使用相同分类。
+- **受控探索**：默认 `80% 当前策略 + 20% 生产类别均衡探索`，PPO 使用实际混合采样概率。等待保留为合法经营选项。
+- **投入与执行**：新建/转产项目每天最多 2 个、同时待启动最多 2 个，订单报价预算为当天开局现金的 25%。启动期保护最长 24 步，真实到货后调度。
+- **自生成成功经验**：约 25% 采集局使用确定性当前策略；它们与冻结历史模型的盈利轨迹可供独立辅助学习，不混入 PPO。
+- **真实现金回报**：按决策间隔记录实际现金变化和时间，用 GAE 计算目标；无开工、走路、采购次数奖励。
+- **稳定对手**：历史模型确定性执行；混合规则对手、当前模型和历史模型，定期验证后晋级。
 
-需要 Rust、C++17 编译器和匹配的 LibTorch；GPU 使用 CUDA 版 LibTorch。
-本机原生库默认位于 `/usr/local/lib/python3.12/dist-packages/torch`，可用 `LIBTORCH` 覆盖。
-没有 Python 训练进程；少量 C++ 桥接代码用于调用 LibTorch。
+## 构建
+
+需要 Rust、C++17 和匹配的 LibTorch；本机默认库目录为 `/usr/local/lib/python3.12/dist-packages/torch`。
+训练不启动 Python 解释器；C++ 桥接调用 LibTorch。
+
+本机 cargo 不在 PATH 时：
+
+```bash
+export PATH="/tmp/route-rl-rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH"
+export CARGO_HOME=/tmp/route-rl-cargo
+```
 
 ```bash
 cargo build --manifest-path native/Cargo.toml --release --features train --offline -j 4
-cargo test --manifest-path native/Cargo.toml --release --features train --offline -j 4
-
-native/target/release/mixed-train \
-  --out runs/mixed_v5_trial \
-  --iterations 5 --games-per-update 32 --workers 7 \
-  --device cuda --epochs 2 --batch-size 256 \
-  --seed 1200 --opponent heuristic
+ROUTE_RL_TEST_CUDA=1 cargo test --manifest-path native/Cargo.toml --release --features train --offline -j 4
 ```
 
-`iterations` 是累计更新次数，`games-per-update` 是实际完整对局数（同种子双座位，必须为偶数）。
-`--workers` 不传时自动读取容器 CPU 配额；本机约 7.65 核，默认 7。
-`--opponent selfplay` 可改成同一冻结采样策略的自对弈；两席样本均参与更新。
-当前默认轻量对手只是用于学习和调试，不代表强策略水平。
+## 短训练实验
 
-训练输出：`manifest.json`、`metrics.jsonl`、`latest.json`。
+**使用新目录，从头训练；v5/v6 检查点不兼容，请不要使用旧的 `--resume` 路径。**
 
 ```bash
 native/target/release/mixed-train \
-  --out runs/mixed_v5_trial --resume runs/mixed_v5_trial/latest.json \
-  --iterations 10 --games-per-update 32 --workers 7 \
-  --device cuda --epochs 2 --batch-size 256 \
-  --seed 1200 --opponent heuristic
+  --out runs/mixed_v7_trial \
+  --iterations 10 \
+  --games-per-update 32 \
+  --workers 7 \
+  --device cuda \
+  --epochs 2 \
+  --batch-size 256 \
+  --seed 1200 \
+  --opponent league \
+  --exploration 0.2 \
+  --imitation-weight 0.05 \
+  --eval-every 5 \
+  --eval-games 8 \
+  --eval-seed 1000000000
 ```
 
-继续训练必须保留 seed、对局数、对手、epochs 和 batch-size。
-检查点包括网络、Adam 动量、迭代数和 Rust 随机状态；旧 v4 权重不可使用。
+共 **10 轮、320 局采集**：每轮 24 局使用随机探索策略、8 局为确定性经验采集。确定性局不产生 PPO 样本。
+当前模型自对弈的随机局可使用双方样本；历史对手样本只进入独立经验筛选。
+第 5、10 轮各进行 32 局验证，额外共 64 局，不参与学习。
+`iterations` 为累计轮数；`games-per-update` 为完整对局数，同种子交换座位，必须为偶数。
+
+### 看哪些输出
+
+- `metrics.jsonl`：采集与更新耗时、每局现金/工作/收获、经营类别选择、等待概率、经验库和辅助更新统计。
+- `evaluations.jsonl`：固定验证种子的确定性/随机策略收益及冠军挑战结果。
+- `latest.json`：网络、Adam、训练随机状态、历史对手池、成功经验库，可直接续训。
+- `best.json`：仅在通过晋级时生成或替换；未生成表示尚未达标。
+
+重点关注：
+
+1. `greedy_vs_heuristic.mean_cash / mean_margin`：确定性执行是否赚钱。
+2. `sampled_vs_heuristic`：纯策略随机采样是否也改善；验证不添加 20% 探索分支。
+3. `inactive_games`、实际收获与 `projects_started`：有没有完成真实生产。
+4. `experience_episodes / imitation_samples`：是否产生了可用盈利经验并用于学习；经验库为空时辅助更新为 0。
+5. `games[].policy_wait_probability`：网络本身的等待概率，按座位统计；`selected_groups` 为实际类别次数。`greedy_probe=true` 的局要与随机局分开看。
+
+不能用 loss 或工作量代替实际收益。这里提供的是新训练机制，经济效果由短实验决定。
+
+### 续训
+
+确认短实验后，可以累计续到第 20 轮：
+
+```bash
+native/target/release/mixed-train \
+  --out runs/mixed_v7_trial --resume runs/mixed_v7_trial/latest.json \
+  --iterations 20 --games-per-update 32 --workers 7 \
+  --device cuda --epochs 2 --batch-size 256 \
+  --seed 1200 --opponent league \
+  --exploration 0.2 --imitation-weight 0.05 \
+  --eval-every 5 --eval-games 8 --eval-seed 1000000000
+```
+
+恢复时保留采集、探索、辅助学习和验证配置。辅助权重 0 可用于新 run 的关闭辅助学习实验，探索率 0 可用于新 run 的关闭额外探索实验。
 
 ## 独立评估
 
-先使用未见种子对轻量 Rust 对手评估：
+用未参与训练和晋级的新种子：
 
 ```bash
 native/target/release/mixed-train \
-  --mode evaluate --out runs/mixed_v5_eval \
-  --resume runs/mixed_v5_trial/latest.json \
-  --seed 9001 --games-per-update 4 --workers 4 --device cuda
+  --mode evaluate --opponent heuristic \
+  --out runs/mixed_v7_eval \
+  --resume runs/mixed_v7_trial/latest.json \
+  --seed 9001 --games-per-update 16 --workers 7 --device cuda
 ```
 
-对原版 farm2945 的评估单独调用 Python 客户端，不计入训练吞吐：
+原版 farm2945 只通过独立评估客户端运行：
 
 ```bash
 PYTHONPATH=src python -m route_rl.evaluate \
-  --checkpoint runs/mixed_v5_trial/latest.json \
-  --seeds 9001 9002 --out runs/mixed_v5_eval/farm2945.json
+  --checkpoint runs/mixed_v7_trial/latest.json \
+  --seeds 9001 9002 --out runs/mixed_v7_eval/farm2945.json
 ```
 
-原版位于 [agents/farm2945_resilient_response](agents/farm2945_resilient_response)，附来源和许可证。
-环境固定使用 `third_party/kaggriculture-simulation` 的 1.32.7 Rust 规则实现。
-
-## 目前验收范围
-
-已验证混合路线的收肥→施肥、收获→续种、真实返仓销售、任务互斥、缺货和仓库溢出保护。
-16 局 CUDA 并行验证已完成采集、更新和检查点保存，随后恢复训练再完成 16 局；CPU 自对弈与独立 farm2945 评估也已跑通。
-这说明执行和训练闭环可运行，**尚不代表经济表现达标或已超过 farm2945**。
-
-结构、约束和指标见 [pipeline 说明](docs/mixed_v5.md)；构建细节见 [native/README.md](native/README.md)。
+详细实现与限制见 [mixed_v7.md](docs/mixed_v7.md)，构建细节见 [native/README.md](native/README.md)。

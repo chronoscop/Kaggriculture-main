@@ -142,6 +142,8 @@ pub struct Stats {
     pub receipt_failures: u64,
     pub completed: u64,
     pub investments: u64,
+    pub projects_requested: u64,
+    pub projects_started: u64,
     pub expired_projects: u64,
     pub harvested_units: i64,
     pub sold_units: i64,
@@ -157,6 +159,9 @@ pub struct Executor {
     receipts: Vec<Receipt>,
     pub last_market: i64,
     pub last_cash: f64,
+    pub expansion_budget: f64,
+    pub expansion_spent: f64,
+    pub new_projects_today: usize,
 }
 impl Executor {
     pub fn new() -> Self {
@@ -193,6 +198,9 @@ impl Executor {
         if self.day != o.day() {
             self.day = o.day();
             self.routes.clear();
+            self.expansion_budget = o.farm.money.max(0.) * 0.25;
+            self.expansion_spent = 0.;
+            self.new_projects_today = 0;
         }
         self.routes.resize_with(o.farm.hands.len() + 1, || None);
         // Discover actual production; approved projects preserve their desired successor.
@@ -214,6 +222,9 @@ impl Executor {
                         failures: 0,
                     });
                     if entry.production == actual {
+                        if !entry.confirmed {
+                            self.stats.projects_started += 1;
+                        }
                         entry.confirmed = true;
                     }
                 }

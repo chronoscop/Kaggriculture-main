@@ -1,9 +1,10 @@
-//! Flat candidate policy and PPO for mixed production; no baseline KEEP gate.
+//! Hierarchical policy, explicit exploration behavior likelihood and native PPO.
 use super::tensor::{NoGrad, Tensor};
 use kagg_engine::json::Json;
 pub const CONTEXT: usize = 96;
 pub const CANDIDATE: usize = 32;
-const SPECS: [(&str, &[i64]); 14] = [
+pub const GROUPS: usize = 16;
+const SPECS: [(&str, &[i64]); 16] = [
     ("context.0.weight", &[64, 96]),
     ("context.0.bias", &[64]),
     ("context.2.weight", &[64, 64]),
@@ -18,6 +19,8 @@ const SPECS: [(&str, &[i64]); 14] = [
     ("value.0.bias", &[64]),
     ("value.2.weight", &[1, 64]),
     ("value.2.bias", &[1]),
+    ("group.weight", &[16, 64]),
+    ("group.bias", &[16]),
 ];
 pub struct Rng(pub u64);
 impl Rng {
@@ -116,7 +119,8 @@ impl Policy {
         let scores = self
             .linear(&self.linear(&joined, 6)?.unary(1)?, 8)?
             .dim(4, -1)?;
-        let lp = Tensor::operation(10, &[&scores, &b.mask.unary(8)?], &[], &[-1e9])?.dim(7, -1)?;
+        let head = self.linear(&z, 14)?;
+        let lp = Tensor::operation(44, &[&scores, &head, &b.groups, &b.mask], &[], &[])?;
         let value = self
             .linear(&self.linear(&z, 10)?.unary(1)?, 12)?
             .dim(4, -1)?;
@@ -134,19 +138,15 @@ impl Policy {
         let _guard = NoGrad::new();
         let batch = Batch::new(rows, self.device)?;
         let (lp, value) = self.forward(&batch)?;
-        let lp = lp.data()?;
+        let base = lp.data()?;
+        let behavior = self.behavior(&lp, &batch)?.data()?;
+        let lp = if deterministic { &base } else { &behavior };
         let values = value.data()?;
         let mut decisions = Vec::with_capacity(rows.len());
         for (i, row) in rows.iter().enumerate() {
             let probs = &lp[i * batch.width..i * batch.width + row.features.len()];
             let action = if deterministic {
-                let mut best = 0;
-                for k in 1..probs.len() {
-                    if probs[k] > probs[best] {
-                        best = k;
-                    }
-                }
-                best
+                hierarchical_argmax(probs, &row.features)
             } else {
                 let total = probs.iter().map(|x| f64::from(*x).exp()).sum::<f64>();
                 let pick = rng.uniform() * total;
@@ -165,9 +165,65 @@ impl Policy {
                 action,
                 logp: probs[action],
                 value: values[i],
+                wait_probability: row
+                    .features
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| f[31] == 0.)
+                    .map(|(k, _)| base[i * batch.width + k].exp())
+                    .sum(),
             });
         }
         Ok(decisions)
+    }
+    pub fn behavior(&self, lp: &Tensor, b: &Batch) -> Result<Tensor, String> {
+        Tensor::operation(45, &[lp, &b.proposal, &b.exploration, &b.mask], &[], &[])
+    }
+
+    /// Old self-generated experience has its own advantage-weighted imitation loss.
+    /// It never enters PPO ratios or the critic's on-policy regression.
+    pub fn imitate(&mut self, rows: &[Sample], coefficient: f64) -> Result<(usize, f64), String> {
+        if rows.is_empty() || coefficient == 0. {
+            return Ok((0, 0.));
+        }
+        let b = Batch::new(rows, self.device)?;
+        let (lp, value) = self.forward(&b)?;
+        let targets = Tensor::floats(
+            &rows.iter().map(|r| r.mc_return).collect::<Vec<_>>(),
+            &[rows.len() as i64],
+            self.device,
+            false,
+        )?;
+        let weight = Tensor::operation(
+            19,
+            &[&targets.binary(13, &value)?.unary(25)?],
+            &[],
+            &[0., 1.],
+        )?;
+        if weight.unary(18)?.value()? <= 0. {
+            return Ok((0, 0.));
+        }
+        let actions = Tensor::integers(
+            &rows.iter().map(|r| r.action as i64).collect::<Vec<_>>(),
+            &[rows.len() as i64, 1],
+            self.device,
+            false,
+        )?;
+        let selected = Tensor::operation(21, &[&lp, &actions], &[1], &[])?.dim(4, 1)?;
+        let loss = selected
+            .binary(14, &weight)?
+            .unary(18)?
+            .scalar(31, -coefficient)?;
+        let scalar = loss.value()?;
+        if !scalar.is_finite() {
+            return Err("non-finite imitation loss".into());
+        }
+        for p in &mut self.parameters {
+            p.value.zero_grad();
+        }
+        loss.backward()?;
+        self.adam()?;
+        Ok((rows.len(), scalar))
     }
     pub fn load_weights(&mut self, weights: &Json) -> Result<(), String> {
         for p in &mut self.parameters {
@@ -234,7 +290,7 @@ impl Policy {
         Ok(Json::Obj(vec![
             (
                 "schema".into(),
-                Json::Str("mixed-production-v5-ppo-v1".into()),
+                Json::Str("mixed-production-v7-ppo-v1".into()),
             ),
             (
                 "policy_contract".into(),
@@ -249,7 +305,7 @@ impl Policy {
         ]))
     }
     pub fn restore(&mut self, checkpoint: &Json) -> Result<(u64, Rng), String> {
-        if checkpoint.get("schema").str() != "mixed-production-v5-ppo-v1"
+        if checkpoint.get("schema").str() != "mixed-production-v7-ppo-v1"
             || checkpoint.get("policy_contract").str() != crate::pipeline::ENCODING
             || checkpoint.get("rng_algorithm").str() != "splitmix64"
         {
@@ -338,7 +394,8 @@ impl Policy {
         advantage: &Tensor,
     ) -> Result<Update, String> {
         let (lp, value) = self.forward(b)?;
-        let new = Tensor::operation(21, &[&lp, &actions.dim(3, 1)?], &[1], &[])?.dim(4, 1)?;
+        let behavior = self.behavior(&lp, b)?;
+        let new = Tensor::operation(21, &[&behavior, &actions.dim(3, 1)?], &[1], &[])?.dim(4, 1)?;
         let log_ratio = new.binary(13, old)?;
         let ratio = log_ratio.unary(16)?;
         let kl = ratio
@@ -429,7 +486,7 @@ impl Policy {
             false,
         )?;
         let mut adv = Tensor::floats(
-            &rows.iter().map(|r| r.reward - r.value).collect::<Vec<_>>(),
+            &rows.iter().map(|r| r.advantage).collect::<Vec<_>>(),
             &[rows.len() as i64],
             self.device,
             false,
@@ -473,6 +530,7 @@ impl Policy {
     }
 }
 pub struct Decision {
+    pub wait_probability: f32,
     pub action: usize,
     pub logp: f32,
     pub value: f32,
@@ -489,8 +547,15 @@ pub struct Metrics {
     pub mean_kl: f64,
     pub kl_stopped: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Sample {
+    pub exploration: f32,
+    pub step: i64,
+    pub cash: f32,
+    pub elapsed: i64,
+    pub cash_delta: f32,
+    pub advantage: f32,
+    pub mc_return: f32,
     pub context: Vec<f32>,
     pub features: Vec<Vec<f32>>,
     pub action: usize,
@@ -515,6 +580,27 @@ fn parse_floats(j: &Json) -> Result<Vec<f32>, String> {
         .collect()
 }
 impl Sample {
+    pub fn json(&self) -> Json {
+        let floats = |v: &[f32]| Json::Arr(v.iter().map(|&x| Json::Num(x as f64)).collect());
+        Json::Obj(vec![
+            ("context".into(), floats(&self.context)),
+            (
+                "features".into(),
+                Json::Arr(self.features.iter().map(|f| floats(f)).collect()),
+            ),
+            ("action".into(), Json::Num(self.action as f64)),
+            ("logp".into(), Json::Num(self.logp as f64)),
+            ("value".into(), Json::Num(self.value as f64)),
+            ("return".into(), Json::Num(self.reward as f64)),
+            ("exploration".into(), Json::Num(self.exploration as f64)),
+            ("step".into(), Json::Num(self.step as f64)),
+            ("cash".into(), Json::Num(self.cash as f64)),
+            ("elapsed".into(), Json::Num(self.elapsed as f64)),
+            ("cash_delta".into(), Json::Num(self.cash_delta as f64)),
+            ("advantage".into(), Json::Num(self.advantage as f64)),
+            ("mc_return".into(), Json::Num(self.mc_return as f64)),
+        ])
+    }
     pub fn parse(j: &Json) -> Result<Self, String> {
         let features = j
             .get("features")
@@ -523,7 +609,19 @@ impl Sample {
             .map(parse_floats)
             .collect::<Result<Vec<_>, _>>()?;
         let context = parse_floats(j.get("context"))?;
-        for key in ["action", "logp", "value", "return"] {
+        for key in [
+            "action",
+            "logp",
+            "value",
+            "return",
+            "exploration",
+            "step",
+            "cash",
+            "elapsed",
+            "cash_delta",
+            "advantage",
+            "mc_return",
+        ] {
             if !j.get(key).is_num() {
                 return Err(format!("missing numeric training field {key}"));
             }
@@ -548,10 +646,29 @@ impl Sample {
             logp: j.get("logp").f64() as f32,
             value: j.get("value").f64() as f32,
             reward: j.get("return").f64() as f32,
+            exploration: j.get("exploration").f64() as f32,
+            step: j.get("step").i64(),
+            cash: j.get("cash").f64() as f32,
+            elapsed: j.get("elapsed").i64(),
+            cash_delta: j.get("cash_delta").f64() as f32,
+            advantage: j.get("advantage").f64() as f32,
+            mc_return: j.get("mc_return").f64() as f32,
         };
-        if ![row.logp, row.value, row.reward]
-            .iter()
-            .all(|v| v.is_finite())
+        if !(0. ..=1.).contains(&row.exploration) || row.step < 0 || row.elapsed < 0 {
+            return Err("invalid sample time or exploration".into());
+        }
+        if ![
+            row.logp,
+            row.value,
+            row.reward,
+            row.exploration,
+            row.cash,
+            row.cash_delta,
+            row.advantage,
+            row.mc_return,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
         {
             return Err("non-finite training target".into());
         }
@@ -559,6 +676,9 @@ impl Sample {
     }
 }
 pub struct Batch {
+    pub groups: Tensor,
+    pub proposal: Tensor,
+    pub exploration: Tensor,
     pub context: Tensor,
     pub candidates: Tensor,
     pub mask: Tensor,
@@ -575,6 +695,9 @@ impl Batch {
         let mut context = Vec::with_capacity(n * CONTEXT);
         let mut candidates = vec![0.; n * width * CANDIDATE];
         let mut mask = vec![0; n * width];
+        let mut groups = vec![0; n * width];
+        let mut proposal = vec![0.; n * width];
+        let mut exploration = vec![0.; n];
         for (i, row) in rows.iter().enumerate() {
             if row.context.len() != CONTEXT
                 || row.features.is_empty()
@@ -582,14 +705,32 @@ impl Batch {
             {
                 return Err("invalid features".into());
             }
+            if !(0. ..=1.).contains(&row.exploration)
+                || row.features.iter().any(|f| {
+                    f[31] < 0.
+                        || f[31] >= GROUPS as f32
+                        || f[31].fract() != 0.
+                        || !f[31].is_finite()
+                })
+            {
+                return Err("invalid category or exploration probability".into());
+            }
+            let q = exploration_proposal(&row.features);
+            let has_proposal = q.iter().sum::<f32>() > 0.;
+            exploration[i] = if has_proposal { row.exploration } else { 0. };
             context.extend_from_slice(&row.context);
             for (j, feat) in row.features.iter().enumerate() {
                 let from = (i * width + j) * CANDIDATE;
                 candidates[from..from + CANDIDATE].copy_from_slice(feat);
                 mask[i * width + j] = 1;
+                groups[i * width + j] = feat[31] as i64;
+                proposal[i * width + j] = q[j];
             }
         }
         Ok(Self {
+            groups: Tensor::integers(&groups, &[n as i64, width as i64], device, false)?,
+            proposal: Tensor::floats(&proposal, &[n as i64, width as i64], device, false)?,
+            exploration: Tensor::floats(&exploration, &[n as i64, 1], device, false)?,
             context: Tensor::floats(&context, &[n as i64, CONTEXT as i64], device, false)?,
             candidates: Tensor::floats(
                 &candidates,
@@ -604,10 +745,70 @@ impl Batch {
     pub fn select(&self, indices: &Tensor) -> Result<Self, String> {
         let select = |t: &Tensor| Tensor::operation(22, &[t, indices], &[0], &[]);
         Ok(Self {
+            groups: select(&self.groups)?,
+            proposal: select(&self.proposal)?,
+            exploration: select(&self.exploration)?,
             context: select(&self.context)?,
             candidates: select(&self.candidates)?,
             mask: select(&self.mask)?,
             width: self.width,
         })
+    }
+}
+
+/// Uniform over productive categories, then uniform within each category.
+pub fn exploration_proposal(features: &[Vec<f32>]) -> Vec<f32> {
+    let mut counts = [0usize; GROUPS];
+    for f in features {
+        let g = f[31] as usize;
+        if matches!(g, 1..=4 | 8..=15) {
+            counts[g] += 1;
+        }
+    }
+    let present = counts.iter().filter(|&&n| n > 0).count();
+    features
+        .iter()
+        .map(|f| {
+            let n = counts[f[31] as usize];
+            if n == 0 {
+                0.
+            } else {
+                1. / (present * n) as f32
+            }
+        })
+        .collect()
+}
+pub fn hierarchical_argmax(logp: &[f32], features: &[Vec<f32>]) -> usize {
+    let mut mass = [0.; GROUPS];
+    for (lp, f) in logp.iter().zip(features) {
+        mass[f[31] as usize] += lp.exp();
+    }
+    let mut group = 0;
+    for g in 1..GROUPS {
+        if mass[g] > mass[group] {
+            group = g;
+        }
+    }
+    (0..features.len())
+        .filter(|&i| features[i][31] as usize == group)
+        .max_by(|&a, &b| logp[a].total_cmp(&logp[b]).then_with(|| b.cmp(&a)))
+        .unwrap()
+}
+/// Undiscounted money objective, with a trace decay measured in environment steps.
+/// Same-step investment/worker decisions have dt=0 and retain the full trace.
+pub fn cash_returns(rows: &mut [Sample], final_step: i64, final_cash: f32, lambda: f32) {
+    let (mut next_step, mut next_cash, mut next_value, mut next_adv) =
+        (final_step, final_cash, 0., 0.);
+    for r in rows.iter_mut().rev() {
+        r.elapsed = next_step - r.step;
+        r.cash_delta = next_cash - r.cash;
+        r.advantage =
+            r.cash_delta + next_value - r.value + lambda.powi(r.elapsed as i32) * next_adv;
+        r.reward = r.value + r.advantage;
+        r.mc_return = final_cash - r.cash;
+        next_step = r.step;
+        next_cash = r.cash;
+        next_value = r.value;
+        next_adv = r.advantage;
     }
 }

@@ -1,6 +1,6 @@
 # 原生混合生产 pipeline
 
-只保留 `mixed-production-v5`。旧 baseline 移植组件、组件测速命令及 v4 训练入口已删除。
+只保留 `mixed-production-v7`。旧 baseline 移植组件、组件测速命令及 v4 训练入口已删除。
 
 ## 构建
 
@@ -27,10 +27,10 @@ GPU 支持来自 CUDA 版 LibTorch，不再依赖此前市场测速的 NVRTC 内
 
 ## 入口
 
-- `mixed-train --help`：独立训练、恢复与轻量对手评估。
+- `mixed-train --help`：独立训练、历史对手池、晋级验证、恢复与评估。
 - `mixed-agent --checkpoint FILE`：逐行接收公开观测、输出动作；供外部对战评估。
 - `mixed-agent --checkpoint heuristic`：同一规划器的轻量规则选择器。
 
-完整命令见[主 README](../README.md)，实现与限制见 [mixed_v5.md](../docs/mixed_v5.md)。
+完整命令见[主 README](../README.md)，实现与限制见 [mixed_v7.md](../docs/mixed_v7.md)。
 生产训练不读取 `agents/`、farm2945 路线数据、原策略 Python 或旧运行轨迹。
 原版 farm2945 仅通过仓库外部评估客户端加载。

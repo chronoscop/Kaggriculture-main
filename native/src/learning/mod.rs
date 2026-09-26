@@ -1,3 +1,5 @@
-//! Native learning implementation; data generation must use the complete migrated policy.
+//! Native learning implementation; Rust rollouts feed on-policy PPO updates.
 pub mod policy;
 pub mod tensor;
+
+pub mod experience;

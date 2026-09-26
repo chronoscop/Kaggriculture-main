@@ -48,6 +48,7 @@ pub fn encode(o: &Observation, e: &Executor, p: &Problem) -> (Vec<f32>, Vec<Vec<
     for shop in kagg_engine::engine::SHOPS_SORTED {
         c.push(f32::from(o.shops.iter().any(|s| s == shop)));
     }
+    let actor_start = c.len();
     if let Some(actor) = p.actor {
         let at = pos(&o.farm, actor);
         c.extend([1., at.0 as f32 / 10., at.1 as f32 / 10.]);
@@ -55,12 +56,58 @@ pub fn encode(o: &Observation, e: &Executor, p: &Problem) -> (Vec<f32>, Vec<Vec<
             c.push(o.private.inventories[actor].get(item) as f32 / 30.);
         }
     }
+    c.resize(actor_start + 3 + PRODUCTS.len(), 0.);
+    // Remaining maturity and committed resources make future cash distinguishable.
+    for name in CROP_NAMES {
+        let first = kagg_engine::rules::crop(name).unwrap().first_yield_day;
+        let remaining = o
+            .farm
+            .tiles
+            .iter()
+            .flatten()
+            .filter_map(|t| match t {
+                Cell::Plant {
+                    crop, planted_day, ..
+                } if crop == name => Some((first - (o.day() - planted_day)).max(0)),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(30);
+        c.push(remaining as f32 / 30.);
+    }
+    for name in ANIMAL_NAMES {
+        let first = kagg_engine::rules::animal(name).unwrap().first_yield_day;
+        let remaining = o
+            .farm
+            .tiles
+            .iter()
+            .flatten()
+            .filter_map(|t| match t {
+                Cell::Structure {
+                    animal: Some(a), ..
+                } if a.animal == name => Some((first - (o.day() - a.placed_day)).max(0)),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(30);
+        c.push(remaining as f32 / 30.);
+    }
+    c.extend([
+        (e.expansion_budget - e.expansion_spent).max(0.) as f32 / 10000.,
+        e.projects
+            .values()
+            .filter(|p| !p.confirmed && p.production != Production::Vacant)
+            .count() as f32
+            / 2.,
+        e.new_projects_today as f32 / 2.,
+    ]);
     c.resize(96, 0.);
     let features = p
         .choices
         .iter()
         .map(|choice| {
             let mut f = vec![0.; 32];
+            f[31] = choice.category(e) as f32;
             match choice {
                 Choice::Continue => f[0] = 1.,
                 Choice::Route { actor, route } => {
@@ -135,7 +182,13 @@ pub fn encode(o: &Observation, e: &Executor, p: &Problem) -> (Vec<f32>, Vec<Vec<
                             f[9 + j] = f32::from(kind.name() == *name);
                         }
                         f[17] = f32::from(*kind == Production::Vacant);
-                        f[18] = o.market.prices.get(kind.name()) as f32 / 200.;
+                        let product = match kind.name() {
+                            "COW" => "MILK",
+                            "SHEEP" => "WOOL",
+                            "GOOSE" => "EGG",
+                            x => x,
+                        };
+                        f[18] = o.market.prices.get(product) as f32 / 200.;
                     }
                     f[19] = orders.iter().filter(|r| r[0] == "HIRE").count() as f32;
                     f[20] = f32::from(orders.iter().any(|r| r[0] == "BUY_LAND"));

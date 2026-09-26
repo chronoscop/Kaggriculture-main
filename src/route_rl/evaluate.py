@@ -1,4 +1,4 @@
-"""Independent held-out evaluation: native v5 agent versus the frozen farm2945 reference."""
+"""Independent held-out evaluation: native v7 agent versus the frozen farm2945 reference."""
 from __future__ import annotations
 import argparse, hashlib, json, selectors, subprocess, time
 from pathlib import Path
@@ -30,7 +30,7 @@ class NativeAgent:
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--checkpoint',required=True,help='native v5 checkpoint path, or heuristic')
+    p.add_argument('--checkpoint',required=True,help='native v7 checkpoint path, or heuristic')
     p.add_argument('--seeds',type=int,nargs='+',default=[9001,9002])
     p.add_argument('--out',type=Path,required=True)
     p.add_argument('--binary',type=Path,default=PROJECT_ROOT/'native/target/release/mixed-agent')
@@ -40,7 +40,7 @@ def main():
     checkpoint=a.checkpoint
     if checkpoint!='heuristic':
         path=Path(checkpoint).resolve();ck=json.loads(path.read_text())
-        if ck.get('schema')!='mixed-production-v5-ppo-v1':p.error('requires a v5 native checkpoint')
+        if ck.get('schema')!='mixed-production-v7-ppo-v1':p.error('requires a v7 native checkpoint')
         run=ck.get('run',{});start=int(run['seed']);count=int(ck['iteration'])*int(run['games_per_update'])//2
         if any(start<=seed<start+count for seed in a.seeds):p.error('evaluation seeds overlap recorded training seeds')
         checkpoint=str(path)
@@ -61,6 +61,6 @@ def main():
                     game=dict(seed=seed,seat=seat,own_cash=own,opponent_cash=other,margin=own-other,seconds=time.perf_counter()-started,native_agent_seconds=seconds[0],reference_agent_seconds=seconds[1])
                     games.append(game);print(json.dumps(game),flush=True)
                 finally:native.close()
-    report=dict(schema='mixed-production-v5-evaluation-v1',checkpoint=checkpoint,baseline_name=BASELINE_NAME,baseline_sha256=hashlib.sha256(BASELINE.read_bytes()).hexdigest(),games=games,mean_margin=sum(g['margin'] for g in games)/len(games),win_rate=sum(g['margin']>0 for g in games)/len(games))
+    report=dict(schema='mixed-production-v7-evaluation-v1',checkpoint=checkpoint,baseline_name=BASELINE_NAME,baseline_sha256=hashlib.sha256(BASELINE.read_bytes()).hexdigest(),games=games,mean_margin=sum(g['margin'] for g in games)/len(games),win_rate=sum(g['margin']>0 for g in games)/len(games))
     a.out.parent.mkdir(parents=True,exist_ok=True);a.out.write_text(json.dumps(report,indent=2)+'\n')
 if __name__=='__main__':main()

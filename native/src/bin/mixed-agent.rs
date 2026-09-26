@@ -58,6 +58,7 @@ fn run() -> Result<(), String> {
                             logp: 0.,
                             value: 0.,
                             reward: 0.,
+                            ..Sample::default()
                         }],
                         true,
                         &mut rng,

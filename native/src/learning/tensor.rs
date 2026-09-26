@@ -67,7 +67,10 @@ impl Drop for NoGrad {
     }
 }
 pub fn threads(n: i32) {
-    unsafe { ft_threads(n) }
+    // LibTorch inter-op configuration is process-global and may only be set once.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    assert!(n > 0);
+    INIT.call_once(|| unsafe { ft_threads(n) });
 }
 impl Tensor {
     fn own(raw: Raw) -> Result<Self, String> {
@@ -132,6 +135,7 @@ impl Tensor {
         scalars: &[f64],
     ) -> Result<Self, String> {
         let (arity, ni, ns) = match code {
+            44 | 45 => (4, 0, 0),
             0 | 11 => (3, 0, 0),
             2 => (inputs.len(), 1, 0),
             3 | 4 | 7 | 9 | 23 | 42 => (1, 1, 0),
