@@ -1,0 +1,18 @@
+[package]
+name = "route-rl-native"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Independent mixed-production half-RL pipeline"
+
+[features]
+default = []
+train = []
+
+[dependencies]
+kagg-engine = { path = "../third_party/kaggriculture-simulation/src-rust/kagg-engine" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

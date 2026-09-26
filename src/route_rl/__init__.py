@@ -1,1 +1,1 @@
-"""Baseline-preserving local economic RL against the pinned Kaggriculture engine."""
+"""Independent native mixed-production RL; Python hosts reference evaluation only."""

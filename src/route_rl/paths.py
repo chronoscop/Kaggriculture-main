@@ -6,7 +6,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SIM_ROOT = PROJECT_ROOT / "third_party" / "kaggriculture-simulation"
-BASELINE = PROJECT_ROOT / "agents" / "baseline.py"
+BASELINE_NAME = "farm2945_resilient_response"
+BASELINE_ROOT = PROJECT_ROOT / "agents" / BASELINE_NAME
+BASELINE = BASELINE_ROOT / "main.py"
 RUNS = PROJECT_ROOT / "runs"
 
 

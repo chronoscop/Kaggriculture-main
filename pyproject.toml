@@ -4,22 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kaggriculture-route-rl"
-version = "0.1.0"
-description = "Baseline-preserving local economic reinforcement learning for Kaggriculture"
+version = "0.5.0"
+description = "Independent Rust mixed-production RL; Python evaluation client only"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
-[project.optional-dependencies]
-train = ["torch>=2.3"]
-
 [project.scripts]
-route-rl-export = "route_rl.submission:main"
-route-rl-submission-check = "route_rl.submission_check:main"
-route-rl-check = "route_rl.check:main"
-route-rl-train = "route_rl.training:main"
 route-rl-evaluate = "route_rl.evaluate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

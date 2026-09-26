@@ -1,0 +1,10 @@
+{
+  "name": "farm2945_resilient_response",
+  "archive": "agents/submission_farm2945_resilient_response.tar.gz",
+  "notebook": "agents/farm2945_resilient_response.ipynb",
+  "sha256": {
+    "main.py": "afae271aae1702a566066483ea7f1b173dad85a720578b806950df65b20424f3",
+    "LICENSE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "NOTICE.txt": "f124061e424eb0db883b8cbe45f549cb603aa11d7cc45a32369782b0c16b2903"
+  }
+}

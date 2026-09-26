@@ -14,3 +14,4 @@ third_party/kaggriculture-simulation/tournaments/
 third_party/kaggriculture-simulation/selfplay/
 third_party/kaggriculture-simulation/gauntlets/
 replay/
+native/target/
