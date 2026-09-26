@@ -1,1 +1,1 @@
-"""Local route-policy training against the pinned Kaggriculture engine."""
+"""Baseline-preserving local economic RL against the pinned Kaggriculture engine."""

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kaggriculture-route-rl"
 version = "0.1.0"
-description = "Route-level reinforcement learning scaffold for Kaggriculture"
+description = "Baseline-preserving local economic reinforcement learning for Kaggriculture"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
@@ -23,5 +23,3 @@ route-rl-evaluate = "route_rl.evaluate:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-route_rl = ["inference.c"]
