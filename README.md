@@ -68,7 +68,7 @@ PYTHONPATH=src python -m route_rl.evaluate \
 ## 目前验收范围
 
 已验证混合路线的收肥→施肥、收获→续种、真实返仓销售、任务互斥、缺货和仓库溢出保护。
-两局完整 CUDA 冒烟已完成采集、更新和检查点保存。
+16 局 CUDA 并行验证已完成采集、更新和检查点保存，随后恢复训练再完成 16 局；CPU 自对弈与独立 farm2945 评估也已跑通。
 这说明执行和训练闭环可运行，**尚不代表经济表现达标或已超过 farm2945**。
 
 结构、约束和指标见 [pipeline 说明](docs/mixed_v5.md)；构建细节见 [native/README.md](native/README.md)。
