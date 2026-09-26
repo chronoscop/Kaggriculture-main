@@ -75,7 +75,7 @@ fn run() -> Result<(), String> {
         .unwrap_or("1200")
         .parse::<u64>()
         .map_err(|_| "invalid seed")?;
-    if seed > i64::MAX as u64 - iterations as u64 * games as u64 {
+    if seed as u128 + iterations as u128 * games as u128 > i64::MAX as u128 {
         return Err("seed overflow".into());
     }
     let device = match get("--device").unwrap_or("cuda") {
@@ -98,10 +98,16 @@ fn run() -> Result<(), String> {
         "evaluate" => true,
         _ => return Err("invalid mode".into()),
     };
+    if evaluate && get("--resume").is_none() {
+        return Err("evaluation requires --resume CHECKPOINT".into());
+    }
     let out = PathBuf::from(get("--out").ok_or(help)?);
     fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     if out.join("metrics.jsonl").exists() && get("--resume").is_none() {
         return Err("output already contains a run; use --resume or a new directory".into());
+    }
+    if evaluate && out.join("metrics.jsonl").exists() {
+        return Err("use a fresh evaluation output directory".into());
     }
     tensor::threads(1);
     let mut policy = Policy::mixed_routes(device, seed, 1e-4)?;
@@ -110,6 +116,20 @@ fn run() -> Result<(), String> {
     if let Some(path) = get("--resume") {
         let checkpoint = json::parse(&fs::read_to_string(path).map_err(|e| e.to_string())?)?;
         let (iteration, saved_rng) = policy.restore(&checkpoint)?;
+        if evaluate {
+            let config = checkpoint.get("run");
+            let start = config
+                .get("seed")
+                .str()
+                .parse::<u64>()
+                .map_err(|_| "checkpoint lacks training seed provenance")?;
+            let count = (iteration as u128) * (config.get("games_per_update").i64() as u128) / 2;
+            let end = start as u128 + count;
+            if (seed as u128) < end && (seed as u128 + games as u128 / 2) > start as u128 {
+                return Err("evaluation seeds overlap training seeds".into());
+            }
+        }
+
         if !evaluate {
             let config = checkpoint.get("run");
             if config.get("seed").str() != seed.to_string()
