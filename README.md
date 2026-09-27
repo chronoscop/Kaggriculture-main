@@ -1,12 +1,14 @@
 # Kaggriculture：Rust 混合生产半 RL
 
-> 当前版本：[独立策略与价值网络](docs/mixed_v7_independent.md)（v7-independent-6）。从零训练，策略/价值参数和梯度裁剪分别处理。旧共享网络检查点不兼容。
+> 当前版本：[可学习市场决策](docs/mixed_v8_market.md)（v8-market-3）。模型学习商品优先顺序、按实际预算选择交易数量，并结合对手成熟时间、种养变化响应市场与资金事件；独立策略/价值网络。支持规则交易对照和两个检查点直接对战。
 
 对手与探索沿用 [PFSP](docs/mixed_v7_pfsp.md) 和 [分对局探索](docs/mixed_v7_exploration.md)；成功经验沿用 [受保护经验](docs/mixed_v7_league.md)。历史文档中的旧检查点续训命令不适用于当前版本。
 
-当前训练 pipeline：**mixed-production-v7**。Rust 采集、LibTorch CPU/CUDA 学习；farm2945 仅用于独立评估。
+当前训练 pipeline：**mixed-production-v8**。Rust 采集、LibTorch CPU/CUDA 学习；farm2945 仅用于独立评估。
 
 ## 本版改动
+
+- **市场决策**：`--market-mode learned` 学买卖与持有；`rule` 为规则交易对照。新增市场历史、资金需求及对手公开产量特征。完整两组实验命令见 [v8 文档](docs/mixed_v8_market.md)。
 
 - **分层策略**：先选经营/路线类别，再选具体方案；随机训练与确定性执行使用相同分类。
 - **受控探索**：每 32 局含 18 局纯策略随机、6 局 `80% 当前策略 + 20% 生产类别均衡探索`、8 局确定性探测，PPO 使用实际采样概率。等待保留为合法经营选项。
@@ -34,11 +36,11 @@ ROUTE_RL_TEST_CUDA=1 cargo test --manifest-path native/Cargo.toml --release --fe
 
 ## 短训练实验
 
-**使用新目录，从头训练；旧共享网络检查点（包括 v7-pfsp-5）不兼容。只有本版本新训练生成的检查点可以续训。**
+**使用新目录，从头训练；旧 v7 检查点（包括独立网络 v7-independent-6）和 v8-market-1 / v8-market-2 检查点不兼容。只有本版本新训练生成的检查点可以续训。**
 
 ```bash
 native/target/release/mixed-train \
-  --out runs/mixed_v7_independent_trial \
+  --out runs/mixed_v8_market3_learned_trial \
   --iterations 10 \
   --games-per-update 32 \
   --workers 7 \
@@ -47,6 +49,7 @@ native/target/release/mixed-train \
   --batch-size 256 \
   --seed 1200 \
   --opponent league \
+  --market-mode learned \
   --exploration 0.2 \
   --imitation-weight 0.05 \
   --eval-every 5 \
@@ -82,10 +85,11 @@ native/target/release/mixed-train \
 
 ```bash
 native/target/release/mixed-train \
-  --out runs/mixed_v7_independent_trial --resume runs/mixed_v7_independent_trial/latest.json \
+  --out runs/mixed_v8_market3_learned_trial --resume runs/mixed_v8_market3_learned_trial/latest.json \
   --iterations 20 --games-per-update 32 --workers 7 \
   --device cuda --epochs 2 --batch-size 256 \
   --seed 1200 --opponent league \
+  --market-mode learned \
   --exploration 0.2 --imitation-weight 0.05 \
   --eval-every 5 --eval-games 8 --eval-seed 1000000000
 ```
@@ -100,7 +104,7 @@ native/target/release/mixed-train \
 native/target/release/mixed-train \
   --mode evaluate --opponent heuristic \
   --out runs/mixed_v7_eval \
-  --resume runs/mixed_v7_independent_trial/latest.json \
+  --resume runs/mixed_v8_market3_learned_trial/latest.json \
   --seed 9001 --games-per-update 16 --workers 7 --device cuda
 ```
 
@@ -108,7 +112,7 @@ native/target/release/mixed-train \
 
 ```bash
 PYTHONPATH=src python -m route_rl.evaluate \
-  --checkpoint runs/mixed_v7_independent_trial/latest.json \
+  --checkpoint runs/mixed_v8_market3_learned_trial/latest.json \
   --seeds 9001 9002 --out runs/mixed_v7_eval/farm2945.json
 ```
 

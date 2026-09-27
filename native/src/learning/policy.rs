@@ -1,11 +1,11 @@
 //! Hierarchical policy, explicit exploration behavior likelihood and native PPO.
 use super::tensor::{NoGrad, Tensor};
 use kagg_engine::json::Json;
-pub const CONTEXT: usize = 96;
+pub const CONTEXT: usize = crate::pipeline::CONTEXT;
 pub const CANDIDATE: usize = 32;
-pub const GROUPS: usize = 16;
+pub const GROUPS: usize = crate::pipeline::GROUPS;
 const SPECS: [(&str, &[i64]); 20] = [
-    ("context.0.weight", &[64, 96]),
+    ("context.0.weight", &[64, CONTEXT as i64]),
     ("context.0.bias", &[64]),
     ("context.2.weight", &[64, 64]),
     ("context.2.bias", &[64]),
@@ -19,9 +19,9 @@ const SPECS: [(&str, &[i64]); 20] = [
     ("value.0.bias", &[64]),
     ("value.2.weight", &[1, 64]),
     ("value.2.bias", &[1]),
-    ("group.weight", &[16, 64]),
-    ("group.bias", &[16]),
-    ("critic_context.0.weight", &[64, 96]),
+    ("group.weight", &[GROUPS as i64, 64]),
+    ("group.bias", &[GROUPS as i64]),
+    ("critic_context.0.weight", &[64, CONTEXT as i64]),
     ("critic_context.0.bias", &[64]),
     ("critic_context.2.weight", &[64, 64]),
     ("critic_context.2.bias", &[64]),
@@ -64,6 +64,7 @@ pub struct Policy {
     pub parameters: Vec<Parameter>,
     pub device: i32,
     pub lr: f64,
+    pub market_mode: crate::pipeline::trading::MarketMode,
 }
 impl Policy {
     pub fn mixed_routes(device: i32, seed: u64, lr: f64) -> Result<Self, String> {
@@ -99,6 +100,7 @@ impl Policy {
             parameters,
             device,
             lr,
+            market_mode: Default::default(),
         })
     }
     fn linear(&self, x: &Tensor, index: usize) -> Result<Tensor, String> {
@@ -298,7 +300,7 @@ impl Policy {
         Ok(Json::Obj(vec![
             (
                 "schema".into(),
-                Json::Str("mixed-production-v7-ppo-v1".into()),
+                Json::Str("mixed-production-v8-ppo-v1".into()),
             ),
             (
                 "policy_contract".into(),
@@ -308,16 +310,20 @@ impl Policy {
             ("rng".into(), Json::Str(rng.0.to_string())),
             ("rng_algorithm".into(), Json::Str("splitmix64".into())),
             ("learning_rate".into(), Json::Num(self.lr)),
+            (
+                "market_mode".into(),
+                Json::Str(self.market_mode.name().into()),
+            ),
             ("weights".into(), self.weights_json()?),
             ("optimizer".into(), Json::Obj(optimizer)),
         ]))
     }
     pub fn restore(&mut self, checkpoint: &Json) -> Result<(u64, Rng), String> {
-        if checkpoint.get("schema").str() != "mixed-production-v7-ppo-v1"
+        if checkpoint.get("schema").str() != "mixed-production-v8-ppo-v1"
             || checkpoint.get("policy_contract").str() != crate::pipeline::ENCODING
             || checkpoint.get("rng_algorithm").str() != "splitmix64"
         {
-            return Err("incompatible native checkpoint: independent actor/critic requires a new run or a matching checkpoint; old shared-network checkpoints are not migrated".into());
+            return Err("incompatible native checkpoint: market policy with independent actor/critic requires a new run or a matching checkpoint; older observation/action checkpoints are not migrated".into());
         }
         let uint = |key: &str| {
             checkpoint
@@ -332,6 +338,8 @@ impl Policy {
         if !lr.is_finite() || lr <= 0. {
             return Err("invalid checkpoint learning rate".into());
         }
+        let market_mode =
+            crate::pipeline::trading::MarketMode::parse(checkpoint.get("market_mode").str())?;
         self.load_weights(checkpoint.get("weights"))?;
         for p in &mut self.parameters {
             let state = checkpoint.get("optimizer").get(p.name);
@@ -349,6 +357,7 @@ impl Policy {
             p.v = Tensor::floats(&v, &p.shape, self.device, false)?;
         }
         self.lr = lr;
+        self.market_mode = market_mode;
         Ok((iteration, rng))
     }
     fn is_critic(name: &str) -> bool {
@@ -791,12 +800,12 @@ impl Batch {
     }
 }
 
-/// Uniform over productive categories, then uniform within each category.
+/// Uniform over productive/market categories (including market hold), then candidates.
 pub fn exploration_proposal(features: &[Vec<f32>]) -> Vec<f32> {
     let mut counts = [0usize; GROUPS];
     for f in features {
         let g = f[31] as usize;
-        if matches!(g, 1..=4 | 8..=15) {
+        if matches!(g, 1..=4 | 8..=18) {
             counts[g] += 1;
         }
     }

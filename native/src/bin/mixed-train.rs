@@ -32,7 +32,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         f.sync_all().map_err(|e| e.to_string())?;
         fs::rename(tmp, path).map_err(|e| e.to_string())
     }
-    let help="mixed-train --out DIR [--iterations 2 --games-per-update 16 --workers 7 --device cuda --epochs 2 --batch-size 256 --seed 1200 --opponent league|heuristic|selfplay --eval-every 5 --eval-games 8 --eval-seed 1000000000 --exploration 0.2 --imitation-weight 0.05 --resume CHECKPOINT --trace 0|1 --mode train|evaluate]";
+    let help="mixed-train --out DIR [--iterations 2 --games-per-update 16 --workers 7 --device cuda --epochs 2 --batch-size 256 --seed 1200 --opponent league|heuristic|selfplay --opponent-checkpoint FILE(evaluate-only) --eval-every 5 --eval-games 8 --eval-seed 1000000000 --exploration 0.2 --imitation-weight 0.05 --market-mode learned|rule --resume CHECKPOINT --trace 0|1 --mode train|evaluate]";
     if args.iter().any(|s| s == "--help") {
         println!("{help}");
         return Ok(());
@@ -47,6 +47,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "--batch-size",
         "--seed",
         "--opponent",
+        "--opponent-checkpoint",
         "--resume",
         "--trace",
         "--mode",
@@ -55,6 +56,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "--eval-seed",
         "--exploration",
         "--imitation-weight",
+        "--market-mode",
     ];
     if args.len() % 2 != 0 || args.chunks(2).any(|p| !allowed.contains(&p[0].as_str())) {
         return Err(help.into());
@@ -84,6 +86,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     {
         return Err("exploration and imitation-weight must be in [0,1]".into());
     }
+    let market_mode =
+        pipeline::trading::MarketMode::parse(get("--market-mode").unwrap_or("learned"))?;
     let iterations = n("--iterations", 2)?;
     let games = n("--games-per-update", 16)?;
     let workers = n("--workers", resources::available_workers())?;
@@ -113,7 +117,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "cuda" => 0,
         _ => return Err("invalid device".into()),
     };
-    let opponent = match get("--opponent").unwrap_or("league") {
+    let mut opponent = match get("--opponent").unwrap_or("league") {
         "league" => Opponent::League,
         "heuristic" => Opponent::Heuristic,
         "selfplay" => Opponent::SelfPlay,
@@ -129,6 +133,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "evaluate" => true,
         _ => return Err("invalid mode".into()),
     };
+    if get("--opponent-checkpoint").is_some() {
+        if !evaluate || get("--opponent").is_some() {
+            return Err("opponent-checkpoint requires --mode evaluate and must not be combined with --opponent".into());
+        }
+        opponent = Opponent::Frozen(0);
+    }
     if evaluate && get("--resume").is_none() {
         return Err(
             "evaluation requires --exploration 0.2 --imitation-weight 0.05 --resume CHECKPOINT"
@@ -157,8 +167,40 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if evaluate && out.join("metrics.jsonl").exists() {
         return Err("use a fresh evaluation output directory".into());
     }
+    let validate_evaluation_seeds = |checkpoint: &Json, iteration: u64| -> Result<(), String> {
+        let config = checkpoint.get("run");
+        let start = config
+            .get("seed")
+            .str()
+            .parse::<u64>()
+            .map_err(|_| "checkpoint lacks training seed provenance")?;
+        let count = (iteration as u128) * (config.get("games_per_update").i64() as u128) / 2;
+        let end = start as u128 + count;
+        if (seed as u128) < end && (seed as u128 + games as u128 / 2) > start as u128 {
+            return Err("evaluation seeds overlap training seeds".into());
+        }
+        let fixed = config
+            .get("eval_seed")
+            .str()
+            .parse::<u128>()
+            .map_err(|_| "invalid validation provenance")?;
+        let n = config.get("eval_games").i64() as u128 / 2;
+        let requested_end = seed as u128 + games as u128 / 2;
+        let overlaps = |lo: u128, hi: u128| (seed as u128) < hi && requested_end > lo;
+        if overlaps(fixed, fixed + n)
+            || (config.get("evaluation_schedule").str() == "fixed-rotating-confirm-v1"
+                && overlaps(
+                    fixed + 1_000_000,
+                    fixed + 1_000_000 + (iteration as u128 + 1) * 4 * n,
+                ))
+        {
+            return Err("independent evaluation seeds overlap model-selection seeds".into());
+        }
+        Ok(())
+    };
     tensor::threads(1);
     let mut policy = Policy::mixed_routes(device, seed, 1e-4)?;
+    policy.market_mode = market_mode;
     let mut rng = Rng(seed);
     let mut first = 1;
     let mut league = League::new(&policy)?;
@@ -166,37 +208,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if let Some(path) = get("--resume") {
         let checkpoint = json::parse(&fs::read_to_string(path).map_err(|e| e.to_string())?)?;
         let (iteration, saved_rng) = policy.restore(&checkpoint)?;
+        if (!evaluate || get("--market-mode").is_some()) && policy.market_mode != market_mode {
+            return Err("resume must preserve market-mode".into());
+        }
         league = League::restore(checkpoint.get("league"))?;
         bank = ExperienceBank::restore(checkpoint.get("experience_bank"))?;
         if evaluate {
-            let config = checkpoint.get("run");
-            let start = config
-                .get("seed")
-                .str()
-                .parse::<u64>()
-                .map_err(|_| "checkpoint lacks training seed provenance")?;
-            let count = (iteration as u128) * (config.get("games_per_update").i64() as u128) / 2;
-            let end = start as u128 + count;
-            if (seed as u128) < end && (seed as u128 + games as u128 / 2) > start as u128 {
-                return Err("evaluation seeds overlap training seeds".into());
-            }
-            let fixed = config
-                .get("eval_seed")
-                .str()
-                .parse::<u128>()
-                .map_err(|_| "invalid validation provenance")?;
-            let n = config.get("eval_games").i64() as u128 / 2;
-            let requested_end = seed as u128 + games as u128 / 2;
-            let overlaps = |lo: u128, hi: u128| (seed as u128) < hi && requested_end > lo;
-            if overlaps(fixed, fixed + n)
-                || (config.get("evaluation_schedule").str() == "fixed-rotating-confirm-v1"
-                    && overlaps(
-                        fixed + 1_000_000,
-                        fixed + 1_000_000 + (iteration as u128 + 1) * 4 * n,
-                    ))
-            {
-                return Err("independent evaluation seeds overlap model-selection seeds".into());
-            }
+            validate_evaluation_seeds(&checkpoint, iteration)?;
         }
 
         if !evaluate {
@@ -226,7 +244,27 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if first > iterations && !evaluate {
         return Err("iterations is cumulative and must exceed checkpoint iteration".into());
     }
-    let mut config=Json::Obj(vec![("schema".into(),Json::Str(pipeline::SCHEMA.into())),("seed".into(),Json::Str(seed.to_string())),("games_per_update".into(),Json::Num(games as f64)),("workers".into(),Json::Num(workers as f64)),("opponent".into(),Json::Str(opponent.name().into())),("epochs".into(),Json::Num(epochs as f64)),("batch_size".into(),Json::Num(batch as f64)),("eval_every".into(),Json::Num(eval_every as f64)),("eval_games".into(),Json::Num(eval_games as f64)),("eval_seed".into(),Json::Str(eval_seed.to_string())),("exploration".into(),Json::Num(exploration as f64)),("imitation_weight".into(),Json::Num(imitation_weight)),("greedy_probe_fraction".into(),Json::Num(0.25)),("gae_lambda_per_step".into(),Json::Num(0.997)),("reward".into(),Json::Str("actual own cash changes / 10000; gamma=1, time-aware GAE; terminal value=0".into())),("planner".into(),Json::Str("bounded mixed route insertion; committed production dispatch; rule sale settlement; learned project/route choices".into()))]);
+    let mut config=Json::Obj(vec![("schema".into(),Json::Str(pipeline::SCHEMA.into())),("seed".into(),Json::Str(seed.to_string())),("games_per_update".into(),Json::Num(games as f64)),("workers".into(),Json::Num(workers as f64)),("opponent".into(),Json::Str(opponent.name().into())),("epochs".into(),Json::Num(epochs as f64)),("batch_size".into(),Json::Num(batch as f64)),("eval_every".into(),Json::Num(eval_every as f64)),("eval_games".into(),Json::Num(eval_games as f64)),("eval_seed".into(),Json::Str(eval_seed.to_string())),("exploration".into(),Json::Num(exploration as f64)),("imitation_weight".into(),Json::Num(imitation_weight)),("greedy_probe_fraction".into(),Json::Num(0.25)),("gae_lambda_per_step".into(),Json::Num(0.997)),("reward".into(),Json::Str("actual own cash changes / 10000; gamma=1, time-aware GAE; terminal value=0".into())),("planner".into(),Json::Str("bounded mixed route insertion; committed production dispatch; learned project/route choices; market-mode controls sales and product procurement".into()))]);
+    config.set_path(
+        "opponent_checkpoint",
+        get("--opponent-checkpoint")
+            .map(|p| Json::Str(p.into()))
+            .unwrap_or(Json::Null),
+    );
+    config.set_path("market_mode", Json::Str(policy.market_mode.name().into()));
+    config.set_path(
+        "market_schedule",
+        Json::Str(
+            if policy.market_mode == pipeline::trading::MarketMode::Learned {
+                "periodic4-and-observed-events-including-rival-supply-final-day-v3"
+            } else {
+                "legacy-automatic-market"
+            }
+            .into(),
+        ),
+    );
+    config.set_path("market_choices", Json::Str(if policy.market_mode == pipeline::trading::MarketMode::Learned { "joint-product-direction-size-global-stop; fractions10-25-50-75-100-plus-unit-and-needs; one-order-per-product" } else { "legacy-fixed-reserves-and-procurement" }.into()));
+    config.set_path("public_supply_features", Json::Str("observed-rival-tiles; first-maturity-steps-and-24-72-step-cohorts; 4-24-step-count-yield-deltas; observed-24-step-additions-removals; no-sales-forecast".into()));
     config.set_path(
         "training_revision",
         Json::Str(pipeline::TRAINING_REVISION.into()),
@@ -300,7 +338,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if !evaluate && opponent == Opponent::League {
         league.freeze_recent(&policy, (first - 1) as u64, true)?;
     }
-    let mut pool = league.policies(device)?;
+    let mut pool = league.policies_with_mode(device, policy.market_mode)?;
+    if let Some(path) = get("--opponent-checkpoint") {
+        let checkpoint = json::parse(&fs::read_to_string(path).map_err(|e| e.to_string())?)?;
+        let mut rival = Policy::mixed_routes(device, 0, 1e-4)?;
+        let (iteration, _) = rival.restore(&checkpoint)?;
+        validate_evaluation_seeds(&checkpoint, iteration)?;
+        league = League::new(&rival)?;
+        league.snapshots[0].iteration = iteration;
+        league.champion_iteration = iteration;
+        pool = vec![rival];
+    }
     if !evaluate && opponent == Opponent::League {
         league.ensure_profiles(&pool, &eval_seeds, workers, eval_seed)?;
     }
@@ -399,7 +447,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 pool_changed |= recent_snapshot_added;
             }
             if pool_changed {
-                pool = league.policies(device)?;
+                pool = league.policies_with_mode(device, policy.market_mode)?;
             }
             let mut checkpoint = policy.checkpoint(iteration as u64, &rng)?;
             if let Json::Obj(fields) = &mut checkpoint {
@@ -500,6 +548,20 @@ fn run(args: Vec<String>) -> Result<(), String> {
             (
                 "new_profitable_episodes".into(),
                 Json::Num(result.experiences.len() as f64),
+            ),
+            (
+                "market_mode".into(),
+                Json::Str(policy.market_mode.name().into()),
+            ),
+            (
+                "trade_samples".into(),
+                Json::Num(
+                    result
+                        .samples
+                        .iter()
+                        .filter(|r| r.features[r.action][31] >= 16.)
+                        .count() as f64,
+                ),
             ),
             ("imitation_samples".into(), Json::Num(imitation.0 as f64)),
             ("imitation_loss".into(), Json::Num(imitation.1)),
@@ -607,7 +669,7 @@ mod tests {
         super::run(first).unwrap();
         let checkpoint = dir.join("latest.json");
         let ck = json::parse(&std::fs::read_to_string(&checkpoint).unwrap()).unwrap();
-        assert_eq!(ck.get("schema").str(), "mixed-production-v7-ppo-v1");
+        assert_eq!(ck.get("schema").str(), "mixed-production-v8-ppo-v1");
         assert!(ck.get("experience_bank").is_arr());
         assert!(ck.get("league").is_arr());
         let mut resumed = base;
@@ -622,6 +684,11 @@ mod tests {
         assert!(super::run(wrong)
             .unwrap_err()
             .contains("resume must preserve"));
+        let mut wrong_mode = resumed.clone();
+        wrong_mode.extend(["--market-mode".into(), "rule".into()]);
+        assert!(super::run(wrong_mode)
+            .unwrap_err()
+            .contains("preserve market-mode"));
         super::run(resumed).unwrap();
         let ck = json::parse(&std::fs::read_to_string(&checkpoint).unwrap()).unwrap();
         assert_eq!(ck.get("iteration").str(), "2");

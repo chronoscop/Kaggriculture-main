@@ -47,6 +47,7 @@ pub struct Game {
     seat: usize,
     actor: usize,
     market_done: bool,
+    trading: Option<super::trading::Trading>,
     markets: [Vec<Vec<String>>; 2],
     actions: [PlayerAction; 2],
     pending: Option<Pending>,
@@ -60,13 +61,17 @@ pub struct Game {
     pub exploration_regime: String,
     pub learned_decisions: [usize; 2],
     pub wait_probability: [f64; 2],
-    pub selected_groups: [[usize; 16]; 2],
+    pub selected_groups: [[usize; super::GROUPS]; 2],
 }
 impl Game {
     pub fn new(seed: i64, learner: usize, opponent: Opponent, record: bool) -> Self {
+        let mut agents = [Executor::new(), Executor::new()];
+        if opponent == Opponent::Heuristic {
+            agents[1 - learner].market_mode = super::trading::MarketMode::Rule;
+        }
         Self {
             state: State::new(seed),
-            agents: [Executor::new(), Executor::new()],
+            agents,
             rows: [vec![], vec![]],
             seed,
             learner,
@@ -74,6 +79,7 @@ impl Game {
             seat: 0,
             actor: 0,
             market_done: false,
+            trading: None,
             markets: [vec![], vec![]],
             actions: Default::default(),
             pending: None,
@@ -87,7 +93,14 @@ impl Game {
             exploration_regime: "standard".into(),
             learned_decisions: [0; 2],
             wait_probability: [0.; 2],
-            selected_groups: [[0; 16]; 2],
+            selected_groups: [[0; super::GROUPS]; 2],
+        }
+    }
+    fn queue_orders(&mut self, orders: Vec<Vec<String>>) {
+        if let Some(t) = &mut self.trading {
+            t.apply(orders);
+        } else {
+            self.markets[self.seat].extend(orders);
         }
     }
     fn request(&mut self, p: Problem, o: Observation) -> Option<Sample> {
@@ -95,14 +108,14 @@ impl Game {
             let orders = p
                 .select(0, &mut self.agents[self.seat], &o)
                 .expect("singleton candidate");
-            self.markets[self.seat].extend(orders);
+            self.queue_orders(orders);
             return None;
         }
         if self.opponent == Opponent::Heuristic && self.seat != self.learner {
             let orders = p
                 .select(p.heuristic(), &mut self.agents[self.seat], &o)
                 .expect("generated index");
-            self.markets[self.seat].extend(orders);
+            self.queue_orders(orders);
             return None;
         }
         let (context, features) = encoding::encode(&o, &self.agents[self.seat], &p);
@@ -121,7 +134,8 @@ impl Game {
                 0.
             },
             step: o.step,
-            cash: (o.farm.money / 10000.) as f32,
+            // Hypothetical order proceeds in the trade observation are not realized rewards.
+            cash: (self.state.farms[self.seat].money / 10000.) as f32,
             ..Sample::default()
         };
         self.pending = Some(Pending {
@@ -168,8 +182,27 @@ impl Game {
                     return Some(sample);
                 }
             }
-            self.actions[seat] =
-                self.agents[seat].action(&o, std::mem::take(&mut self.markets[seat]));
+            if self.trading.is_none() {
+                let (mut action, projected) =
+                    self.agents[seat].project_action(&o, std::mem::take(&mut self.markets[seat]));
+                self.trading = super::trading::Trading::begin_if_due(
+                    &o,
+                    projected,
+                    &mut action.market,
+                    &mut self.agents[seat],
+                );
+                self.actions[seat] = action;
+            }
+            if let Some(t) = &mut self.trading {
+                if let Some(p) = t.next(&mut self.agents[seat]) {
+                    let trade_obs = t.obs.clone();
+                    if let Some(sample) = self.request(p, trade_obs) {
+                        return Some(sample);
+                    }
+                    continue;
+                }
+                self.actions[seat].market = self.trading.take().unwrap().finish();
+            }
             self.actor = 0;
             self.market_done = false;
             if seat == 0 {
@@ -196,7 +229,7 @@ impl Game {
             pending
                 .problem
                 .select(d.action, &mut self.agents[pending.seat], &pending.obs)?;
-        self.markets[pending.seat].extend(orders);
+        self.queue_orders(orders);
         self.learned_decisions[pending.seat] += 1;
         self.wait_probability[pending.seat] += d.wait_probability as f64;
         self.selected_groups[pending.seat][pending.sample.features[d.action][31] as usize] += 1;
@@ -302,6 +335,69 @@ impl Game {
                         .collect(),
                 ),
             ),
+            (
+                "trading".into(),
+                Json::Arr(
+                    (0..2)
+                        .map(|seat| {
+                            let t = &self.trade_stats[seat];
+                            Json::Obj(vec![
+                                (
+                                    "mode".into(),
+                                    Json::Str(self.agents[seat].market_mode.name().into()),
+                                ),
+                                ("sales_revenue".into(), Json::Num(t.revenue.iter().sum())),
+                                ("total_spending".into(), Json::Num(t.spending)),
+                                (
+                                    "ending_stock".into(),
+                                    Json::Num(self.state.private[seat].shed.sum() as f64),
+                                ),
+                                (
+                                    "products".into(),
+                                    Json::Obj(
+                                        kagg_engine::state::PRODUCTS
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(j, name)| {
+                                                (
+                                                    (*name).into(),
+                                                    Json::Obj(vec![
+                                                        (
+                                                            "sold_units".into(),
+                                                            Json::Num(t.units[j] as f64),
+                                                        ),
+                                                        (
+                                                            "sales_revenue".into(),
+                                                            Json::Num(t.revenue[j]),
+                                                        ),
+                                                        (
+                                                            "bought_units".into(),
+                                                            Json::Num(t.bought_units[j] as f64),
+                                                        ),
+                                                        (
+                                                            "purchase_cost".into(),
+                                                            Json::Num(t.purchase_cost[j]),
+                                                        ),
+                                                        (
+                                                            "ending_stock".into(),
+                                                            Json::Num(
+                                                                self.state.private[seat]
+                                                                    .shed
+                                                                    .get(name)
+                                                                    as f64,
+                                                            ),
+                                                        ),
+                                                    ]),
+                                                )
+                                            })
+                                            .collect(),
+                                    ),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
             ("learner_seat".into(), Json::Num(self.learner as f64)),
             ("steps".into(), Json::Num(self.state.step as f64)),
             (
@@ -323,6 +419,24 @@ impl Game {
 }
 pub fn stats_json(s: &Stats) -> Json {
     Json::Obj(vec![
+        ("trade_sessions".into(), Json::Num(s.trade_sessions as f64)),
+        (
+            "trade_events".into(),
+            Json::Obj(
+                super::trading::EVENT_NAMES
+                    .iter()
+                    .zip(s.trade_events)
+                    .map(|(name, count)| ((*name).into(), Json::Num(count as f64)))
+                    .collect(),
+            ),
+        ),
+        (
+            "trade_decisions".into(),
+            Json::Num(s.trade_decisions as f64),
+        ),
+        ("trade_holds".into(), Json::Num(s.trade_holds as f64)),
+        ("sell_orders".into(), Json::Num(s.sell_orders as f64)),
+        ("buy_orders".into(), Json::Num(s.buy_orders as f64)),
         ("routes".into(), Json::Num(s.routes as f64)),
         ("mixed_routes".into(), Json::Num(s.mixed_routes as f64)),
         (
@@ -634,6 +748,12 @@ fn collect_impl(
         };
         for seat in 0..2 {
             let mut game = Game::new(seed, seat, selected, record);
+            game.agents[seat].market_mode = policy.market_mode;
+            game.agents[1 - seat].market_mode = match selected {
+                Opponent::Heuristic => super::trading::MarketMode::Rule,
+                Opponent::Frozen(i) => pool[i].market_mode,
+                _ => policy.market_mode,
+            };
             game.greedy_probe = probes
                 && !deterministic
                 && schedule

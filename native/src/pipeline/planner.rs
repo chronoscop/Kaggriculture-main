@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 #[derive(Clone, Debug)]
 pub enum Choice {
     Continue,
+    Trade(super::trading::Trade),
     Route {
         actor: usize,
         route: Route,
@@ -24,6 +25,15 @@ impl Choice {
     pub fn category(&self, e: &Executor) -> usize {
         match self {
             Self::Continue => 0,
+            Self::Trade(t) => {
+                if t.quantity == 0 {
+                    16
+                } else if t.quantity > 0 {
+                    17
+                } else {
+                    18
+                }
+            }
             Self::Route { route, .. } => {
                 if route.crop_jobs > 0 && route.animal_jobs > 0 {
                     if route.reused_fertilizer > 0 {
@@ -90,6 +100,27 @@ impl Problem {
             .ok_or("candidate index out of range")?;
         match choice {
             Choice::Continue => {}
+            Choice::Trade(t) => {
+                e.stats.trade_decisions += 1;
+                if t.quantity == 0 {
+                    e.stats.trade_holds += 1;
+                } else {
+                    if t.quantity > 0 {
+                        e.stats.sell_orders += 1;
+                    } else {
+                        e.stats.buy_orders += 1;
+                    }
+                    return Ok(vec![vec![
+                        if t.quantity > 0 {
+                            "SELL".into()
+                        } else {
+                            "BUY_PRODUCT".into()
+                        },
+                        t.item.clone(),
+                        t.quantity.abs().to_string(),
+                    ]]);
+                }
+            }
             Choice::Route { actor, route } => e.assign(*actor, route.clone()),
             Choice::Invest {
                 site,
@@ -135,6 +166,7 @@ impl Problem {
 fn heuristic(c: &Choice) -> f64 {
     match c {
         Choice::Continue => 0.,
+        Choice::Trade(t) => t.cash_delta,
         Choice::Route { route, .. } => {
             route.work as f64 * 3.
                 + route.harvested as f64 * 2.
@@ -681,7 +713,7 @@ pub fn investment_problem(o: &Observation, e: &Executor) -> Problem {
         .max(0)
         .min(8)
         .min((100 - o.private.shed.sum()).max(0));
-    if need > 0 {
+    if need > 0 && e.market_mode == super::trading::MarketMode::Rule {
         add(None, None, vec![order("BUY_PRODUCT", "WHEAT", need)]);
     }
     let mut sites = Vec::new();
@@ -782,7 +814,7 @@ pub fn investment_problem(o: &Observation, e: &Executor) -> Problem {
                 continue;
             };
             let feed = (2 - wheat).max(0);
-            if feed > 0 {
+            if feed > 0 && e.market_mode == super::trading::MarketMode::Rule {
                 orders.push(order("BUY_PRODUCT", "WHEAT", feed));
             }
             add(Some(p), Some(Production::Animal(name.into())), orders);

@@ -41,6 +41,7 @@ fn mixed_route_transfers_fertilizer_replants_and_sells_actual_products() {
     let mut s = mixed();
     let initial_money = s.farms[0].money;
     let mut e = Executor::new();
+    e.market_mode = super::trading::MarketMode::Rule;
     let o = Observation::from_state(&s, 0);
     e.observe(&o);
     let p = planner::route_problem(&o, &e, 0);
@@ -197,7 +198,7 @@ fn candidates_ignore_seed_and_opponent_private_state() {
         outputs.push(encoding::encode(&o, &e, &p));
     }
     assert_eq!(outputs[0], outputs[1]);
-    assert_eq!(outputs[0].0.len(), 96);
+    assert_eq!(outputs[0].0.len(), super::CONTEXT);
     assert!(outputs[0].1.iter().all(|v| v.len() == 32));
 }
 #[test]
@@ -210,7 +211,10 @@ fn new_projects_are_selectable_without_baseline_or_free_materials() {
     let i=p.choices.iter().position(|c|matches!(c,planner::Choice::Invest{production:Some(Production::Animal(a)),..} if a=="COW")).unwrap();
     let orders = p.select(i, &mut e, &o).unwrap();
     assert!(orders.iter().any(|o| o[0] == "BUY_ANIMAL"));
-    assert!(orders.iter().any(|o| o[0] == "BUY_PRODUCT"));
+    assert!(
+        !orders.iter().any(|o| o[0] == "BUY_PRODUCT"),
+        "learned market owns feed quantity"
+    );
     assert!(planner::route_problem(&o,&e,0).choices.iter().all(|c|!matches!(c,planner::Choice::Route{route,..} if route.steps.iter().any(|s|s.action.op=="PLACE"&&s.action.item=="COW"))));
     assert!(p.select(usize::MAX, &mut e, &o).is_err());
 }
@@ -236,7 +240,7 @@ fn policy_updates_and_resumes_without_old_gate_or_baseline_checkpoint() {
                 f[j] = 1.;
             }
             rows.push(Sample {
-                context: vec![i as f32 / 8.; 96],
+                context: vec![i as f32 / 8.; super::CONTEXT],
                 features,
                 action: 0,
                 logp: 0.,
@@ -338,6 +342,7 @@ fn funded_project_dispatches_but_missing_stock_allows_waiting() {
 fn singleton_return_route_is_executed_without_a_policy_request() {
     use super::rollout::{Game, Opponent};
     let mut game = Game::new(42, 0, Opponent::Heuristic, false);
+    game.agents[0].market_mode = super::trading::MarketMode::Rule;
     game.state.step = 718;
     game.state.private[0].inventories[0].add("WHEAT", 2);
     for seat in 0..2 {
@@ -572,7 +577,7 @@ fn hierarchical_probabilities_exploration_and_greedy_share_one_contract() {
             f[31] = 2.;
         }
         let row = Sample {
-            context: vec![0.; 96],
+            context: vec![0.; super::CONTEXT],
             features: features.clone(),
             exploration: 0.2,
             ..Sample::default()
@@ -669,7 +674,7 @@ fn profitable_experience_is_bounded_resumable_and_learned_separately() {
     features[1][2] = 1.;
     features[1][9] = 1.;
     let row = Sample {
-        context: vec![0.; 96],
+        context: vec![0.; super::CONTEXT],
         features,
         action: 1,
         mc_return: 2.,
@@ -801,7 +806,7 @@ fn experience_retains_recent_routes_and_balances_opponent_sources() {
         policy::{Rng, Sample},
     };
     let mut row = Sample {
-        context: vec![0.; 96],
+        context: vec![0.; super::CONTEXT],
         features: vec![vec![0.; 32]],
         mc_return: 2.,
         ..Sample::default()
@@ -903,7 +908,7 @@ fn protected_elites_survive_hundreds_of_new_styles_and_resume() {
         policy::{Rng, Sample},
     };
     let mut row = Sample {
-        context: vec![0.; 96],
+        context: vec![0.; super::CONTEXT],
         features: vec![vec![0.; 32]],
         mc_return: 1.,
         ..Default::default()
@@ -1330,7 +1335,7 @@ fn mixed_exploration_rows_keep_exact_behavior_likelihood_for_ppo() {
     let mut rows: Vec<_> = [0., 0.2]
         .iter()
         .map(|&exploration| Sample {
-            context: vec![0.; 96],
+            context: vec![0.; super::CONTEXT],
             features: features.clone(),
             exploration,
             ..Sample::default()

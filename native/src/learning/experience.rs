@@ -25,7 +25,9 @@ impl Experience {
         harvested: i64,
         rows: &[Sample],
     ) -> Option<Self> {
-        if profit <= 0. || harvested <= 0 {
+        // Profitable realized trading can also supply experience without a harvest.
+        let traded = rows.iter().any(|r| r.features[r.action][31] == 17.);
+        if profit <= 0. || (harvested <= 0 && !traded) {
             return None;
         }
         let mut style = 0u32;
@@ -49,13 +51,21 @@ impl Experience {
         if eligible.is_empty() {
             return None;
         }
-        let stride = eligible.len().div_ceil(ROWS_PER_EPISODE);
-        let rows = eligible
+        // Trading adds frequent decisions; protect production coverage in successful episodes.
+        let (production, trading): (Vec<_>, Vec<_>) = eligible
             .into_iter()
-            .step_by(stride)
-            .take(ROWS_PER_EPISODE)
-            .cloned()
-            .collect();
+            .partition(|r| r.features[r.action][31] < 16.);
+        let p_count = production
+            .len()
+            .min(ROWS_PER_EPISODE / 2 + (ROWS_PER_EPISODE / 2).saturating_sub(trading.len()));
+        let t_count = trading.len().min(ROWS_PER_EPISODE - p_count);
+        let mut rows = Vec::with_capacity(p_count + t_count);
+        for (source, count) in [(&production, p_count), (&trading, t_count)] {
+            for i in 0..count {
+                rows.push(source[i * source.len() / count].clone());
+            }
+        }
+        rows.sort_by_key(|r| r.step);
         Some(Self {
             seed,
             seat,

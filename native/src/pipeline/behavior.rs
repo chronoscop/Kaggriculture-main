@@ -9,6 +9,8 @@ pub struct TradeStats {
     pub revenue: [f64; 9],
     pub units: [i64; 9],
     pub spending: f64,
+    pub bought_units: [i64; 9],
+    pub purchase_cost: [f64; 9],
     pub early_spending: f64,
 }
 /// Replay just the unit and market phases on a copy to measure actual filled sales.
@@ -70,6 +72,14 @@ pub fn observe_market(state: &State, actions: &[PlayerAction; 2], stats: &mut [T
                     }
                 } else {
                     stats[p].spending -= delta;
+                    if o.first().is_some_and(|x| x == "BUY_PRODUCT") {
+                        if let Some(j) = o.get(1).and_then(|x| PRODUCTS.iter().position(|y| x == y))
+                        {
+                            stats[p].bought_units[j] +=
+                                s.private[p].shed.get(PRODUCTS[j]) - inventory[p][j];
+                            stats[p].purchase_cost[j] -= delta;
+                        }
+                    }
                     if state.step < 12 * 24 {
                         stats[p].early_spending -= delta;
                     }

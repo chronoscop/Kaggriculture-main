@@ -148,6 +148,12 @@ pub struct Stats {
     pub harvested_units: i64,
     pub sold_units: i64,
     pub fertilizer_used: u64,
+    pub trade_sessions: u64,
+    pub trade_events: [u64; super::trading::EVENT_COUNT],
+    pub trade_decisions: u64,
+    pub trade_holds: u64,
+    pub sell_orders: u64,
+    pub buy_orders: u64,
 }
 #[derive(Clone, Default)]
 pub struct Executor {
@@ -162,6 +168,16 @@ pub struct Executor {
     pub expansion_budget: f64,
     pub expansion_spent: f64,
     pub new_projects_today: usize,
+    pub market_mode: super::trading::MarketMode,
+    pub market_history: VecDeque<super::trading::MarketPoint>,
+    pub rival_supply: super::public_supply::History,
+    pub trade_anchor: Option<super::trading::MarketAnchor>,
+    pub trade_events: [bool; super::trading::EVENT_COUNT],
+    pub trade_remaining: [bool; 9],
+    pub trade_slots: usize,
+    pub trade_reserved_cash: f64,
+    pub trade_start_cash: f64,
+    pub trade_reserved_space: i64,
 }
 impl Executor {
     pub fn new() -> Self {
@@ -176,6 +192,25 @@ impl Executor {
             return;
         }
         self.last_observed = Some(o.step);
+        self.rival_supply.observe(&o.rival, o.step);
+        self.trade_events = [false; super::trading::EVENT_COUNT];
+        self.trade_remaining = [false; 9];
+        self.trade_slots = 0;
+        self.trade_reserved_cash = 0.;
+        self.trade_reserved_space = 0;
+        self.trade_start_cash = o.farm.money;
+        self.market_history.push_back(super::trading::MarketPoint {
+            step: o.step,
+            prices: o.market.prices.clone(),
+            inventory: o.market.inventory.clone(),
+        });
+        while self
+            .market_history
+            .front()
+            .is_some_and(|p| p.step < o.step - 24)
+        {
+            self.market_history.pop_front();
+        }
         for r in self.receipts.drain(..) {
             if r.at % 24 == 23 {
                 continue;
@@ -289,6 +324,14 @@ impl Executor {
         self.routes[actor] = Some(route);
     }
     pub fn action(&mut self, o: &Observation, market: Vec<Vec<String>>) -> PlayerAction {
+        self.project_action(o, market).0
+    }
+    /// Project own legal unit actions once, before simultaneous market settlement.
+    pub fn project_action(
+        &mut self,
+        o: &Observation,
+        market: Vec<Vec<String>>,
+    ) -> (PlayerAction, Observation) {
         let mut farm = o.farm.clone();
         let mut private = o.private.clone();
         let mut units = Vec::new();
@@ -370,6 +413,9 @@ impl Executor {
             .filter(|p| matches!(p.production, Production::Animal(_)))
             .count() as i64;
         for item in kagg_engine::state::PRODUCTS {
+            if self.market_mode != super::trading::MarketMode::Rule {
+                break;
+            }
             let reserve = if o.step >= 694 {
                 0
             } else if item == "WHEAT" {
@@ -387,11 +433,17 @@ impl Executor {
         // Purchasing proposals reserve their own order slots first; never truncate a selected investment.
         orders.truncate(10usize.saturating_sub(market.len()));
         orders.extend(market);
-        PlayerAction {
-            farmer: units.remove(0),
-            hands: units,
-            market: orders,
-        }
+        let mut projected = o.clone();
+        projected.farm = farm;
+        projected.private = private;
+        (
+            PlayerAction {
+                farmer: units.remove(0),
+                hands: units,
+                market: orders,
+            },
+            projected,
+        )
     }
     pub fn labor_load(&self) -> usize {
         self.projects

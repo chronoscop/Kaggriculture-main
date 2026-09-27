@@ -1,8 +1,8 @@
 # 原生混合生产 pipeline
 
-> 当前版本：[独立策略与价值网络](../docs/mixed_v7_independent.md)（v7-independent-6）。从零开始；旧共享网络检查点不兼容。策略和价值网络各自裁剪梯度，原 PFSP、探索和奖励保留。
+> 当前版本：[可学习市场决策](../docs/mixed_v8_market.md)（v8-market-3）。模型控制交易顺序和数量，新增对手潜在供给信息与事件触发，支持规则交易对照；320 维观测、19 类动作，旧 v7 / v8-market-1 / v8-market-2 检查点不兼容。
 
-只保留 `mixed-production-v7`。旧 baseline 移植组件、组件测速命令及 v4 训练入口已删除。
+当前入口为 `mixed-production-v8`。旧 baseline 移植组件、组件测速命令及 v4 训练入口已删除。
 
 ## 构建
 

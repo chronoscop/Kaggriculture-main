@@ -102,6 +102,78 @@ pub fn encode(o: &Observation, e: &Executor, p: &Problem) -> (Vec<f32>, Vec<Vec<
         e.new_projects_today as f32 / 2.,
     ]);
     c.resize(96, 0.);
+    // Trends are computed from observations actually seen by this seat.
+    for item in PRODUCTS {
+        let param = kagg_engine::market::param(item).unwrap();
+        c.push((o.market.prices.get(item) as f64 / param.base) as f32);
+        c.push(((o.market.inventory.get(item) as f64 - param.i0) / param.t) as f32);
+        for horizon in [4, 24] {
+            let past = e
+                .market_history
+                .iter()
+                .rev()
+                .find(|p| p.step <= o.step - horizon)
+                .or_else(|| e.market_history.front());
+            let dp = past
+                .map(|p| o.market.prices.get(item) - p.prices.get(item))
+                .unwrap_or(0);
+            let di = past
+                .map(|p| o.market.inventory.get(item) - p.inventory.get(item))
+                .unwrap_or(0);
+            c.extend([
+                (dp as f64 / param.base) as f32,
+                (di as f64 / param.t) as f32,
+            ]);
+        }
+        c.push(
+            o.private
+                .inventories
+                .iter()
+                .map(|i| i.get(item))
+                .sum::<i64>() as f32
+                / 100.,
+        );
+        c.push(super::trading::committed(e, item) as f32 / 20.);
+        let demand: i64 = o
+            .shops
+            .iter()
+            .map(|shop| {
+                let products = kagg_engine::engine::shop_products(shop);
+                if products.contains(&item) {
+                    if products.len() == 1 {
+                        2
+                    } else {
+                        1
+                    }
+                } else {
+                    0
+                }
+            })
+            .sum();
+        c.push((6 * demand + i64::from(item != "FERTILIZER")) as f32 / 24.);
+    }
+    c.extend(super::trading::production_features(&o.farm, o.day()));
+    c.extend(super::trading::production_features(&o.rival, o.day()));
+    let (operating_cash, feed) = super::trading::operating_need(o, e);
+    c.extend([
+        operating_cash as f32 / 10000.,
+        feed as f32 / 20.,
+        (100 - o.private.shed.sum()) as f32 / 100.,
+        e.trade_reserved_cash as f32 / 10000.,
+        e.trade_reserved_space as f32 / 100.,
+        (o.farm.money - e.trade_start_cash) as f32 / 10000.,
+        f32::from(p.choices.iter().any(|c| matches!(c, Choice::Trade(_)))),
+        e.market_history
+            .front()
+            .map(|h| (o.step - h.step) as f32 / 24.)
+            .unwrap_or(0.),
+    ]);
+    c.extend(e.trade_remaining.map(f32::from));
+    c.push(e.trade_slots as f32 / 10.);
+    c.extend(e.trade_events.map(f32::from));
+    c.extend(e.rival_supply.features());
+    assert!(c.len() <= super::CONTEXT);
+    c.resize(super::CONTEXT, 0.);
     let features = p
         .choices
         .iter()
@@ -110,6 +182,34 @@ pub fn encode(o: &Observation, e: &Executor, p: &Problem) -> (Vec<f32>, Vec<Vec<
             f[31] = choice.category(e) as f32;
             match choice {
                 Choice::Continue => f[0] = 1.,
+                Choice::Trade(t) => {
+                    // Empty product identifies a global end-of-trading decision.
+                    let base = kagg_engine::market::param(&t.item)
+                        .map(|p| p.base)
+                        .unwrap_or(1.);
+                    f[0] = f32::from(t.quantity == 0);
+                    f[3] = t.quantity as f32 / 100.;
+                    f[4] = t.cash_delta as f32 / 10000.;
+                    f[5] = if t.quantity == 0 {
+                        0.
+                    } else {
+                        (t.cash_delta.abs() / t.quantity.abs() as f64 / base) as f32
+                    };
+                    f[6] = t.cash_after as f32 / 10000.;
+                    f[7] = t.stock_after as f32 / 100.;
+                    f[8] = super::trading::committed(e, &t.item) as f32 / 20.;
+                    for (j, name) in PRODUCTS.iter().enumerate() {
+                        f[9 + j] = f32::from(t.item == *name);
+                    }
+                    f[18] = (o.market.prices.get(&t.item) as f64 / base) as f32;
+                    f[19] = (t.marginal_price as f64 / base) as f32;
+                    f[20] = operating_cash as f32 / 10000.;
+                    f[21] = (100 - o.private.shed.sum() + t.quantity - e.trade_reserved_space)
+                        as f32
+                        / 100.;
+                    f[22] = t.quantity.abs() as f32 / t.quantity_limit.max(1) as f32;
+                    f[23] = (t.cash_after - operating_cash) as f32 / 10000.;
+                }
                 Choice::Route { actor, route } => {
                     f[1] = 1.;
                     f[3] = route.steps.len() as f32 / 24.;

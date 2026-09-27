@@ -10,7 +10,7 @@ fn run() -> Result<(), String> {
             policy::{Policy, Rng, Sample},
             tensor,
         },
-        pipeline::{encoding, executor::*, planner},
+        pipeline::{encoding, executor::*, planner, trading},
     };
     use std::io::{self, BufRead, Write};
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -44,35 +44,41 @@ fn run() -> Result<(), String> {
         }
         last[seat] = o.step;
         let e = &mut agents[seat];
+        e.market_mode = policy
+            .as_ref()
+            .map(|p| p.market_mode)
+            .unwrap_or(trading::MarketMode::Rule);
         e.observe(&o);
         let mut orders = Vec::new();
-        let mut choose =
-            |p: planner::Problem, e: &mut Executor| -> Result<Vec<Vec<String>>, String> {
-                let index = if let Some(model) = &policy {
-                    let (c, f) = encoding::encode(&o, e, &p);
-                    model.infer(
-                        &[Sample {
-                            context: c,
-                            features: f,
-                            action: 0,
-                            logp: 0.,
-                            value: 0.,
-                            reward: 0.,
-                            ..Sample::default()
-                        }],
-                        true,
-                        &mut rng,
-                    )?[0]
-                        .action
-                } else {
-                    p.heuristic()
-                };
-                p.select(index, e, &o)
+        let mut choose = |p: planner::Problem,
+                          e: &mut Executor,
+                          decision_obs: &Observation|
+         -> Result<Vec<Vec<String>>, String> {
+            let index = if let Some(model) = &policy {
+                let (c, f) = encoding::encode(decision_obs, e, &p);
+                model.infer(
+                    &[Sample {
+                        context: c,
+                        features: f,
+                        action: 0,
+                        logp: 0.,
+                        value: 0.,
+                        reward: 0.,
+                        ..Sample::default()
+                    }],
+                    true,
+                    &mut rng,
+                )?[0]
+                    .action
+            } else {
+                p.heuristic()
             };
+            p.select(index, e, decision_obs)
+        };
         if e.market_due(&o) {
             e.last_market = o.step;
             e.last_cash = o.farm.money;
-            orders = choose(planner::investment_problem(&o, e), e)?;
+            orders = choose(planner::investment_problem(&o, e), e, &o)?;
         }
         for actor in 0..o.private.inventories.len() {
             if e.routes
@@ -80,10 +86,17 @@ fn run() -> Result<(), String> {
                 .and_then(Option::as_ref)
                 .is_none_or(|r| r.steps.is_empty())
             {
-                choose(planner::route_problem(&o, e, actor), e)?;
+                choose(planner::route_problem(&o, e, actor), e, &o)?;
             }
         }
-        let action = e.action(&o, orders);
+        let (mut action, projected) = e.project_action(&o, orders);
+        if let Some(mut t) = trading::Trading::begin_if_due(&o, projected, &mut action.market, e) {
+            while let Some(p) = t.next(e) {
+                let selected = choose(p, e, &t.obs)?;
+                t.apply(selected);
+            }
+            action.market = t.finish();
+        }
         let result: Json = action_json(&action);
         writeln!(output, "{}", result.dump()).map_err(|e| e.to_string())?;
         output.flush().map_err(|e| e.to_string())?;

@@ -57,7 +57,12 @@ impl Score {
             score.harvest += s.harvested_units as f64 / n;
             let total = s.work + s.walking + s.idle;
             score.idle_fraction += s.idle as f64 / total.max(1) as f64 / n;
-            score.inactive_games += usize::from(s.work == 0 || s.harvested_units == 0);
+            let t = &g.trade_stats[seat];
+            let profitable_trading = cash > 3000.
+                && t.bought_units.iter().sum::<i64>() > 0
+                && t.units.iter().sum::<i64>() > 0;
+            score.inactive_games +=
+                usize::from((s.work == 0 || s.harvested_units == 0) && !profitable_trading);
         }
         score
     }
@@ -183,11 +188,19 @@ impl League {
         )
     }
     pub fn policies(&self, device: i32) -> Result<Vec<Policy>, String> {
+        self.policies_with_mode(device, super::trading::MarketMode::Learned)
+    }
+    pub fn policies_with_mode(
+        &self,
+        device: i32,
+        mode: super::trading::MarketMode,
+    ) -> Result<Vec<Policy>, String> {
         self.snapshots
             .iter()
             .map(|s| {
                 let mut p = Policy::mixed_routes(device, 0, 1e-4)?;
                 p.load_weights(&s.weights)?;
+                p.market_mode = mode;
                 Ok(p)
             })
             .collect()
@@ -464,7 +477,7 @@ impl League {
         eval_seed: u64,
     ) -> Result<(bool, Json), String> {
         let started = std::time::Instant::now();
-        let pool = self.policies(candidate.device)?;
+        let pool = self.policies_with_mode(candidate.device, candidate.market_mode)?;
         let profile_games = 0;
         let ci = self.champion_index();
         let champion_iteration = self.champion_iteration;
