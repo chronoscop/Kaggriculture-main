@@ -1,6 +1,6 @@
 # 原生混合生产 pipeline
 
-> 当前训练机制修订见 [经验与对手保留修订](../docs/mixed_v7_retention.md)：对手入池与冠军分离、分组经验库、分层探测采样。下文原 v7 的容量与采样说明以修订文档为准；旧模型可续训。
+> 当前版本：[独立策略与价值网络](../docs/mixed_v7_independent.md)（v7-independent-6）。从零开始；旧共享网络检查点不兼容。策略和价值网络各自裁剪梯度，原 PFSP、探索和奖励保留。
 
 只保留 `mixed-production-v7`。旧 baseline 移植组件、组件测速命令及 v4 训练入口已删除。
 

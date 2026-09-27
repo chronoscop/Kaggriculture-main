@@ -142,6 +142,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
     {
         return Err("validation seeds overlap training seeds or overflow".into());
     }
+    let rotate_start = eval_seed as u128 + 1_000_000;
+    let rotate_end = rotate_start + (iterations as u128 + 1) * (4 * (eval_games / 2)) as u128;
+    if rotate_end > i64::MAX as u128
+        || (!evaluate && (seed as u128) < rotate_end && train_end > rotate_start)
+    {
+        return Err("rotating validation seeds overlap training seeds or overflow".into());
+    }
     let out = PathBuf::from(get("--out").ok_or(help)?);
     fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     if out.join("metrics.jsonl").exists() && get("--resume").is_none() {
@@ -173,13 +180,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
             if (seed as u128) < end && (seed as u128 + games as u128 / 2) > start as u128 {
                 return Err("evaluation seeds overlap training seeds".into());
             }
+            let fixed = config
+                .get("eval_seed")
+                .str()
+                .parse::<u128>()
+                .map_err(|_| "invalid validation provenance")?;
+            let n = config.get("eval_games").i64() as u128 / 2;
+            let requested_end = seed as u128 + games as u128 / 2;
+            let overlaps = |lo: u128, hi: u128| (seed as u128) < hi && requested_end > lo;
+            if overlaps(fixed, fixed + n)
+                || (config.get("evaluation_schedule").str() == "fixed-rotating-confirm-v1"
+                    && overlaps(
+                        fixed + 1_000_000,
+                        fixed + 1_000_000 + (iteration as u128 + 1) * 4 * n,
+                    ))
+            {
+                return Err("independent evaluation seeds overlap model-selection seeds".into());
+            }
         }
 
         if !evaluate {
             let config = checkpoint.get("run");
-            if !config.get("training_revision").is_null()
-                && config.get("training_revision").str() != "v7-retention-2"
-            {
+            if config.get("training_revision").str() != pipeline::TRAINING_REVISION {
                 return Err("unsupported training revision; use a matching trainer".into());
             }
             if config.get("seed").str() != seed.to_string()
@@ -205,9 +227,60 @@ fn run(args: Vec<String>) -> Result<(), String> {
         return Err("iterations is cumulative and must exceed checkpoint iteration".into());
     }
     let mut config=Json::Obj(vec![("schema".into(),Json::Str(pipeline::SCHEMA.into())),("seed".into(),Json::Str(seed.to_string())),("games_per_update".into(),Json::Num(games as f64)),("workers".into(),Json::Num(workers as f64)),("opponent".into(),Json::Str(opponent.name().into())),("epochs".into(),Json::Num(epochs as f64)),("batch_size".into(),Json::Num(batch as f64)),("eval_every".into(),Json::Num(eval_every as f64)),("eval_games".into(),Json::Num(eval_games as f64)),("eval_seed".into(),Json::Str(eval_seed.to_string())),("exploration".into(),Json::Num(exploration as f64)),("imitation_weight".into(),Json::Num(imitation_weight)),("greedy_probe_fraction".into(),Json::Num(0.25)),("gae_lambda_per_step".into(),Json::Num(0.997)),("reward".into(),Json::Str("actual own cash changes / 10000; gamma=1, time-aware GAE; terminal value=0".into())),("planner".into(),Json::Str("bounded mixed route insertion; committed production dispatch; rule sale settlement; learned project/route choices".into()))]);
-    config.set_path("training_revision", Json::Str("v7-retention-2".into()));
+    config.set_path(
+        "training_revision",
+        Json::Str(pipeline::TRAINING_REVISION.into()),
+    );
+    config.set_path(
+        "network_architecture",
+        Json::Str("independent-actor-critic".into()),
+    );
+    config.set_path(
+        "gradient_clipping",
+        Json::Str("separate-actor-critic-norm-0.5".into()),
+    );
     config.set_path("opponent_pool_capacity", Json::Num(8.));
-    config.set_path("experience_capacity", Json::Num(128.));
+    config.set_path(
+        "pfsp_difficulty_source",
+        Json::Str("greedy_training_probes".into()),
+    );
+    config.set_path(
+        "exploration_schedule",
+        Json::Str("policy18-broad6-greedy8-per32".into()),
+    );
+    config.set_path(
+        "focused_exploration",
+        Json::Num(rollout::FOCUSED_EXPLORATION as f64),
+    );
+    config.set_path(
+        "opponent_schedule",
+        Json::Str("recent12-pfsp12-coverage4-current2-heuristic2".into()),
+    );
+    config.set_path(
+        "snapshot_every",
+        Json::Num(pipeline::league::SNAPSHOT_EVERY as f64),
+    );
+    config.set_path(
+        "pfsp_half_life_iterations",
+        Json::Num(pipeline::matchmaking::HALF_LIFE),
+    );
+    config.set_path(
+        "pfsp_prior_games",
+        Json::Num(pipeline::matchmaking::PRIOR_GAMES),
+    );
+    config.set_path(
+        "pfsp_uniform_mix",
+        Json::Num(pipeline::matchmaking::UNIFORM_MIX),
+    );
+    config.set_path(
+        "pfsp_max_share",
+        Json::Num(pipeline::matchmaking::MAX_SHARE),
+    );
+    config.set_path("experience_capacity", Json::Num(192.));
+    config.set_path(
+        "evaluation_schedule",
+        Json::Str("fixed-rotating-confirm-v1".into()),
+    );
     config.set_path(
         "resume_from",
         get("--resume")
@@ -224,7 +297,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
         .map(|i| (eval_seed + i as u64) as i64)
         .collect();
     // Frozen models stay on the coordinator device and are rebuilt after pool admission.
+    if !evaluate && opponent == Opponent::League {
+        league.freeze_recent(&policy, (first - 1) as u64, true)?;
+    }
     let mut pool = league.policies(device)?;
+    if !evaluate && opponent == Opponent::League {
+        league.ensure_profiles(&pool, &eval_seeds, workers, eval_seed)?;
+    }
     for iteration in first..=if evaluate { first } else { iterations } {
         let seeds: Vec<_> = (0..games / 2)
             .map(|i| (seed + ((iteration - 1) * games / 2 + i) as u64) as i64)
@@ -237,9 +316,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map(|s| Json::Num(s.iteration as f64))
                 .collect(),
         );
+        let matchmaking_before = league.matchmaking_report(iteration as u64);
         let result = if evaluate {
             rollout::collect_with_pool(
                 &policy, &seeds, workers, opponent, &pool, true, &mut rng, trace,
+            )?
+        } else if opponent == Opponent::League {
+            rollout::collect_roster(
+                &policy,
+                &seeds,
+                workers,
+                &pool,
+                &mut rng,
+                trace,
+                exploration,
+                &league.roster(iteration as u64),
             )?
         } else {
             rollout::collect_exploring(
@@ -254,6 +345,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 exploration,
             )?
         };
+        if !evaluate && opponent == Opponent::League {
+            league.observe_training(&result, iteration as u64);
+        }
+        // Record against pre-admission slot identities, before pruning can shift indices.
+        let opponent_outcomes = league.matchmaking_report(iteration as u64);
+        let mut recent_snapshot_added = false;
         let started = Instant::now();
         let update = if evaluate {
             None
@@ -277,6 +374,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 return Err("no PPO update completed".into());
             }
             let mut promoted = false;
+            let mut pool_changed = false;
             if iteration % eval_every == 0 || iteration == iterations {
                 println!("{{\"stage\":\"validate\",\"iteration\":{iteration}}}");
                 let (accepted, report) = league.evaluate_and_promote(
@@ -294,9 +392,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
                 writeln!(evaluations, "{}", report.dump()).map_err(|e| e.to_string())?;
                 println!("{}", report.dump());
-                if report.get("pool_admitted").bool() {
-                    pool = league.policies(device)?;
-                }
+                pool_changed = report.get("pool_admitted").bool();
+            }
+            if opponent == Opponent::League {
+                recent_snapshot_added = league.freeze_recent(&policy, iteration as u64, false)?;
+                pool_changed |= recent_snapshot_added;
+            }
+            if pool_changed {
+                pool = league.policies(device)?;
             }
             let mut checkpoint = policy.checkpoint(iteration as u64, &rng)?;
             if let Json::Obj(fields) = &mut checkpoint {
@@ -327,6 +430,23 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             }
         }
+        let game_reports = Json::Arr(
+            result
+                .games
+                .iter()
+                .map(|g| {
+                    let mut report = g.report();
+                    report.set_path(
+                        "opponent_iteration",
+                        match g.opponent {
+                            Opponent::Frozen(i) => pool_before.arr()[i].clone(),
+                            _ => Json::Null,
+                        },
+                    );
+                    report
+                })
+                .collect(),
+        );
         let report = Json::Obj(vec![
             ("schema".into(), Json::Str(pipeline::SCHEMA.into())),
             ("iteration".into(), Json::Num(iteration as f64)),
@@ -341,9 +461,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 ),
             ),
             ("opponent_pool_before".into(), pool_before),
+            ("matchmaking_before".into(), matchmaking_before),
+            ("opponent_outcomes".into(), opponent_outcomes),
+            (
+                "exploration_summary".into(),
+                rollout::exploration_summary(&result),
+            ),
+            (
+                "recent_snapshot_added".into(),
+                Json::Bool(recent_snapshot_added),
+            ),
             (
                 "training_revision".into(),
-                Json::Str("v7-retention-2".into()),
+                Json::Str(pipeline::TRAINING_REVISION.into()),
             ),
             (
                 "champion_iteration".into(),
@@ -393,9 +523,34 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Json::Bool(update.as_ref().is_some_and(|u| u.kl_stopped)),
             ),
             (
-                "games".into(),
-                Json::Arr(result.games.iter().map(|g| g.report()).collect()),
+                "policy_loss".into(),
+                update
+                    .as_ref()
+                    .map(|u| Json::Num(u.policy_loss))
+                    .unwrap_or(Json::Null),
             ),
+            (
+                "value_loss".into(),
+                update
+                    .as_ref()
+                    .map(|u| Json::Num(u.value_loss))
+                    .unwrap_or(Json::Null),
+            ),
+            (
+                "policy_entropy".into(),
+                update
+                    .as_ref()
+                    .map(|u| Json::Num(u.entropy))
+                    .unwrap_or(Json::Null),
+            ),
+            (
+                "mean_ppo_kl".into(),
+                update
+                    .as_ref()
+                    .map(|u| Json::Num(u.mean_kl))
+                    .unwrap_or(Json::Null),
+            ),
+            ("games".into(), game_reports),
         ]);
         writeln!(metrics, "{}", report.dump()).map_err(|e| e.to_string())?;
         metrics.flush().map_err(|e| e.to_string())?;

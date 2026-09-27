@@ -1,13 +1,15 @@
 # Kaggriculture：Rust 混合生产半 RL
 
-> 当前训练机制修订见 [经验与对手保留修订](docs/mixed_v7_retention.md)：对手入池与冠军分离、分组经验库、分层探测采样。下文原 v7 的容量与采样说明以修订文档为准；旧模型可续训。
+> 当前版本：[独立策略与价值网络](docs/mixed_v7_independent.md)（v7-independent-6）。从零训练，策略/价值参数和梯度裁剪分别处理。旧共享网络检查点不兼容。
+
+对手与探索沿用 [PFSP](docs/mixed_v7_pfsp.md) 和 [分对局探索](docs/mixed_v7_exploration.md)；成功经验沿用 [受保护经验](docs/mixed_v7_league.md)。历史文档中的旧检查点续训命令不适用于当前版本。
 
 当前训练 pipeline：**mixed-production-v7**。Rust 采集、LibTorch CPU/CUDA 学习；farm2945 仅用于独立评估。
 
 ## 本版改动
 
 - **分层策略**：先选经营/路线类别，再选具体方案；随机训练与确定性执行使用相同分类。
-- **受控探索**：默认 `80% 当前策略 + 20% 生产类别均衡探索`，PPO 使用实际混合采样概率。等待保留为合法经营选项。
+- **受控探索**：每 32 局含 18 局纯策略随机、6 局 `80% 当前策略 + 20% 生产类别均衡探索`、8 局确定性探测，PPO 使用实际采样概率。等待保留为合法经营选项。
 - **投入与执行**：新建/转产项目每天最多 2 个、同时待启动最多 2 个，订单报价预算为当天开局现金的 25%。启动期保护最长 24 步，真实到货后调度。
 - **自生成成功经验**：约 25% 采集局使用确定性当前策略；它们与冻结历史模型的盈利轨迹可供独立辅助学习，不混入 PPO。
 - **真实现金回报**：按决策间隔记录实际现金变化和时间，用 GAE 计算目标；无开工、走路、采购次数奖励。
@@ -32,11 +34,11 @@ ROUTE_RL_TEST_CUDA=1 cargo test --manifest-path native/Cargo.toml --release --fe
 
 ## 短训练实验
 
-**使用新目录，从头训练；v5/v6 检查点不兼容，请不要使用旧的 `--resume` 路径。**
+**使用新目录，从头训练；旧共享网络检查点（包括 v7-pfsp-5）不兼容。只有本版本新训练生成的检查点可以续训。**
 
 ```bash
 native/target/release/mixed-train \
-  --out runs/mixed_v7_trial \
+  --out runs/mixed_v7_independent_trial \
   --iterations 10 \
   --games-per-update 32 \
   --workers 7 \
@@ -54,12 +56,12 @@ native/target/release/mixed-train \
 
 共 **10 轮、320 局采集**：每轮 24 局使用随机探索策略、8 局为确定性经验采集。确定性局不产生 PPO 样本。
 当前模型自对弈的随机局可使用双方样本；历史对手样本只进入独立经验筛选。
-第 5、10 轮各进行 32 局验证，额外共 64 局，不参与学习。
+第 5、10 轮进行验证，包含固定评估、轮换对手初筛及有条件的晋级复核；验证局数随对手池和初筛结果变化，不参与学习。
 `iterations` 为累计轮数；`games-per-update` 为完整对局数，同种子交换座位，必须为偶数。
 
 ### 看哪些输出
 
-- `metrics.jsonl`：采集与更新耗时、每局现金/工作/收获、经营类别选择、等待概率、经验库和辅助更新统计。
+- `metrics.jsonl`：新增 `policy_loss`、`value_loss`、`policy_entropy`、`mean_ppo_kl`；采集与更新耗时、每局现金/工作/收获、经营类别选择、等待概率、经验库和辅助更新统计。
 - `evaluations.jsonl`：固定验证种子的确定性/随机策略收益及冠军挑战结果。
 - `latest.json`：网络、Adam、训练随机状态、历史对手池、成功经验库，可直接续训。
 - `best.json`：仅在通过晋级时生成或替换；未生成表示尚未达标。
@@ -80,7 +82,7 @@ native/target/release/mixed-train \
 
 ```bash
 native/target/release/mixed-train \
-  --out runs/mixed_v7_trial --resume runs/mixed_v7_trial/latest.json \
+  --out runs/mixed_v7_independent_trial --resume runs/mixed_v7_independent_trial/latest.json \
   --iterations 20 --games-per-update 32 --workers 7 \
   --device cuda --epochs 2 --batch-size 256 \
   --seed 1200 --opponent league \
@@ -98,7 +100,7 @@ native/target/release/mixed-train \
 native/target/release/mixed-train \
   --mode evaluate --opponent heuristic \
   --out runs/mixed_v7_eval \
-  --resume runs/mixed_v7_trial/latest.json \
+  --resume runs/mixed_v7_independent_trial/latest.json \
   --seed 9001 --games-per-update 16 --workers 7 --device cuda
 ```
 
@@ -106,7 +108,7 @@ native/target/release/mixed-train \
 
 ```bash
 PYTHONPATH=src python -m route_rl.evaluate \
-  --checkpoint runs/mixed_v7_trial/latest.json \
+  --checkpoint runs/mixed_v7_independent_trial/latest.json \
   --seeds 9001 9002 --out runs/mixed_v7_eval/farm2945.json
 ```
 

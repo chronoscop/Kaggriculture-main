@@ -55,6 +55,9 @@ pub struct Game {
     pub exploration: f32,
     pub greedy_probe: bool,
     pub experiences: Vec<Experience>,
+    pub trade_stats: [super::behavior::TradeStats; 2],
+    pub opponent_role: String,
+    pub exploration_regime: String,
     pub learned_decisions: [usize; 2],
     pub wait_probability: [f64; 2],
     pub selected_groups: [[usize; 16]; 2],
@@ -79,6 +82,9 @@ impl Game {
             exploration: 0.,
             greedy_probe: false,
             experiences: vec![],
+            trade_stats: Default::default(),
+            opponent_role: opponent.name().into(),
+            exploration_regime: "standard".into(),
             learned_decisions: [0; 2],
             wait_probability: [0.; 2],
             selected_groups: [[0; 16]; 2],
@@ -179,6 +185,7 @@ impl Game {
                     ),
                 ]));
             }
+            super::behavior::observe_market(&self.state, &self.actions, &mut self.trade_stats);
             engine::step(&mut self.state, &self.actions);
             self.seat = 0;
         }
@@ -256,7 +263,16 @@ impl Game {
         Json::Obj(vec![
             ("seed".into(), Json::Num(self.seed as f64)),
             ("greedy_probe".into(), Json::Bool(self.greedy_probe)),
+            (
+                "exploration_regime".into(),
+                Json::Str(self.exploration_regime.clone()),
+            ),
+            ("exploration".into(), Json::Num(self.exploration as f64)),
             ("opponent".into(), Json::Str(self.opponent.name().into())),
+            (
+                "opponent_role".into(),
+                Json::Str(self.opponent_role.clone()),
+            ),
             (
                 "opponent_slot".into(),
                 match self.opponent {
@@ -353,6 +369,60 @@ pub struct Collection {
     pub inference_calls: usize,
     pub mean_batch: f64,
 }
+/// Descriptive cohort outcomes; opponent/seed mixes may differ, not a paired A/B.
+pub fn exploration_summary(c: &Collection) -> Json {
+    Json::Obj(
+        ["greedy", "focused", "broad", "standard"]
+            .iter()
+            .map(|&mode| {
+                let games: Vec<_> = c
+                    .games
+                    .iter()
+                    .filter(|g| g.exploration_regime == mode)
+                    .collect();
+                let n = games.len() as f64;
+                let cash = games
+                    .iter()
+                    .map(|g| g.state.farms[g.learner].money)
+                    .sum::<f64>();
+                let margin = games
+                    .iter()
+                    .map(|g| g.state.farms[g.learner].money - g.state.farms[1 - g.learner].money)
+                    .sum::<f64>();
+                let points = games
+                    .iter()
+                    .map(|g| {
+                        let d = g.state.farms[g.learner].money - g.state.farms[1 - g.learner].money;
+                        if d > 0. {
+                            1.
+                        } else if d == 0. {
+                            0.5
+                        } else {
+                            0.
+                        }
+                    })
+                    .sum::<f64>();
+                let mean = |value| {
+                    if n > 0. {
+                        Json::Num(value / n)
+                    } else {
+                        Json::Null
+                    }
+                };
+                (
+                    mode.into(),
+                    Json::Obj(vec![
+                        ("games".into(), Json::Num(n)),
+                        ("mean_cash".into(), mean(cash)),
+                        ("mean_margin".into(), mean(margin)),
+                        ("score_rate".into(), mean(points)),
+                    ]),
+                )
+            })
+            .collect(),
+    )
+}
+
 pub fn collect(
     policy: &Policy,
     seeds: &[i64],
@@ -396,6 +466,7 @@ pub fn collect_with_pool(
         record,
         0.,
         false,
+        None,
     )
 }
 
@@ -421,6 +492,31 @@ pub fn collect_exploring(
         record,
         exploration,
         true,
+        None,
+    )
+}
+pub fn collect_roster(
+    policy: &Policy,
+    seeds: &[i64],
+    workers: usize,
+    pool: &[Policy],
+    rng: &mut Rng,
+    record: bool,
+    exploration: f32,
+    roster: &super::league::Roster,
+) -> Result<Collection, String> {
+    collect_impl(
+        policy,
+        seeds,
+        workers,
+        Opponent::League,
+        pool,
+        false,
+        rng,
+        record,
+        exploration,
+        true,
+        Some(roster),
     )
 }
 /// One probe per full block of four seed pairs. Across four blocks, each
@@ -437,6 +533,34 @@ pub(crate) fn probe_schedule(count: usize, rng: &mut Rng) -> Vec<bool> {
     mask
 }
 
+/// Reserve one quarter of stochastic game pairs for broad exploration.
+/// The rest still sample the learned policy, with no extra uniform proposal.
+/// A pair's exploration mode stays fixed for the full season.
+pub const FOCUSED_EXPLORATION: f32 = 0.;
+pub(crate) fn league_exploration_plan(
+    probes: &[bool],
+    maximum: f32,
+    rng: &mut Rng,
+) -> Vec<(&'static str, f32)> {
+    let mut plan: Vec<_> = probes
+        .iter()
+        .map(|&probe| {
+            if probe {
+                ("greedy", 0.)
+            } else {
+                ("focused", FOCUSED_EXPLORATION)
+            }
+        })
+        .collect();
+    let mut candidates: Vec<_> = (0..probes.len()).filter(|&i| !probes[i]).collect();
+    for j in 0..candidates.len() / 4 {
+        let selected = j + (rng.uniform() * (candidates.len() - j) as f64) as usize;
+        candidates.swap(j, selected);
+        plan[candidates[j]] = ("broad", maximum);
+    }
+    plan
+}
+
 fn collect_impl(
     policy: &Policy,
     seeds: &[i64],
@@ -448,6 +572,7 @@ fn collect_impl(
     record: bool,
     exploration: f32,
     probes: bool,
+    roster: Option<&super::league::Roster>,
 ) -> Result<Collection, String> {
     if !exploration.is_finite() || !(0. ..=1.).contains(&exploration) {
         return Err("exploration must be between 0 and 1".into());
@@ -460,6 +585,24 @@ fn collect_impl(
             return Err("missing frozen opponent".into());
         }
     }
+    if let Some(r) = roster {
+        if r.recent.is_empty()
+            || r.historical.is_empty()
+            || r.probabilities.len() != r.historical.len()
+            || r.probabilities.iter().any(|p| !p.is_finite() || *p < 0.)
+            || (r.probabilities.iter().sum::<f64>() - 1.).abs() > 1e-8
+        {
+            return Err("invalid roster probabilities".into());
+        }
+        if std::iter::once(&r.champion)
+            .chain(r.recent.iter())
+            .chain(r.historical.iter())
+            .any(|&i| i >= pool.len())
+        {
+            return Err("missing roster opponent".into());
+        }
+    }
+    let schedule = roster.map(|r| r.schedule(seeds.len(), rng));
     let mut games = Vec::new();
     let offset = (rng.uniform() * 4.) as usize;
     let probe_mask = if probes && !deterministic {
@@ -467,8 +610,17 @@ fn collect_impl(
     } else {
         vec![false; seeds.len()]
     };
+    let exploration_plan = schedule.as_ref().map(|schedule| {
+        league_exploration_plan(
+            &schedule.iter().map(|s| s.2).collect::<Vec<_>>(),
+            exploration,
+            rng,
+        )
+    });
     for (index, &seed) in seeds.iter().enumerate() {
-        let selected = if opponent == Opponent::League {
+        let selected = if let Some(schedule) = &schedule {
+            schedule[index].0
+        } else if opponent == Opponent::League {
             match (index + offset) % 4 {
                 0 => Opponent::Heuristic,
                 1 => Opponent::SelfPlay,
@@ -482,12 +634,31 @@ fn collect_impl(
         };
         for seat in 0..2 {
             let mut game = Game::new(seed, seat, selected, record);
-            game.greedy_probe = probes && !deterministic && probe_mask[index];
-            game.exploration = if deterministic || game.greedy_probe {
-                0.
+            game.greedy_probe = probes
+                && !deterministic
+                && schedule
+                    .as_ref()
+                    .map(|s| s[index].2)
+                    .unwrap_or(probe_mask[index]);
+            if let Some(s) = &schedule {
+                game.opponent_role = s[index].1.into();
+            }
+            if let Some(plan) = &exploration_plan {
+                game.exploration = plan[index].1;
+                game.exploration_regime = plan[index].0.into();
             } else {
-                exploration
-            };
+                game.exploration = if deterministic || game.greedy_probe {
+                    0.
+                } else {
+                    exploration
+                };
+                game.exploration_regime = if deterministic || game.greedy_probe {
+                    "greedy"
+                } else {
+                    "standard"
+                }
+                .into();
+            }
             games.push(game);
         }
     }

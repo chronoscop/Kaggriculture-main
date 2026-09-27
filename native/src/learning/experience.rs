@@ -1,9 +1,9 @@
 //! Self-generated profitable episodes. Separate from the PPO on-policy stream.
 use super::policy::{Rng, Sample};
 use kagg_engine::json::Json;
-pub const CAPACITY: usize = 128;
-pub const PER_SOURCE: usize = 32;
-pub const PER_STYLE: usize = 4;
+pub const CAPACITY: usize = 192;
+pub const PER_SOURCE: usize = 48;
+pub const PER_BUCKET: usize = 16;
 pub const ROWS_PER_EPISODE: usize = 32;
 #[derive(Clone)]
 pub struct Experience {
@@ -15,6 +15,7 @@ pub struct Experience {
     pub opponent: String,
     pub learner_seat: Option<usize>,
     pub collected_iteration: u64,
+    pub retention_bucket: String,
 }
 impl Experience {
     pub fn from_episode(
@@ -64,6 +65,7 @@ impl Experience {
             opponent: "legacy".into(),
             learner_seat: None,
             collected_iteration: 0,
+            retention_bucket: "unassigned".into(),
         })
     }
     pub fn json(&self) -> Json {
@@ -71,6 +73,10 @@ impl Experience {
             ("seed".into(), Json::Str(self.seed.to_string())),
             ("seat".into(), Json::Num(self.seat as f64)),
             ("profit".into(), Json::Num(self.profit)),
+            (
+                "retention_bucket".into(),
+                Json::Str(self.retention_bucket.clone()),
+            ),
             ("style".into(), Json::Num(self.style as f64)),
             ("opponent".into(), Json::Str(self.opponent.clone())),
             (
@@ -109,87 +115,78 @@ impl ExperienceBank {
     }
     fn retain_balanced(&mut self) {
         use std::collections::BTreeMap;
-        let mut groups: BTreeMap<String, BTreeMap<u32, Vec<Experience>>> = BTreeMap::new();
+        let mut sources: BTreeMap<String, Vec<Experience>> = BTreeMap::new();
         for e in self.episodes.drain(..) {
-            groups
-                .entry(e.opponent.clone())
-                .or_default()
-                .entry(e.style)
-                .or_default()
-                .push(e);
+            sources.entry(e.opponent.clone()).or_default().push(e);
         }
-        // Retire provenance-free legacy rows once fresh coverage exists in every
-        // live source. They cannot be assigned to an opponent retrospectively.
-        if ["heuristic", "current", "historical"].iter().all(|source| {
-            groups
-                .get(*source)
-                .is_some_and(|styles| styles.values().map(Vec::len).sum::<usize>() >= 8)
-        }) {
-            groups.remove("legacy");
+        if ["heuristic", "current", "historical"]
+            .iter()
+            .all(|s| sources.get(*s).is_some_and(|v| v.len() >= 8))
+        {
+            sources.remove("legacy");
         }
-        for (_, styles) in groups {
-            let mut retained = Vec::new();
-            for (_, mut episodes) in styles {
-                episodes.sort_by(|a, b| {
-                    b.profit
-                        .total_cmp(&a.profit)
-                        .then(b.collected_iteration.cmp(&a.collected_iteration))
-                        .then(b.seed.cmp(&a.seed))
-                });
-                let best: Vec<_> = episodes
-                    .drain(..episodes.len().min(PER_STYLE / 2))
-                    .collect();
-                episodes.sort_by(|a, b| {
-                    b.collected_iteration
-                        .cmp(&a.collected_iteration)
-                        .then(b.seed.cmp(&a.seed))
-                        .then(b.profit.total_cmp(&a.profit))
-                });
-                let recent: Vec<_> = episodes.into_iter().take(PER_STYLE / 2).collect();
-                // When source capacity binds, offer a recent episode before the
-                // second profit leader, not only after both profit leaders.
-                let mut chosen = Vec::new();
-                for rank in 0..PER_STYLE / 2 {
-                    if let Some(e) = best.get(rank) {
-                        chosen.push(e.clone());
-                    }
-                    if let Some(e) = recent.get(rank) {
-                        chosen.push(e.clone());
-                    }
-                }
-                retained.push(chosen);
-            }
-            // Keep coverage across styles; when there are too many, favor recently seen styles.
-            retained.sort_by_key(|v| {
-                std::cmp::Reverse(
-                    v.iter()
-                        .map(|e| (e.collected_iteration, e.seed))
-                        .max()
-                        .unwrap(),
-                )
+        for (_, mut remaining) in sources {
+            // Protected elite capacity: neither recency nor new style IDs can evict it.
+            remaining.sort_by(|a, b| {
+                b.profit
+                    .total_cmp(&a.profit)
+                    .then(a.collected_iteration.cmp(&b.collected_iteration))
+                    .then(a.seed.cmp(&b.seed))
+                    .then(a.seat.cmp(&b.seat))
+                    .then(a.learner_seat.cmp(&b.learner_seat))
             });
-            let mut count = 0;
-            for rank in 0..PER_STYLE {
-                for style in &retained {
-                    if count < PER_SOURCE {
-                        if let Some(e) = style.get(rank) {
-                            self.episodes.push(e.clone());
-                            count += 1;
-                        }
-                    }
-                }
+            for mut e in remaining.drain(..remaining.len().min(PER_BUCKET)) {
+                e.retention_bucket = "elite".into();
+                self.episodes.push(e);
+            }
+            remaining.sort_by(|a, b| {
+                b.collected_iteration
+                    .cmp(&a.collected_iteration)
+                    .then(b.seed.cmp(&a.seed))
+                    .then(b.profit.total_cmp(&a.profit))
+                    .then(a.seat.cmp(&b.seat))
+                    .then(a.learner_seat.cmp(&b.learner_seat))
+            });
+            for mut e in remaining.drain(..remaining.len().min(PER_BUCKET)) {
+                e.retention_bucket = "recent".into();
+                self.episodes.push(e);
+            }
+            // Diversity has its own capacity and does not compete with elites.
+            remaining.sort_by(|a, b| {
+                b.profit
+                    .total_cmp(&a.profit)
+                    .then(a.seed.cmp(&b.seed))
+                    .then(a.seat.cmp(&b.seat))
+                    .then(a.learner_seat.cmp(&b.learner_seat))
+            });
+            let mut styles = Vec::<u32>::new();
+            for _ in 0..PER_BUCKET.min(remaining.len()) {
+                let i = (0..remaining.len())
+                    .max_by_key(|&i| {
+                        let d = styles
+                            .iter()
+                            .map(|s| (s ^ remaining[i].style).count_ones())
+                            .min()
+                            .unwrap_or(32);
+                        (d, std::cmp::Reverse(i))
+                    })
+                    .unwrap();
+                let mut e = remaining.remove(i);
+                styles.push(e.style);
+                e.retention_bucket = "diverse".into();
+                self.episodes.push(e);
             }
         }
         debug_assert!(self.episodes.len() <= CAPACITY);
     }
     pub fn sample(&self, count: usize, rng: &mut Rng) -> Vec<Sample> {
         use std::collections::BTreeMap;
-        let mut groups: BTreeMap<&str, BTreeMap<u32, Vec<&Experience>>> = BTreeMap::new();
+        let mut groups: BTreeMap<&str, BTreeMap<&str, Vec<&Experience>>> = BTreeMap::new();
         for e in &self.episodes {
             groups
                 .entry(&e.opponent)
                 .or_default()
-                .entry(e.style)
+                .entry(&e.retention_bucket)
                 .or_default()
                 .push(e);
         }
@@ -223,6 +220,49 @@ impl ExperienceBank {
                         source.into(),
                         Json::Obj(vec![
                             ("episodes".into(), Json::Num(es.len() as f64)),
+                            (
+                                "buckets".into(),
+                                Json::Obj(
+                                    ["elite", "recent", "diverse"]
+                                        .iter()
+                                        .map(|&bucket| {
+                                            let rows: Vec<_> = es
+                                                .iter()
+                                                .filter(|e| e.retention_bucket == bucket)
+                                                .collect();
+                                            (
+                                                bucket.into(),
+                                                Json::Obj(vec![
+                                                    (
+                                                        "episodes".into(),
+                                                        Json::Num(rows.len() as f64),
+                                                    ),
+                                                    (
+                                                        "oldest_iteration".into(),
+                                                        Json::Num(
+                                                            rows.iter()
+                                                                .map(|e| e.collected_iteration)
+                                                                .min()
+                                                                .unwrap_or(0)
+                                                                as f64,
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "newest_iteration".into(),
+                                                        Json::Num(
+                                                            rows.iter()
+                                                                .map(|e| e.collected_iteration)
+                                                                .max()
+                                                                .unwrap_or(0)
+                                                                as f64,
+                                                        ),
+                                                    ),
+                                                ]),
+                                            )
+                                        })
+                                        .collect(),
+                                ),
+                            ),
                             (
                                 "rows".into(),
                                 Json::Num(es.iter().map(|e| e.rows.len()).sum::<usize>() as f64),
@@ -302,6 +342,7 @@ impl ExperienceBank {
                     .map_err(|_| "invalid experience iteration")?
             };
             bank.episodes.push(Experience {
+                retention_bucket: e.get("retention_bucket").str().into(),
                 opponent: opponent.into(),
                 learner_seat,
                 collected_iteration,
@@ -315,6 +356,27 @@ impl ExperienceBank {
                 style: e.get("style").i64() as u32,
                 rows,
             });
+        }
+        if j.arr().iter().any(|e| e.get("retention_bucket").is_null()) {
+            bank.retain_balanced();
+        } else {
+            use std::collections::{BTreeMap, BTreeSet};
+            let mut counts = BTreeMap::new();
+            let mut seen = BTreeSet::new();
+            for e in &bank.episodes {
+                if !["elite", "recent", "diverse"].contains(&e.retention_bucket.as_str())
+                    || !seen.insert((e.seed, e.seat, e.learner_seat))
+                {
+                    return Err("invalid retained experience".into());
+                }
+                let n = counts
+                    .entry((&e.opponent, &e.retention_bucket))
+                    .or_insert(0);
+                *n += 1;
+                if *n > PER_BUCKET {
+                    return Err("experience bucket exceeds capacity".into());
+                }
+            }
         }
         Ok(bank)
     }

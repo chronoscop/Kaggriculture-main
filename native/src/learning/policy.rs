@@ -4,7 +4,7 @@ use kagg_engine::json::Json;
 pub const CONTEXT: usize = 96;
 pub const CANDIDATE: usize = 32;
 pub const GROUPS: usize = 16;
-const SPECS: [(&str, &[i64]); 16] = [
+const SPECS: [(&str, &[i64]); 20] = [
     ("context.0.weight", &[64, 96]),
     ("context.0.bias", &[64]),
     ("context.2.weight", &[64, 64]),
@@ -21,6 +21,10 @@ const SPECS: [(&str, &[i64]); 16] = [
     ("value.2.bias", &[1]),
     ("group.weight", &[16, 64]),
     ("group.bias", &[16]),
+    ("critic_context.0.weight", &[64, 96]),
+    ("critic_context.0.bias", &[64]),
+    ("critic_context.2.weight", &[64, 64]),
+    ("critic_context.2.bias", &[64]),
 ];
 pub struct Rng(pub u64);
 impl Rng {
@@ -121,8 +125,12 @@ impl Policy {
             .dim(4, -1)?;
         let head = self.linear(&z, 14)?;
         let lp = Tensor::operation(44, &[&scores, &head, &b.groups, &b.mask], &[], &[])?;
+        // Value regression must not update the actor context representation.
+        let critic_z = self
+            .linear(&self.linear(&b.context, 16)?.unary(1)?, 18)?
+            .unary(1)?;
         let value = self
-            .linear(&self.linear(&z, 10)?.unary(1)?, 12)?
+            .linear(&self.linear(&critic_z, 10)?.unary(1)?, 12)?
             .dim(4, -1)?;
         Ok((lp, value))
     }
@@ -309,7 +317,7 @@ impl Policy {
             || checkpoint.get("policy_contract").str() != crate::pipeline::ENCODING
             || checkpoint.get("rng_algorithm").str() != "splitmix64"
         {
-            return Err("incompatible native checkpoint".into());
+            return Err("incompatible native checkpoint: independent actor/critic requires a new run or a matching checkpoint; old shared-network checkpoints are not migrated".into());
         }
         let uint = |key: &str| {
             checkpoint
@@ -343,45 +351,51 @@ impl Policy {
         self.lr = lr;
         Ok((iteration, rng))
     }
+    fn is_critic(name: &str) -> bool {
+        name.starts_with("critic_context.") || name.starts_with("value.")
+    }
     fn adam(&mut self) -> Result<(), String> {
         let _guard = NoGrad::new();
-        let mut grads = Vec::new();
-        let mut norms = Vec::new();
-        for (i, p) in self.parameters.iter().enumerate() {
-            if p.value.has_grad() {
-                let g = p.value.unary(33)?;
-                norms.push(g.unary(37)?.dim(3, 0)?);
-                grads.push((i, g));
+        // Clip separately: a large critic gradient must not scale down actor updates.
+        for critic in [false, true] {
+            let mut grads = Vec::new();
+            let mut norms = Vec::new();
+            for (i, p) in self.parameters.iter().enumerate() {
+                if Self::is_critic(p.name) == critic && p.value.has_grad() {
+                    let g = p.value.unary(33)?;
+                    norms.push(g.unary(37)?.dim(3, 0)?);
+                    grads.push((i, g));
+                }
             }
-        }
-        if grads.is_empty() {
-            return Ok(());
-        }
-        let refs: Vec<_> = norms.iter().collect();
-        let norm = Tensor::operation(2, &refs, &[0], &[])?.unary(37)?;
-        let coef = Tensor::operation(
-            19,
-            &[&norm.scalar(30, 1e-6)?.unary(38)?.scalar(31, 0.5)?],
-            &[],
-            &[0., 1.],
-        )?;
-        for (i, mut g) in grads {
-            let p = &mut self.parameters[i];
-            let clipped = g.binary(14, &coef)?;
-            g.copy_from(&clipped)?;
-            p.step += 1;
-            p.m = Tensor::operation(40, &[&p.m, &g], &[], &[0.1])?;
-            p.v = Tensor::operation(41, &[&p.v.scalar(31, 0.999)?, &g, &g], &[], &[0.001])?;
-            let correction1 = 1. - 0.9f64.powf(p.step as f64);
-            let correction2 = (1. - 0.999f64.powf(p.step as f64)).sqrt();
-            let denom = p.v.unary(28)?.scalar(43, correction2)?.scalar(30, 1e-8)?;
-            let updated = Tensor::operation(
-                39,
-                &[&p.value, &p.m, &denom],
+            if grads.is_empty() {
+                continue;
+            }
+            let refs: Vec<_> = norms.iter().collect();
+            let norm = Tensor::operation(2, &refs, &[0], &[])?.unary(37)?;
+            let coef = Tensor::operation(
+                19,
+                &[&norm.scalar(30, 1e-6)?.unary(38)?.scalar(31, 0.5)?],
                 &[],
-                &[-self.lr / correction1],
+                &[0., 1.],
             )?;
-            p.value.copy_from(&updated)?;
+            for (i, mut g) in grads {
+                let p = &mut self.parameters[i];
+                let clipped = g.binary(14, &coef)?;
+                g.copy_from(&clipped)?;
+                p.step += 1;
+                p.m = Tensor::operation(40, &[&p.m, &g], &[], &[0.1])?;
+                p.v = Tensor::operation(41, &[&p.v.scalar(31, 0.999)?, &g, &g], &[], &[0.001])?;
+                let correction1 = 1. - 0.9f64.powf(p.step as f64);
+                let correction2 = (1. - 0.999f64.powf(p.step as f64)).sqrt();
+                let denom = p.v.unary(28)?.scalar(43, correction2)?.scalar(30, 1e-8)?;
+                let updated = Tensor::operation(
+                    39,
+                    &[&p.value, &p.m, &denom],
+                    &[],
+                    &[-self.lr / correction1],
+                )?;
+                p.value.copy_from(&updated)?;
+            }
         }
         Ok(())
     }
@@ -409,6 +423,9 @@ impl Policy {
         if kl > 0.02 {
             return Ok(Update {
                 loss: None,
+                policy_loss: 0.,
+                value_loss: 0.,
+                entropy: 0.,
                 kl,
                 stopped: true,
             });
@@ -442,6 +459,9 @@ impl Policy {
         self.adam()?;
         Ok(Update {
             loss: Some(scalar),
+            policy_loss: policy.value()?,
+            value_loss: values.value()?,
+            entropy: entropy.value()?,
             kl,
             stopped: false,
         })
@@ -457,6 +477,9 @@ impl Policy {
             samples: rows.len(),
             updates: 0,
             loss: 0.,
+            policy_loss: 0.,
+            value_loss: 0.,
+            entropy: 0.,
             mean_kl: 0.,
             kl_stopped: false,
         };
@@ -520,11 +543,17 @@ impl Policy {
                 metrics.updates += 1;
                 metrics.loss += result.loss.unwrap();
                 metrics.mean_kl += result.kl;
+                metrics.policy_loss += result.policy_loss;
+                metrics.value_loss += result.value_loss;
+                metrics.entropy += result.entropy;
             }
         }
         if metrics.updates > 0 {
             metrics.loss /= metrics.updates as f64;
             metrics.mean_kl /= metrics.updates as f64;
+            metrics.policy_loss /= metrics.updates as f64;
+            metrics.value_loss /= metrics.updates as f64;
+            metrics.entropy /= metrics.updates as f64;
         }
         Ok(metrics)
     }
@@ -537,6 +566,9 @@ pub struct Decision {
 }
 pub struct Update {
     pub loss: Option<f64>,
+    pub policy_loss: f64,
+    pub value_loss: f64,
+    pub entropy: f64,
     pub kl: f64,
     pub stopped: bool,
 }
@@ -544,6 +576,9 @@ pub struct Metrics {
     pub samples: usize,
     pub updates: usize,
     pub loss: f64,
+    pub policy_loss: f64,
+    pub value_loss: f64,
+    pub entropy: f64,
     pub mean_kl: f64,
     pub kl_stopped: bool,
 }
@@ -810,5 +845,135 @@ pub fn cash_returns(rows: &mut [Sample], final_step: i64, final_cash: f32, lambd
         next_cash = r.cash;
         next_value = r.value;
         next_adv = r.advantage;
+    }
+}
+
+#[cfg(test)]
+mod independent_tests {
+    use super::*;
+
+    fn batch(device: i32) -> Batch {
+        let rows: Vec<_> = (0..3)
+            .map(|i| {
+                let mut features = vec![vec![0.; CANDIDATE]; 3];
+                features[1][31] = 2.;
+                features[1][2] = 1.;
+                features[2][31] = 14.;
+                features[2][1] = 1.;
+                Sample {
+                    context: (0..CONTEXT).map(|j| ((i + j) % 7) as f32 / 7.).collect(),
+                    features,
+                    ..Sample::default()
+                }
+            })
+            .collect();
+        Batch::new(&rows, device).unwrap()
+    }
+
+    #[test]
+    fn actor_and_critic_gradients_and_optimizer_states_are_isolated() {
+        super::super::tensor::threads(1);
+        let devices = if std::env::var_os("ROUTE_RL_TEST_CUDA").is_some() {
+            vec![-1, 0]
+        } else {
+            vec![-1]
+        };
+        for device in devices {
+            for train_critic in [false, true] {
+                let mut p = Policy::mixed_routes(device, 432, 1e-4).unwrap();
+                let b = batch(device);
+                let before = p.weights_json().unwrap();
+                let (lp, v) = p.forward(&b).unwrap();
+                let value_before = v.data().unwrap();
+                let lp_before = lp.data().unwrap();
+                let loss = if train_critic {
+                    v.scalar(30, -3.)
+                        .unwrap()
+                        .unary(24)
+                        .unwrap()
+                        .unary(18)
+                        .unwrap()
+                } else {
+                    lp.unary(18).unwrap().unary(32).unwrap()
+                };
+                loss.backward().unwrap();
+                for param in &p.parameters {
+                    assert_eq!(
+                        param.value.has_grad(),
+                        Policy::is_critic(param.name) == train_critic,
+                        "{}",
+                        param.name
+                    );
+                }
+                p.adam().unwrap();
+                let after = p.weights_json().unwrap();
+                for param in &p.parameters {
+                    if Policy::is_critic(param.name) != train_critic {
+                        assert_eq!(before.get(param.name), after.get(param.name));
+                        assert_eq!(param.step, 0);
+                        assert!(param.m.data().unwrap().iter().all(|&x| x == 0.));
+                        assert!(param.v.data().unwrap().iter().all(|&x| x == 0.));
+                    }
+                }
+                let (lp, v) = p.forward(&b).unwrap();
+                if train_critic {
+                    assert_eq!(lp_before, lp.data().unwrap());
+                    assert_ne!(value_before, v.data().unwrap());
+                } else {
+                    assert_eq!(value_before, v.data().unwrap());
+                    assert_ne!(lp_before, lp.data().unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn critic_gradient_scale_does_not_change_actor_adam_updates() {
+        super::super::tensor::threads(1);
+        let mut a = Policy::mixed_routes(-1, 765, 1e-4).unwrap();
+        let mut b = Policy::mixed_routes(-1, 765, 1e-4).unwrap();
+        let batch = batch(-1);
+        for _ in 0..3 {
+            for (p, scale) in [(&mut a, 1.), (&mut b, 10000.)] {
+                for param in &mut p.parameters {
+                    param.value.zero_grad();
+                }
+                let (lp, v) = p.forward(&batch).unwrap();
+                let actor = lp.unary(18).unwrap().unary(32).unwrap();
+                let critic = v
+                    .scalar(30, -3.)
+                    .unwrap()
+                    .unary(24)
+                    .unwrap()
+                    .unary(18)
+                    .unwrap()
+                    .scalar(31, scale)
+                    .unwrap();
+                actor.binary(12, &critic).unwrap().backward().unwrap();
+                p.adam().unwrap();
+            }
+            for (a, b) in a.parameters.iter().zip(&b.parameters) {
+                if !Policy::is_critic(a.name) {
+                    assert_eq!(a.value.data().unwrap(), b.value.data().unwrap());
+                    assert_eq!(a.m.data().unwrap(), b.m.data().unwrap());
+                    assert_eq!(a.v.data().unwrap(), b.v.data().unwrap());
+                    assert_eq!(a.step, b.step);
+                }
+            }
+        }
+        let checkpoint = a.checkpoint(3, &Rng(19)).unwrap();
+        let mut restored = Policy::mixed_routes(-1, 99, 1e-4).unwrap();
+        restored.restore(&checkpoint).unwrap();
+        assert_eq!(checkpoint, restored.checkpoint(3, &Rng(19)).unwrap());
+        let mut old = checkpoint;
+        old.set_path(
+            "policy_contract",
+            Json::Str("mixed-routes-96x32-hierarchy-cash-v3".into()),
+        );
+        assert!(restored
+            .restore(&old)
+            .err()
+            .unwrap()
+            .contains("independent actor/critic"));
     }
 }

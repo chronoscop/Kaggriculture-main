@@ -450,12 +450,13 @@ fn league_mixes_opponents_excludes_historical_rows_and_preserves_frozen_weights(
 #[cfg(feature = "train")]
 #[test]
 fn league_gate_rejects_idle_regression_and_losing_to_champion() {
-    use super::league::{qualifies, Score};
+    use super::league::{anchor_guard, qualifies_for_pool, Score};
     let champion = Score {
         games: 8,
         cash: 3200.,
         margin: -200.,
         win_rate: 0.25,
+        draw_rate: 0.,
         work: 100.,
         harvest: 20.,
         idle_fraction: 0.5,
@@ -466,15 +467,15 @@ fn league_gate_rejects_idle_regression_and_losing_to_champion() {
     candidate.margin = 100.;
     let mut duel = candidate.clone();
     duel.win_rate = 0.75;
-    assert!(qualifies(&candidate, &champion, &duel));
+    assert!(anchor_guard(&candidate, &champion) && qualifies_for_pool(&candidate, &duel));
     candidate.inactive_games = 1;
-    assert!(!qualifies(&candidate, &champion, &duel));
+    assert!(!(anchor_guard(&candidate, &champion) && qualifies_for_pool(&candidate, &duel)));
     candidate.inactive_games = 0;
-    candidate.margin = -201.;
-    assert!(!qualifies(&candidate, &champion, &duel));
-    candidate.margin = 100.;
+    candidate.cash = 2000.;
+    assert!(!anchor_guard(&candidate, &champion));
+    candidate.cash = 3500.;
     duel.margin = -1.;
-    assert!(!qualifies(&candidate, &champion, &duel));
+    assert!(!(anchor_guard(&candidate, &champion) && qualifies_for_pool(&candidate, &duel)));
 }
 
 #[cfg(feature = "train")]
@@ -485,12 +486,15 @@ fn validation_cannot_promote_an_unchanged_policy() {
     tensor::threads(1);
     let policy = Policy::mixed_routes(-1, 1200, 1e-4).unwrap();
     let mut league = League::new(&policy).unwrap();
-    let before = league.json().dump();
+    let weights = league.snapshots[0].weights.clone();
     let (promoted, report) = league
         .evaluate_and_promote(&policy, 5, &[1000000000], 2, 77)
         .unwrap();
     assert!(!promoted);
-    assert_eq!(before, league.json().dump());
+    assert_eq!(league.snapshots.len(), 1);
+    assert_eq!(weights, league.snapshots[0].weights);
+    assert!(!report.get("pool_admitted").bool());
+    assert!(report.get("confirmation").is_null());
     assert_eq!(
         report.get("greedy_vs_heuristic").dump(),
         report.get("champion_vs_heuristic").dump()
@@ -680,7 +684,7 @@ fn profitable_experience_is_bounded_resumable_and_learned_separately() {
             Experience::from_episode(seed, 0, 100. + seed as f64, 3, &[row.clone()]).unwrap(),
         );
     }
-    assert_eq!(bank.episodes.len(), 4);
+    assert_eq!(bank.episodes.len(), 20);
     assert!(bank.episodes.len() <= CAPACITY);
     let j = bank.json();
     let restored = ExperienceBank::restore(&j).unwrap();
@@ -736,13 +740,14 @@ fn probe_assignment_covers_all_opponent_types_in_each_32_game_batch() {
 #[cfg(feature = "train")]
 #[test]
 fn competitive_pool_entry_does_not_replace_or_evict_champion() {
-    use super::league::{qualifies, qualifies_for_pool, League, Score, Snapshot, CAPACITY};
+    use super::league::{anchor_guard, qualifies_for_pool, League, Score, Snapshot, CAPACITY};
     use kagg_engine::json::Json;
     let champion = Score {
         games: 8,
         cash: 60000.,
         margin: 54000.,
         win_rate: 1.,
+        draw_rate: 0.,
         work: 800.,
         harvest: 200.,
         idle_fraction: 0.1,
@@ -753,7 +758,7 @@ fn competitive_pool_entry_does_not_replace_or_evict_champion() {
     let mut duel = champion.clone();
     duel.margin = 5026.;
     duel.win_rate = 0.75;
-    assert!(!qualifies(&candidate, &champion, &duel));
+    assert!(anchor_guard(&candidate, &champion));
     assert!(qualifies_for_pool(&candidate, &duel));
     duel.inactive_games = 1;
     assert!(!qualifies_for_pool(&candidate, &duel));
@@ -767,6 +772,7 @@ fn competitive_pool_entry_does_not_replace_or_evict_champion() {
             Snapshot {
                 iteration,
                 weights: Json::Obj(vec![]),
+                profile: None,
             },
             false,
         );
@@ -780,6 +786,7 @@ fn competitive_pool_entry_does_not_replace_or_evict_champion() {
         Snapshot {
             iteration: 1040,
             weights: Json::Obj(vec![]),
+            profile: None,
         },
         true,
     );
@@ -872,7 +879,13 @@ fn experience_retains_recent_routes_and_balances_opponent_sources() {
     let mut legacy = make(0, "heuristic", 1, 100.).json();
     if let kagg_engine::json::Json::Obj(ref mut fields) = legacy {
         fields.retain(|(k, _)| {
-            !["opponent", "learner_seat", "collected_iteration"].contains(&k.as_str())
+            ![
+                "opponent",
+                "learner_seat",
+                "collected_iteration",
+                "retention_bucket",
+            ]
+            .contains(&k.as_str())
         });
     }
     let old = ExperienceBank::restore(&kagg_engine::json::Json::Arr(vec![legacy])).unwrap();
@@ -880,4 +893,462 @@ fn experience_retains_recent_routes_and_balances_opponent_sources() {
     assert_eq!(old.episodes[0].learner_seat, None);
     bank.insert(old.episodes[0].clone());
     assert!(!bank.episodes.iter().any(|e| e.opponent == "legacy"));
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn protected_elites_survive_hundreds_of_new_styles_and_resume() {
+    use crate::learning::{
+        experience::{Experience, ExperienceBank, PER_BUCKET, PER_SOURCE},
+        policy::{Rng, Sample},
+    };
+    let mut row = Sample {
+        context: vec![0.; 96],
+        features: vec![vec![0.; 32]],
+        mc_return: 1.,
+        ..Default::default()
+    };
+    row.features[0][31] = 2.;
+    let make = |seed: i64, profit: f64| {
+        let mut e = Experience::from_episode(seed, 0, profit, 1, &[row.clone()]).unwrap();
+        e.opponent = "historical".into();
+        e.style = seed as u32;
+        e.collected_iteration = seed as u64;
+        e.learner_seat = Some(0);
+        e.rows[0].context[0] = seed as f32;
+        e
+    };
+    let mut bank = ExperienceBank::default();
+    for i in 1..=16 {
+        bank.insert(make(i, 10000. + i as f64));
+    }
+    for i in 17..600 {
+        bank.insert(make(i, 100.));
+    }
+    assert_eq!(bank.episodes.len(), PER_SOURCE);
+    for name in ["elite", "recent", "diverse"] {
+        assert_eq!(
+            bank.episodes
+                .iter()
+                .filter(|e| e.retention_bucket == name)
+                .count(),
+            PER_BUCKET
+        );
+    }
+    assert_eq!(
+        bank.episodes
+            .iter()
+            .filter(|e| e.retention_bucket == "elite")
+            .map(|e| e.seed)
+            .collect::<std::collections::BTreeSet<_>>(),
+        (1..=16).collect()
+    );
+    assert!(bank
+        .episodes
+        .iter()
+        .filter(|e| e.retention_bucket == "recent")
+        .all(|e| e.seed >= 584));
+    let sampled = bank.sample(6000, &mut Rng(8));
+    let elite = sampled.iter().filter(|r| r.context[0] <= 16.).count();
+    assert!((1700..2300).contains(&elite));
+    let mut restored = ExperienceBank::restore(&bank.json()).unwrap();
+    assert_eq!(bank.json(), restored.json());
+    for i in 600..900 {
+        let e = make(i, 110.);
+        bank.insert(e.clone());
+        restored.insert(e);
+    }
+    assert_eq!(bank.json(), restored.json());
+    assert_eq!(
+        bank.episodes
+            .iter()
+            .filter(|e| e.retention_bucket == "elite" && e.seed <= 16)
+            .count(),
+        16
+    );
+    assert_eq!(
+        bank.episodes
+            .iter()
+            .map(|e| (e.seed, e.seat, e.learner_seat))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        bank.episodes.len()
+    );
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn training_roster_covers_history_and_preserves_seat_pair_probes() {
+    use super::{league::Roster, rollout::Opponent};
+    use crate::learning::policy::Rng;
+    let roster = Roster {
+        champion: 2,
+        recent: vec![4, 3],
+        historical: vec![0, 1, 2],
+        probabilities: vec![0.4, 0.3, 0.3],
+        phase: 10,
+    };
+    let schedule = roster.schedule(16, &mut Rng(9));
+    let count = |role: &str| schedule.iter().filter(|x| x.1 == role).count() * 2;
+    assert_eq!(
+        [
+            count("recent"),
+            count("pfsp"),
+            count("coverage"),
+            count("current"),
+            count("heuristic")
+        ],
+        [12, 12, 4, 2, 2]
+    );
+    assert!(schedule.iter().filter(|x| x.1 == "recent").all(|x| [
+        Opponent::Frozen(3),
+        Opponent::Frozen(4)
+    ]
+    .contains(&x.0)));
+    assert_eq!(schedule.iter().filter(|x| x.2).count(), 4);
+    for n in 1..33 {
+        assert_eq!(
+            roster
+                .schedule(n, &mut Rng(9))
+                .iter()
+                .filter(|x| x.2)
+                .count(),
+            n / 4
+        );
+    }
+    let mut a = Rng(80);
+    let mut b = Rng(80);
+    assert_eq!(roster.schedule(32, &mut a), roster.schedule(32, &mut b));
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn actual_market_profile_accounts_for_partial_sales_and_preserves_state() {
+    use super::behavior::{observe_market, Profile, TradeStats};
+    use kagg_engine::engine::PlayerAction;
+    let mut state = State::new(42);
+    state.private[0].shed.add("MILK", 3);
+    state.private[1].shed.add("MILK", 2);
+    let a = |n: &str| PlayerAction {
+        market: vec![vec!["SELL".into(), "MILK".into(), n.into()]],
+        ..Default::default()
+    };
+    let actions = [a("99"), a("2")];
+    let mut stats: [TradeStats; 2] = Default::default();
+    observe_market(&state, &actions, &mut stats);
+    assert_eq!(state.private[0].shed.get("MILK"), 3);
+    assert_eq!(state.farms[0].money, 3000.);
+    let mut actual = state.clone();
+    engine::step(&mut actual, &actions);
+    let milk = kagg_engine::state::PRODUCTS
+        .iter()
+        .position(|x| *x == "MILK")
+        .unwrap();
+    assert_eq!(stats[0].units[milk], 3);
+    assert_eq!(stats[1].units[milk], 2);
+    for p in 0..2 {
+        assert_eq!(
+            stats[p].revenue[milk],
+            actual.farms[p].money - state.farms[p].money
+        );
+    }
+    let p = Profile {
+        values: vec![0.; 11],
+    };
+    assert_eq!(p.distance(&p), 0.);
+    assert_eq!(Profile::parse(&p.json()).unwrap().unwrap().values, p.values);
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn hard_history_and_recent_versions_survive_without_behavior_novelty() {
+    use super::league::{League, Snapshot};
+    use kagg_engine::json::Json;
+    let mut league = League::restore(&Json::Arr(vec![Json::Obj(vec![
+        ("iteration".into(), Json::Str("0".into())),
+        ("weights".into(), Json::Obj(vec![])),
+    ])]))
+    .unwrap();
+    for i in 1..30 {
+        league.admit(
+            Snapshot {
+                iteration: i,
+                weights: Json::Obj(vec![]),
+                profile: None,
+            },
+            false,
+        );
+        if i == 2 {
+            for _ in 0..32 {
+                league
+                    .outcomes
+                    .entry(2)
+                    .or_default()
+                    .greedy
+                    .observe(i, 40000., 60000.);
+            }
+        }
+    }
+    for i in [0, 1, 2, 28, 29] {
+        assert!(league.snapshots.iter().any(|s| s.iteration == i));
+    }
+    let roster = league.roster(30);
+    assert_eq!(
+        roster
+            .recent
+            .iter()
+            .map(|&i| league.snapshots[i].iteration)
+            .collect::<Vec<_>>(),
+        vec![29, 28]
+    );
+    let hard = roster
+        .historical
+        .iter()
+        .position(|&i| league.snapshots[i].iteration == 2)
+        .unwrap();
+    assert!(roster.probabilities[hard] > 1. / roster.historical.len() as f64);
+    assert_eq!(
+        League::restore(&league.json()).unwrap().json(),
+        league.json()
+    );
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn actual_market_profile_matches_drop_sale_buy_and_order_limit() {
+    use super::behavior::{observe_market, TradeStats};
+    use kagg_engine::{
+        engine::PlayerAction,
+        state::{MAX_MARKET_ORDERS, PRODUCTS},
+    };
+    let mut s = State::new(99);
+    s.step = 30 * 2;
+    s.private[0].inventories[0].add("MILK", 3);
+    let mut a = PlayerAction {
+        farmer: unit("DROP", "", 0),
+        market: vec![
+            vec!["SELL".into(), "MILK".into(), "9".into()],
+            vec!["BUY_PRODUCT".into(), "WHEAT".into(), "3".into()],
+        ],
+        ..Default::default()
+    };
+    for _ in 2..MAX_MARKET_ORDERS + 2 {
+        a.market
+            .push(vec!["BUY_SEED".into(), "WHEAT".into(), "1".into()]);
+    }
+    let actions = [a, PlayerAction::default()];
+    let mut stats: [TradeStats; 2] = Default::default();
+    observe_market(&s, &actions, &mut stats);
+    let before = s.farms[0].money;
+    engine::step(&mut s, &actions);
+    assert_eq!(
+        stats[0].units[PRODUCTS.iter().position(|x| *x == "MILK").unwrap()],
+        3
+    );
+    assert_eq!(
+        before + stats[0].revenue.iter().sum::<f64>() - stats[0].spending,
+        s.farms[0].money
+    );
+    assert_eq!(stats[0].early_spending, stats[0].spending);
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn training_outcomes_use_version_seat_mode_and_completed_games() {
+    use super::{
+        league::{League, Snapshot},
+        rollout::{Collection, Game, Opponent},
+    };
+    use kagg_engine::json::Json;
+    let mut league = League::restore(&Json::Arr(vec![Json::Obj(vec![
+        ("iteration".into(), Json::Str("100".into())),
+        ("weights".into(), Json::Obj(vec![])),
+    ])]))
+    .unwrap();
+    let make = |seat, probe, step| {
+        let mut g = Game::new(42, seat, Opponent::Frozen(0), true);
+        g.greedy_probe = probe;
+        g.state.step = step;
+        g.state.farms[0].money = 60000.;
+        g.state.farms[1].money = 40000.;
+        g
+    };
+    let c = Collection {
+        games: vec![
+            make(0, false, 719),
+            make(1, false, 719),
+            make(1, true, 719),
+            make(0, false, 100),
+        ],
+        samples: vec![],
+        experiences: vec![],
+        seconds: 0.,
+        inference_seconds: 0.,
+        inference_calls: 0,
+        mean_batch: 0.,
+    };
+    league.observe_training(&c, 105);
+    let r = &league.outcomes[&100];
+    assert_eq!(r.sampled.total_games, 2);
+    assert_eq!(r.sampled.points, 1.);
+    assert_eq!(r.sampled.cash / r.sampled.games, 50000.);
+    assert_eq!(r.greedy.total_games, 1);
+    assert_eq!(r.greedy.points, 0.);
+    let saved = r.json();
+    // Insertion changes the slot index, but historical statistics stay on version 100.
+    league.admit(
+        Snapshot {
+            iteration: 50,
+            weights: Json::Obj(vec![]),
+            profile: None,
+        },
+        false,
+    );
+    assert_eq!(league.champion_index(), 1);
+    assert_eq!(league.outcomes[&100].json(), saved);
+    let restored = League::restore(&league.json()).unwrap();
+    assert_eq!(restored.json(), league.json());
+    assert_eq!(
+        restored
+            .roster(106)
+            .schedule(16, &mut crate::learning::policy::Rng(123)),
+        league
+            .roster(106)
+            .schedule(16, &mut crate::learning::policy::Rng(123))
+    );
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn periodic_snapshots_advance_without_champion_promotion() {
+    use super::league::League;
+    use crate::learning::{policy::Policy, tensor};
+    tensor::threads(1);
+    let p = Policy::mixed_routes(-1, 89, 1e-4).unwrap();
+    let mut league = League::new(&p).unwrap();
+    assert!(!league.freeze_recent(&p, 9, false).unwrap());
+    assert!(league.freeze_recent(&p, 10, false).unwrap());
+    assert!(!league.freeze_recent(&p, 10, false).unwrap());
+    assert!(league.freeze_recent(&p, 20, false).unwrap());
+    assert_eq!(league.champion_iteration, 0);
+    assert_eq!(
+        league
+            .roster(21)
+            .recent
+            .iter()
+            .map(|&i| league.snapshots[i].iteration)
+            .collect::<Vec<_>>(),
+        vec![20, 10]
+    );
+    assert_eq!(
+        league.snapshots.last().unwrap().weights,
+        p.weights_json().unwrap()
+    );
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn league_exploration_preserves_random_policy_and_broad_episode_pairs() {
+    use super::rollout::league_exploration_plan;
+    use crate::learning::policy::Rng;
+    let probes: Vec<_> = (0..16).map(|i| i % 4 == 0).collect();
+    let plan = league_exploration_plan(&probes, 0.2, &mut Rng(72));
+    assert_eq!(plan.iter().filter(|x| x.0 == "greedy").count(), 4);
+    assert_eq!(plan.iter().filter(|x| x.0 == "focused").count(), 9);
+    assert_eq!(plan.iter().filter(|x| x.0 == "broad").count(), 3);
+    for (i, p) in plan.iter().enumerate() {
+        assert_eq!(p.0 == "greedy", probes[i]);
+        assert_eq!(p.1, if p.0 == "broad" { 0.2 } else { 0. });
+    }
+    assert_eq!(plan, league_exploration_plan(&probes, 0.2, &mut Rng(72)));
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn pfsp_uses_greedy_evidence_when_all_exploratory_games_lose() {
+    use super::league::League;
+    use kagg_engine::json::Json;
+    let entries = (0..6)
+        .map(|i| {
+            Json::Obj(vec![
+                ("iteration".into(), Json::Str(i.to_string())),
+                ("weights".into(), Json::Obj(vec![])),
+            ])
+        })
+        .collect();
+    let mut league = League::restore(&Json::Arr(entries)).unwrap();
+    for i in 0..3 {
+        for _ in 0..32 {
+            league
+                .outcomes
+                .entry(i)
+                .or_default()
+                .sampled
+                .observe(10, 100., 200.);
+        }
+    }
+    for _ in 0..32 {
+        league
+            .outcomes
+            .entry(0)
+            .or_default()
+            .greedy
+            .observe(10, 200., 100.);
+        league
+            .outcomes
+            .entry(1)
+            .or_default()
+            .greedy
+            .observe(10, 100., 200.);
+    }
+    let r = league.roster(10);
+    let probability = |version| {
+        r.probabilities[r
+            .historical
+            .iter()
+            .position(|&i| league.snapshots[i].iteration == version)
+            .unwrap()]
+    };
+    assert!(probability(1) > probability(2) && probability(2) > probability(0));
+    assert_eq!(league.outcomes[&2].greedy.score(10), 0.5);
+}
+
+#[cfg(feature = "train")]
+#[test]
+fn mixed_exploration_rows_keep_exact_behavior_likelihood_for_ppo() {
+    use crate::learning::{
+        policy::{Batch, Policy, Rng, Sample},
+        tensor,
+    };
+    tensor::threads(1);
+    let mut p = Policy::mixed_routes(-1, 76, 1e-4).unwrap();
+    let features = vec![vec![0.; 32], {
+        let mut f = vec![0.; 32];
+        f[31] = 2.;
+        f
+    }];
+    let mut rows: Vec<_> = [0., 0.2]
+        .iter()
+        .map(|&exploration| Sample {
+            context: vec![0.; 96],
+            features: features.clone(),
+            exploration,
+            ..Sample::default()
+        })
+        .collect();
+    let b = Batch::new(&rows, -1).unwrap();
+    let (lp, _) = p.forward(&b).unwrap();
+    let actual = p.behavior(&lp, &b).unwrap().data().unwrap();
+    let decisions = p.infer(&rows, false, &mut Rng(33)).unwrap();
+    for (i, (row, d)) in rows.iter_mut().zip(decisions).enumerate() {
+        assert!((d.logp - actual[i * b.width + d.action]).abs() < 1e-6);
+        row.action = d.action;
+        row.logp = d.logp;
+        row.value = d.value;
+        row.advantage = 1.;
+        row.reward = 1.;
+    }
+    let u = p.update(&rows, 1, 2, &mut Rng(44)).unwrap();
+    assert_eq!(u.updates, 1);
+    assert!(u.mean_kl.abs() < 1e-5);
 }
