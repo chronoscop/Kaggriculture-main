@@ -10,10 +10,28 @@ fn load_deployment(
     ),
     String,
 > {
+    use route_rl_native::pipeline::event_policy::{
+        CONTRACT, EVIDENCE_SCHEMA, LEGACY_SCHEMA, SCHEMA,
+    };
     use route_rl_native::pipeline::{
         event_portfolio::{Portfolio, Runtime},
         plan_prototype::Config,
     };
+    if matches!(
+        checkpoint.get("schema").str(),
+        SCHEMA | EVIDENCE_SCHEMA | LEGACY_SCHEMA
+    ) {
+        let contract = CONTRACT;
+        if checkpoint.get("policy_contract").str() != contract
+            || checkpoint.get("deployment").get("contract").str() != contract
+        {
+            return Err("wrong shared event execution contract".into());
+        }
+        let config = Config::parse(checkpoint.get("config"))?;
+        let accepted =
+            route_rl_native::pipeline::event_policy::Version::parse(checkpoint.get("deployment"))?;
+        return Ok((config, accepted.runtime(-1)?));
+    }
     if checkpoint.get("schema").str() != "event-plan-improvement-v4"
         || checkpoint.get("policy_contract").str()
             != route_rl_native::pipeline::event_portfolio::CONTRACT
@@ -134,6 +152,73 @@ mod tests {
         assert_eq!(runtime.select(Some(2), &row()).unwrap(), 1);
         assert_eq!(runtime.select(Some(1), &row()).unwrap(), 0);
         assert_eq!(runtime.select(None, &row()).unwrap(), 0);
+    }
+    #[test]
+    fn stable_deployment_ignores_unaccepted_learner() {
+        use route_rl_native::pipeline::event_policy::{Version, CONTRACT, SCHEMA};
+        tensor::worker_threads();
+        let p = Version::initial(Portfolio::empty(), vec![0, 1, 2, 3]).unwrap();
+        let j = Json::Obj(vec![
+            ("schema".into(), Json::Str(SCHEMA.into())),
+            ("policy_contract".into(), Json::Str(CONTRACT.into())),
+            ("config".into(), Config::default().json()),
+            ("deployment".into(), p.json()),
+            ("model".into(), Json::Str("invalid and unaccepted".into())),
+        ]);
+        assert_eq!(
+            load_deployment(&j)
+                .unwrap()
+                .1
+                .select(Some(0), &row())
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn legacy_v5_v6_and_v7_wrappers_preserve_deployed_decisions() {
+        use route_rl_native::pipeline::event_policy::{
+            Version, CONTRACT, EVIDENCE_SCHEMA, LEGACY_SCHEMA, SCHEMA,
+        };
+        tensor::worker_threads();
+        let p = Version::initial(Portfolio::empty(), vec![0, 1, 2, 3])
+            .unwrap()
+            .propose(
+                1,
+                Policy::plans(-1, 7, 0.0003)
+                    .unwrap()
+                    .weights_json()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut j = Json::Obj(vec![
+            ("schema".into(), Json::Str(SCHEMA.into())),
+            ("policy_contract".into(), Json::Str(CONTRACT.into())),
+            ("config".into(), Config::default().json()),
+            ("deployment".into(), p.json()),
+        ]);
+        let current = load_deployment(&j)
+            .unwrap()
+            .1
+            .select(Some(0), &row())
+            .unwrap();
+        j.set_path("schema", Json::Str(EVIDENCE_SCHEMA.into()));
+        assert_eq!(
+            load_deployment(&j)
+                .unwrap()
+                .1
+                .select(Some(0), &row())
+                .unwrap(),
+            current
+        );
+        j.set_path("schema", Json::Str(LEGACY_SCHEMA.into()));
+        assert_eq!(
+            load_deployment(&j)
+                .unwrap()
+                .1
+                .select(Some(0), &row())
+                .unwrap(),
+            current
+        );
     }
     #[test]
     fn deployment_rejects_legacy_contract_and_missing_portfolio() {

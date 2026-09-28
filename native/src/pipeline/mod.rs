@@ -38,3 +38,5 @@ pub mod event_portfolio;
 pub mod plan_events;
 #[cfg(feature = "train")]
 pub mod plan_resources;
+#[cfg(feature = "train")]
+pub mod event_policy;

@@ -1,6 +1,6 @@
 # 下一步：在真实经营事件上选择和修订可执行计划
 
-状态：本文件保留最初设计；首个可运行范围已实现，实际接口、边界和命令见 [事件计划训练](event_plan_training.md)。保留现有 plan-improvement-v3 检查点。
+状态：本文件保留最初设计；执行能力已实现，训练协议已改为 [事件策略证据学习](event_policy_normalization.md)。保留现有 plan-improvement-v3 检查点。
 
 ## 已确认的教训
 

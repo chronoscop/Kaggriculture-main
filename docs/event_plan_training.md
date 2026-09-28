@@ -1,3 +1,5 @@
+> 历史文档：以下描述旧的双网络训练协议，已停用。当前实现和命令见 [固定参考策略的经营计划学习](event_policy_iteration.md)。请勿用下面的旧训练命令恢复新实验。
+
 # 事件计划训练：分季节机会与同批次两次决策
 
 入口：`event-train` / `event-agent`。当前外层检查点仍为 `event-plan-improvement-v4`，输入/执行契约更新为 `event-batch-context320-actions32-season-pair-v4`。

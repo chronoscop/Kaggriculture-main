@@ -6,7 +6,7 @@ use super::{
     plan_portfolio as legacy,
     plan_prototype::{Agent, Config},
 };
-use crate::learning::policy::Sample;
+use crate::learning::policy::{Policy, Rng, Sample};
 use kagg_engine::{engine::PlayerAction, json::Json};
 pub use legacy::SLOTS;
 use std::collections::BTreeMap;
@@ -179,10 +179,46 @@ pub struct Runtime {
     followups: legacy::Runtime,
     followup_portfolio: legacy::Portfolio,
     device: i32,
+    unified: Option<(Vec<usize>, Option<Policy>)>,
 }
 impl Runtime {
     pub fn select(&self, slot: Option<usize>, row: &Sample) -> Result<usize, String> {
+        if let Some((scope, Some(model))) = &self.unified {
+            if slot.is_some_and(|s| scope.contains(&s)) {
+                return Ok(model.infer(&[row.clone()], true, &mut Rng(0))?[0].action);
+            }
+        }
         self.patches.select(slot, row)
+    }
+    fn select_followup(&self, slot: usize, row: &Sample) -> Result<usize, String> {
+        if let Some((scope, model)) = &self.unified {
+            if scope.contains(&slot) {
+                return match model {
+                    Some(p) => Ok(p.infer(&[row.clone()], true, &mut Rng(0))?[0].action),
+                    None => Ok(0),
+                };
+            }
+        }
+        self.followups.select(Some(slot), row)
+    }
+    /// ONE network for both arrangements and revisions. Unset weights preserve
+    /// the foundation; controlled exploration may still reach a same-batch event.
+    pub fn unified(
+        p: &Portfolio,
+        scope: &[usize],
+        weights: Option<&Json>,
+        device: i32,
+    ) -> Result<Self, String> {
+        let mut runtime = Self::load(p, device)?;
+        let model = if let Some(w) = weights {
+            let mut model = Policy::plans(device, 0, 0.0003)?;
+            model.load_weights(w)?;
+            Some(model)
+        } else {
+            None
+        };
+        runtime.unified = Some((scope.to_vec(), model));
+        Ok(runtime)
     }
     pub fn load(p: &Portfolio, device: i32) -> Result<Self, String> {
         let followup_portfolio = p.followups();
@@ -192,9 +228,17 @@ impl Runtime {
             followups: legacy::Runtime::load(&followup_portfolio, device)?,
             followup_portfolio,
             device,
+            unified: None,
         })
     }
     pub fn has_followup(&self, slot: usize) -> bool {
+        if self
+            .unified
+            .as_ref()
+            .is_some_and(|(scope, _)| scope.contains(&slot))
+        {
+            return true;
+        }
         self.followup_portfolio
             .slots
             .get(slot)
@@ -301,7 +345,7 @@ impl Deployed {
             }
             let mut row = plan_events::sample(&self.controller, o, &event, &choices);
             row.context[295] = 1.;
-            let selected = p.followups.select(Some(slot), &row)?;
+            let selected = p.select_followup(slot, &row)?;
             self.last_event = Some(event);
             self.last_slot = Some(slot);
             self.last_followup = true;
@@ -333,7 +377,7 @@ impl Deployed {
                 continue;
             }
             let row = plan_events::sample(&self.controller, o, &event, &choices);
-            let selected = p.patches.select(Some(slot), &row)?;
+            let selected = p.select(Some(slot), &row)?;
             self.last_event = Some(event);
             self.last_slot = Some(slot);
             return Ok(Some(Decision {
@@ -399,6 +443,34 @@ mod tests {
     use super::*;
     use crate::learning::tensor;
     use kagg_engine::{engine, state::State};
+    #[test]
+    fn unified_runtime_uses_same_weights_for_both_roles() {
+        tensor::worker_threads();
+        let p = Policy::mixed_routes(-1, 73, 0.0003).unwrap();
+        let mut p = p;
+        p.plan_residual = true;
+        let runtime = Runtime::unified(
+            &Portfolio::empty(),
+            &[0, 1, 2, 3],
+            Some(&p.weights_json().unwrap()),
+            -1,
+        )
+        .unwrap();
+        for role in [0., 1.] {
+            let mut row = Sample {
+                context: vec![0.; 320],
+                features: vec![vec![0.; 32]; 3],
+                ..Default::default()
+            };
+            row.context[295] = role;
+            row.features[1][4] = 1.;
+            row.features[2][7] = 1.;
+            let expected = p.infer(&[row.clone()], true, &mut Rng(0)).unwrap()[0].action;
+            assert_eq!(runtime.select(Some(0), &row).unwrap(), expected);
+            assert_eq!(runtime.select_followup(0, &row).unwrap(), expected);
+            assert_eq!(runtime.select(Some(7), &row).unwrap(), 0);
+        }
+    }
     #[test]
     fn empty_event_layer_preserves_foundation_actions_in_real_engine() {
         tensor::worker_threads();

@@ -3,6 +3,7 @@ use super::tensor::{NoGrad, Tensor};
 use kagg_engine::json::Json;
 pub const CONTEXT: usize = crate::pipeline::CONTEXT;
 pub const CANDIDATE: usize = 32;
+pub const EVENT_INPUT_ENCODING: &str = "event-centered-bounded-v1";
 pub const GROUPS: usize = crate::pipeline::GROUPS;
 const SPECS: [(&str, &[i64]); 20] = [
     ("context.0.weight", &[64, CONTEXT as i64]),
@@ -66,6 +67,7 @@ pub struct Policy {
     pub lr: f64,
     pub market_mode: crate::pipeline::trading::MarketMode,
     pub plan_residual: bool,
+    pub event_input_scaling: bool,
 }
 impl Policy {
     pub fn mixed_routes(device: i32, seed: u64, lr: f64) -> Result<Self, String> {
@@ -103,6 +105,7 @@ impl Policy {
             lr,
             market_mode: Default::default(),
             plan_residual: false,
+            event_input_scaling: false,
         })
     }
     /// Start exactly at the executable planner in greedy mode. The fixed prior
@@ -117,6 +120,86 @@ impl Policy {
         }
         Ok(p)
     }
+    /// New event learners only. Legacy weights retain their original input units.
+    pub fn event_plans(device: i32, seed: u64, lr: f64) -> Result<Self, String> {
+        let mut p = Self::plans(device, seed, lr)?;
+        p.event_input_scaling = true;
+        Ok(p)
+    }
+    fn bounded(x: &Tensor) -> Result<Tensor, String> {
+        // Smooth signed compression: retains order and has no clipping boundary.
+        let denominator = x.unary(24)?.scalar(30, 1.)?.unary(28)?;
+        x.binary(15, &denominator)
+    }
+    fn actor_inputs(&self, b: &Batch) -> Result<(Tensor, Tensor), String> {
+        if !self.event_input_scaling {
+            return Ok((b.context.unary(34)?, b.candidates.unary(34)?));
+        }
+        let mut scale = vec![1.; CONTEXT];
+        let mut offset = vec![0.; CONTEXT];
+        // Raw event rows store market stock /100. Initial stock is 10000:
+        // (raw - 100)/100 == (actual_stock - 10000)/10000.
+        for i in 0..9 {
+            scale[17 + 3 * i] = 0.01;
+            offset[17 + 3 * i] = -1.;
+        }
+        let scale = Tensor::floats(&scale, &[CONTEXT as i64], self.device, false)?;
+        let offset = Tensor::floats(&offset, &[CONTEXT as i64], self.device, false)?;
+        let context = Self::bounded(&b.context.binary(14, &scale)?.binary(12, &offset)?)?;
+        Ok((context, Self::bounded(&b.candidates)?))
+    }
+    /// Diagnostics on observed rows, using the SAME transform as train/inference.
+    pub fn input_diagnostics(&self, rows: &[Sample]) -> Result<Json, String> {
+        if rows.is_empty() {
+            return Ok(Json::Null);
+        }
+        let _guard = NoGrad::new();
+        let b = Batch::new(&rows[..rows.len().min(128)], self.device)?;
+        let (x, features) = self.actor_inputs(&b)?;
+        let z1 = self.linear(&x, 0)?.unary(1)?;
+        let z2 = self.linear(&z1, 2)?.unary(1)?;
+        let first = z1.data()?;
+        let second = z2.data()?;
+        let mut span = 0f32;
+        for col in 0..64 {
+            let vs: Vec<_> = second.iter().skip(col).step_by(64).copied().collect();
+            span = span.max(
+                vs.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                    - vs.iter().copied().fold(f32::INFINITY, f32::min),
+            );
+        }
+        let max_abs = |xs: Vec<f32>| xs.into_iter().map(f32::abs).fold(0f32, f32::max) as f64;
+        Ok(Json::Obj(vec![
+            (
+                "encoding".into(),
+                Json::Str(
+                    if self.event_input_scaling {
+                        EVENT_INPUT_ENCODING
+                    } else {
+                        "legacy-raw"
+                    }
+                    .into(),
+                ),
+            ),
+            ("rows".into(), Json::Num(rows.len().min(128) as f64)),
+            ("context_abs_max".into(), Json::Num(max_abs(x.data()?))),
+            (
+                "candidate_abs_max".into(),
+                Json::Num(max_abs(features.data()?)),
+            ),
+            (
+                "context_layer1_saturated_fraction".into(),
+                Json::Num(
+                    first.iter().filter(|x| x.abs() > 0.99).count() as f64 / first.len() as f64,
+                ),
+            ),
+            ("context_layer2_max_span".into(), Json::Num(span as f64)),
+            (
+                "context_gradient_norm".into(),
+                Json::Num(self.parameters[0].value.unary(33)?.unary(37)?.value()?),
+            ),
+        ]))
+    }
     fn linear(&self, x: &Tensor, index: usize) -> Result<Tensor, String> {
         Tensor::operation(
             0,
@@ -130,10 +213,11 @@ impl Policy {
         )
     }
     pub fn forward(&self, b: &Batch) -> Result<(Tensor, Tensor), String> {
+        let (context, candidates) = self.actor_inputs(b)?;
         let z = self
-            .linear(&self.linear(&b.context, 0)?.unary(1)?, 2)?
+            .linear(&self.linear(&context, 0)?.unary(1)?, 2)?
             .unary(1)?;
-        let v = self.linear(&b.candidates, 4)?.unary(1)?;
+        let v = self.linear(&candidates, 4)?.unary(1)?;
         let expanded = Tensor::operation(5, &[&z.dim(3, 1)?], &[-1, b.width as i64, -1], &[])?;
         let joined = Tensor::operation(2, &[&v, &expanded], &[-1], &[])?;
         let mut scores = self
@@ -153,7 +237,7 @@ impl Policy {
         };
         // Value regression must not update the actor context representation.
         let critic_z = self
-            .linear(&self.linear(&b.context, 16)?.unary(1)?, 18)?
+            .linear(&self.linear(&context, 16)?.unary(1)?, 18)?
             .unary(1)?;
         let value = self
             .linear(&self.linear(&critic_z, 10)?.unary(1)?, 12)?
@@ -264,6 +348,11 @@ impl Policy {
         Ok((rows.len(), scalar))
     }
     pub fn load_weights(&mut self, weights: &Json) -> Result<(), String> {
+        let scaling = match weights.get("_event_input_encoding") {
+            Json::Null => false,
+            Json::Str(s) if s == EVENT_INPUT_ENCODING => true,
+            _ => return Err("unknown event input encoding".into()),
+        };
         for p in &mut self.parameters {
             let row = weights.get(p.name);
             if !row.is_obj() {
@@ -277,10 +366,11 @@ impl Policy {
             let value = Tensor::floats(&data, &shape, self.device, false)?;
             p.value.copy_from(&value)?;
         }
+        self.event_input_scaling = scaling;
         Ok(())
     }
     pub fn weights_json(&self) -> Result<Json, String> {
-        Ok(Json::Obj(
+        let mut result = Json::Obj(
             self.parameters
                 .iter()
                 .map(|p| {
@@ -305,7 +395,14 @@ impl Policy {
                     ))
                 })
                 .collect::<Result<_, String>>()?,
-        ))
+        );
+        if self.event_input_scaling {
+            result.set_path(
+                "_event_input_encoding",
+                Json::Str(EVENT_INPUT_ENCODING.into()),
+            );
+        }
+        Ok(result)
     }
     /// Model plus Adam moments. Native checkpoints are explicit JSON, not Python pickle.
     pub fn checkpoint(&self, iteration: u64, rng: &Rng) -> Result<Json, String> {
@@ -1014,5 +1111,127 @@ mod independent_tests {
             .err()
             .unwrap()
             .contains("independent actor/critic"));
+    }
+}
+
+#[cfg(test)]
+mod event_input_tests {
+    use super::*;
+    fn rows() -> Vec<Sample> {
+        (0..2)
+            .map(|i| {
+                let mut context = vec![0.; CONTEXT];
+                for k in 0..9 {
+                    context[17 + 3 * k] = 100.;
+                }
+                context[1] = if i == 0 { 0.05 } else { 5. };
+                let mut f = vec![vec![0.; 32]; 2];
+                f[0][0] = 1.;
+                f[1][2] = 1.;
+                f[0][31] = 1.;
+                f[1][31] = 1.;
+                Sample {
+                    context,
+                    features: f,
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+    #[test]
+    fn event_input_normalization_is_versioned_and_preserves_market_differences() {
+        crate::learning::tensor::worker_threads();
+        let old = Policy::plans(-1, 220000, 0.0003).unwrap();
+        let new = Policy::event_plans(-1, 220000, 0.0003).unwrap();
+        let mut r = rows();
+        r[0].context[17] = 90.;
+        r[1].context[17] = 110.;
+        let b = Batch::new(&r, -1).unwrap();
+        let (old_x, _) = old.actor_inputs(&b).unwrap();
+        assert_eq!(
+            old_x.data().unwrap(),
+            r.iter().flat_map(|r| r.context.clone()).collect::<Vec<_>>()
+        );
+        let (new_x, f) = new.actor_inputs(&b).unwrap();
+        let xs = new_x.data().unwrap();
+        assert!(xs[17] < -0.09 && xs[CONTEXT + 17] > 0.09);
+        assert!(xs
+            .iter()
+            .chain(f.data().unwrap().iter())
+            .all(|v| v.abs() <= 1.));
+        let health = new.input_diagnostics(&r).unwrap();
+        assert!(health.get("context_layer1_saturated_fraction").f64() < 0.1);
+        assert!(health.get("context_layer2_max_span").f64() > 0.01);
+        let mut restore = Policy::plans(-1, 1, 0.0003).unwrap();
+        restore.load_weights(&new.weights_json().unwrap()).unwrap();
+        assert!(restore.event_input_scaling);
+        assert_eq!(
+            new.forward(&b).unwrap().0.data().unwrap(),
+            restore.forward(&b).unwrap().0.data().unwrap()
+        );
+        restore.load_weights(&old.weights_json().unwrap()).unwrap();
+        assert!(!restore.event_input_scaling);
+        assert_eq!(
+            old.forward(&b).unwrap().0.data().unwrap(),
+            restore.forward(&b).unwrap().0.data().unwrap()
+        );
+        let mut bad = new.weights_json().unwrap();
+        bad.set_path("_event_input_encoding", Json::Str("unknown".into()));
+        assert!(restore.load_weights(&bad).is_err());
+    }
+    #[test]
+    fn event_input_context_can_learn_opposite_choices_with_identical_candidates() {
+        crate::learning::tensor::worker_threads();
+        let mut p = Policy::event_plans(-1, 220000, 0.003).unwrap();
+        let r = rows();
+        let b = Batch::new(&r, -1).unwrap();
+        let target = Tensor::floats(&[-1., 1.], &[2], -1, false).unwrap();
+        let mut gradient_seen = false;
+        for _ in 0..200 {
+            let lp = p.forward(&b).unwrap().0;
+            let a = Tensor::operation(27, &[&lp], &[1, 0, 1], &[])
+                .unwrap()
+                .dim(4, 1)
+                .unwrap();
+            let c = Tensor::operation(27, &[&lp], &[1, 1, 1], &[])
+                .unwrap()
+                .dim(4, 1)
+                .unwrap();
+            let loss = c
+                .binary(13, &a)
+                .unwrap()
+                .binary(13, &target)
+                .unwrap()
+                .unary(24)
+                .unwrap()
+                .unary(18)
+                .unwrap();
+            for v in &mut p.parameters {
+                v.value.zero_grad();
+            }
+            loss.backward().unwrap();
+            gradient_seen |= p.parameters[0]
+                .value
+                .unary(33)
+                .unwrap()
+                .unary(37)
+                .unwrap()
+                .value()
+                .unwrap()
+                > 1e-6;
+            p.adam().unwrap();
+        }
+        assert!(gradient_seen);
+        let d = p.infer(&r, true, &mut Rng(0)).unwrap();
+        assert_eq!((d[0].action, d[1].action), (0, 1));
+        let mut restored = Policy::plans(-1, 1, 0.0003).unwrap();
+        restored
+            .restore(&p.checkpoint(200, &Rng(123)).unwrap())
+            .unwrap();
+        assert!(restored.event_input_scaling);
+        assert_eq!(
+            p.forward(&b).unwrap().0.data().unwrap(),
+            restored.forward(&b).unwrap().0.data().unwrap()
+        );
     }
 }
