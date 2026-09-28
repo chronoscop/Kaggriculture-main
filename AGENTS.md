@@ -12,3 +12,13 @@ The user requires lessons from prior failures to guide every optimization. Befor
 6. Verify targeted execution/learning invariants. Small smoke tests prove connectivity only; do not report them as evidence of economic improvement. The user normally runs training experiments after receiving the command.
 
 Current detailed design discussion: `docs/event_plan_next_steps.md`. It is a proposal, not an implementation or an instruction to start work without considering the user's current request.
+
+## Competition objective
+
+For the active event training pipeline, optimize terminal match score only: win=1, draw=0.5, loss=0 at the end of the 720-turn game. Absolute cash and cash margin are diagnostics, not auxiliary rewards or promotion vetoes. Preserve paired independent confirmation and accepted deployments; version the learning objective and recompute cached labels from actual outcomes when changing it.
+
+## Event execution checks learned from the final audit
+
+- Inspect actual legal candidate sets, not only event/branch counts. The first paired smoke had 11 follow-up comparisons but all were Keep/Cancel because daily workers had expired before maintenance rehired them. Use real post-maintenance observations; do not invent future workers or suppress cancellation during genuine persistent shortages.
+- A route-blocked follow-up event must survive ordinary scope exhaustion until the same live batch is editable; normal dispatch must not delete or steal the reserved event.
+- When event timing or execution changes, invalidate dependent comparison labels and version the contract. Preserve accepted checkpoints; never silently reinterpret accepted old event scopes.

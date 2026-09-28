@@ -1,6 +1,6 @@
 # 原生混合生产 pipeline
 
-> **当前训练主线：[事件与下一批生产对照学习](../docs/event_plan_training.md)（event-plan-improvement-v4）**，入口 `event-train` / `event-agent`。支持加载第55轮v3已验收组合为冻结底座，新增可修订批次、共享资源约束和A/B/C真实对照；新实验命令见该文档。
+> **当前训练主线：[事件与下一批生产对照学习](../docs/event_plan_training.md)（event-plan-improvement-v4）**，入口 `event-train` / `event-agent`。支持加载第55轮v3已验收组合为冻结底座，使用分季节事件机会、同批次两次决策、共享资源约束和冻结首选实测；夜间实验及检查点兼容说明见该文档。
 > [v3固定窗口版](../docs/plan_improvement.md)保留用于基准与检查点读取，下方v8命令为历史实验。
 
 > 旧版：[可学习市场决策](../docs/mixed_v8_market.md)（v8-market-3）。模型控制交易顺序和数量，新增对手潜在供给信息与事件触发，支持规则交易对照；320 维观测、19 类动作，旧 v7 / v8-market-1 / v8-market-2 检查点不兼容。

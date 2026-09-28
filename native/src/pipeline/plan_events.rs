@@ -12,7 +12,7 @@ use kagg_engine::{
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-pub const CONTRACT: &str = "event-batch-context320-actions32-v2";
+pub const CONTRACT: &str = "event-batch-context320-actions32-season-pair-v4";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventKind {
     Harvest = 0,
@@ -32,8 +32,11 @@ pub struct Event {
     pub kind: EventKind,
     pub sites: Vec<Pos>,
     pub batch: Option<usize>,
+    /// When the business condition changed, rather than when it became editable.
+    pub observed_step: i64,
     batch_revision: Option<u64>,
     identities: Vec<SiteIdentity>,
+    claimed_slot: Option<usize>,
 }
 impl Event {
     pub fn capture(
@@ -68,8 +71,10 @@ impl Event {
             kind,
             sites,
             batch,
+            observed_step: o.step,
             batch_revision: batch.map(|id| c.batches[id].revision),
             identities,
+            claimed_slot: None,
         }
     }
     fn live_sites(&self, c: &Controller, o: &Observation) -> Vec<Pos> {
@@ -103,6 +108,7 @@ impl Event {
         Json::Obj(vec![
             ("key".into(), Json::Str(self.key.clone())),
             ("kind".into(), Json::Num(self.kind as usize as f64)),
+            ("observed_step".into(), Json::Num(self.observed_step as f64)),
             (
                 "batch".into(),
                 self.batch
@@ -169,6 +175,7 @@ pub struct Tracker {
     seen_harvest: BTreeSet<(Pos, String, i64)>,
     pending: VecDeque<Event>,
     pub counts: [usize; 4],
+    pub claimed: [bool; 16],
     last_step: Option<i64>,
 }
 impl Tracker {
@@ -304,17 +311,42 @@ impl Tracker {
                 .insert(key, (material, affordable, blocked, anchor));
         }
     }
-    pub fn defer(&mut self, event: Event) {
-        self.counts[event.kind as usize] -= 1;
+    pub fn defer(&mut self, mut event: Event) {
+        if let Some(slot) = event.claimed_slot.take() {
+            self.claimed[slot] = false;
+            self.counts[event.kind as usize] -= 1;
+        }
         self.pending.push_back(event);
     }
     pub fn take(&mut self, c: &Controller, o: &Observation) -> Option<(Event, usize)> {
-        // Four distinct events per kind per game. Scope is event ordinal, never a clock window.
+        self.take_excluding_batches(c, o, &[])
+    }
+    /// Armed paired decisions own their batch events while routes temporarily
+    /// prevent an edit. Ordinary scope exhaustion must not discard those events.
+    pub fn take_excluding_batches(
+        &mut self,
+        c: &Controller,
+        o: &Observation,
+        protected_batches: &[usize],
+    ) -> Option<(Event, usize)> {
+        // One real event of each kind in each quarter of the season. An early burst
+        // cannot spend opportunities reserved for later renewals and conversions.
+        let phase = (o.step.max(0) / 180).min(3) as usize;
         let n = self.pending.len();
         for _ in 0..n {
             let event = self.pending.pop_front()?;
+            if event
+                .batch
+                .is_some_and(|id| protected_batches.contains(&id))
+            {
+                if !event.live_sites(c, o).is_empty() {
+                    self.pending.push_back(event);
+                }
+                continue;
+            }
             let kind = event.kind as usize;
-            if self.counts[kind] >= 4 {
+            let slot = kind * 4 + phase;
+            if self.claimed[slot] {
                 continue;
             }
             let live = event.live_sites(c, o);
@@ -333,9 +365,47 @@ impl Tracker {
             }
             let mut event = event;
             event.sites = sites;
-            let slot = kind * 4 + self.counts[kind];
+            event.claimed_slot = Some(slot);
+            self.claimed[slot] = true;
             self.counts[kind] += 1;
             return Some((event, slot));
+        }
+        None
+    }
+    /// A bounded second decision requires a new event on the first decision's batch.
+    /// It neither spends another normal season scope nor borrows another batch.
+    pub fn take_for_batch(
+        &mut self,
+        c: &Controller,
+        o: &Observation,
+        batch: usize,
+        not_before: i64,
+    ) -> Option<Event> {
+        if o.step <= not_before {
+            return None;
+        }
+        let n = self.pending.len();
+        for _ in 0..n {
+            let mut event = self.pending.pop_front()?;
+            if event.batch != Some(batch) || event.observed_step <= not_before {
+                self.pending.push_back(event);
+                continue;
+            }
+            let live = event.live_sites(c, o);
+            let sites: Vec<_> = live.iter().copied().filter(|s| c.editable(o, *s)).collect();
+            if sites.is_empty() {
+                if !live.is_empty()
+                    && live.iter().any(|s| {
+                        matches!(tile(&o.farm, *s), Cell::Plant { .. }) || c.pending_at(*s)
+                    })
+                {
+                    self.pending.push_back(event);
+                }
+                continue;
+            }
+            event.sites = sites;
+            event.claimed_slot = None;
+            return Some(event);
         }
         None
     }
@@ -617,6 +687,186 @@ pub fn sample(c: &Controller, o: &Observation, e: &Event, choices: &[Choice]) ->
 mod tests {
     use super::super::plan_resources::tests::fixture;
     use super::*;
+    #[test]
+    fn normal_scopes_reserve_one_opportunity_per_kind_per_season_phase() {
+        let (mut state, c) = fixture(72);
+        let mut tracker = Tracker::default();
+        for phase in 0..4 {
+            state.step = phase * 180 + 72;
+            let o = Observation::from_state(&state, 0);
+            for kind in [
+                EventKind::Harvest,
+                EventKind::Material,
+                EventKind::Funding,
+                EventKind::Review,
+            ] {
+                for attempt in 0..3 {
+                    tracker.pending.push_back(Event::capture(
+                        format!("phase:{phase}:{kind:?}:{attempt}"),
+                        kind,
+                        vec![(3, 4)],
+                        None,
+                        &c,
+                        &o,
+                    ));
+                }
+                let (_, slot) = tracker.take(&c, &o).unwrap();
+                assert_eq!(slot, kind as usize * 4 + phase as usize);
+                assert!(
+                    tracker.take(&c, &o).is_none(),
+                    "early events must not spend later phase slots"
+                );
+            }
+        }
+        assert_eq!(tracker.counts, [4; 4]);
+        assert!(tracker.claimed.into_iter().all(|x| x));
+    }
+    #[test]
+    fn deferring_undoes_the_original_claim_even_across_phase_boundary() {
+        let (mut state, c) = fixture(179);
+        let mut tracker = Tracker::default();
+        let o = Observation::from_state(&state, 0);
+        tracker.pending.push_back(Event::capture(
+            "defer".into(),
+            EventKind::Review,
+            vec![(3, 4)],
+            None,
+            &c,
+            &o,
+        ));
+        let (event, slot) = tracker.take(&c, &o).unwrap();
+        assert_eq!(slot, 12);
+        state.step = 180;
+        tracker.defer(event);
+        assert!(!tracker.claimed[12]);
+        assert_eq!(tracker.counts, [0; 4]);
+        let (_, slot) = tracker
+            .take(&c, &Observation::from_state(&state, 0))
+            .unwrap();
+        assert_eq!(slot, 13);
+        assert!(tracker.claimed[13]);
+    }
+    #[test]
+    fn followup_requires_a_later_event_on_exact_batch_without_spending_normal_scope() {
+        let (mut state, mut c) = fixture(72);
+        let o = Observation::from_state(&state, 0);
+        let batch = c
+            .revise_batch(
+                &o,
+                &[(3, 4)],
+                Some(Production::Crop("CARROT".into())),
+                1,
+                24,
+                180.,
+            )
+            .unwrap();
+        let other = c
+            .revise_batch(
+                &o,
+                &[(2, 4)],
+                Some(Production::Crop("CARROT".into())),
+                1,
+                24,
+                180.,
+            )
+            .unwrap();
+        let mut tracker = Tracker::default();
+        tracker.pending.push_back(Event::capture(
+            "immediate".into(),
+            EventKind::Review,
+            vec![(3, 4)],
+            Some(batch),
+            &c,
+            &o,
+        ));
+        assert!(tracker.take_for_batch(&c, &o, batch, 72).is_none());
+        state.step = 73;
+        let o = Observation::from_state(&state, 0);
+        tracker.pending.push_back(Event::capture(
+            "other".into(),
+            EventKind::Material,
+            vec![(2, 4)],
+            Some(other),
+            &c,
+            &o,
+        ));
+        assert!(tracker.take_for_batch(&c, &o, batch, 72).is_none());
+        tracker.pending.push_back(Event::capture(
+            "later".into(),
+            EventKind::Funding,
+            vec![(3, 4)],
+            Some(batch),
+            &c,
+            &o,
+        ));
+        tracker.claimed[8] = true;
+        tracker.counts[2] = 1;
+        let event = tracker.take_for_batch(&c, &o, batch, 72).unwrap();
+        assert_eq!(event.key, "later");
+        assert_eq!(event.observed_step, 73);
+        assert_eq!(tracker.counts, [0, 0, 1, 0]);
+        assert_eq!(tracker.pending.len(), 2);
+        tracker.defer(event);
+        assert!(
+            tracker.claimed[8],
+            "deferring followup cannot release a normal claim"
+        );
+        assert_eq!(tracker.counts, [0, 0, 1, 0]);
+        assert!(tracker.take_for_batch(&c, &o, batch, 72).is_some());
+    }
+    #[test]
+    fn followup_cannot_attach_to_superseded_batch_or_crop_generation() {
+        let (mut state, mut c) = fixture(72);
+        let o = Observation::from_state(&state, 0);
+        let batch = c
+            .revise_batch(
+                &o,
+                &[(3, 4)],
+                Some(Production::Crop("CARROT".into())),
+                1,
+                24,
+                180.,
+            )
+            .unwrap();
+        state.step = 73;
+        let o = Observation::from_state(&state, 0);
+        let mut tracker = Tracker::default();
+        tracker.pending.push_back(Event::capture(
+            "stale-batch".into(),
+            EventKind::Material,
+            vec![(3, 4)],
+            Some(batch),
+            &c,
+            &o,
+        ));
+        let replacement = c
+            .revise_batch(
+                &o,
+                &[(3, 4)],
+                Some(Production::Crop("TOMATO".into())),
+                1,
+                24,
+                180.,
+            )
+            .unwrap();
+        assert!(tracker.take_for_batch(&c, &o, batch, 72).is_none());
+        tracker.pending.push_back(Event::capture(
+            "stale-crop".into(),
+            EventKind::Harvest,
+            vec![(3, 4)],
+            Some(replacement),
+            &c,
+            &o,
+        ));
+        if let Cell::Plant { planted_day, .. } = &mut state.farms[0].tiles[4][3] {
+            *planted_day += 1;
+        }
+        assert!(tracker
+            .take_for_batch(&c, &Observation::from_state(&state, 0), replacement, 72)
+            .is_none());
+        assert!(tracker.pending.is_empty());
+        assert_eq!(tracker.counts, [0; 4]);
+    }
     #[test]
     fn inherited_pending_links_receive_harvest_and_resource_events() {
         let (mut state, mut c) = fixture(72);

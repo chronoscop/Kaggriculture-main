@@ -1,6 +1,6 @@
 # Kaggriculture：Rust 混合生产半 RL
 
-> **当前训练主线：[事件与下一批生产对照学习](docs/event_plan_training.md)（event-plan-improvement-v4）**，入口 `event-train` / `event-agent`。支持加载第55轮v3已验收组合为冻结底座，新增可修订批次、共享资源约束和A/B/C真实对照；新实验命令见该文档。
+> **当前训练主线：[事件与下一批生产对照学习](docs/event_plan_training.md)（event-plan-improvement-v4）**，入口 `event-train` / `event-agent`。支持加载第55轮v3已验收组合为冻结底座，使用分季节事件机会、同批次两次决策、共享资源约束和冻结首选实测；夜间实验及检查点兼容说明见该文档。
 > [v3固定窗口版](docs/plan_improvement.md)保留用于基准与检查点读取，下方v8命令为历史实验。
 
 > 旧版：[可学习市场决策](docs/mixed_v8_market.md)（v8-market-3）。模型学习商品优先顺序、按实际预算选择交易数量，并结合对手成熟时间、种养变化响应市场与资金事件；独立策略/价值网络。支持规则交易对照和两个检查点直接对战。

@@ -5,6 +5,8 @@ use super::{
     tensor::{NoGrad, Tensor},
 };
 use kagg_engine::json::Json;
+pub const MATCH_SCORE_OBJECTIVE: &str = "terminal_match_score_difference_v1";
+
 #[derive(Clone)]
 pub struct Pair {
     /// Exactly two TESTED choices; untested choices receive no negative labels.
@@ -29,10 +31,58 @@ impl Pair {
         Ok(self.incumbent_revision()? == revision)
     }
     pub fn improvement_target(&self) -> Result<f32, String> {
-        improvement_target(
-            evidence_cash(&self.evidence, "reference_cash")?,
-            evidence_cash(&self.evidence, "alternative_cash")?,
-        )
+        let reference = evidence_cash(&self.evidence, "reference_cash")?;
+        let alternative = evidence_cash(&self.evidence, "alternative_cash")?;
+        match self.evidence.get("objective").str() {
+            MATCH_SCORE_OBJECTIVE => match_score_target(reference, alternative),
+            "" | "terminal_utility_difference_regression" => {
+                improvement_target(reference, alternative)
+            }
+            other => Err(format!("unknown comparison objective: {other}")),
+        }
+    }
+    /// Recompute labels from actual outcomes; never carry cash-based preference into win-only learning.
+    pub fn relabel_match_score(&mut self) -> Result<(), String> {
+        let reference = evidence_cash(&self.evidence, "reference_cash")?;
+        let alternative = evidence_cash(&self.evidence, "alternative_cash")?;
+        let pref = match_score_preference(reference, alternative)?;
+        let (target, gain) = pref.clone().unwrap_or_else(|| (vec![0.5, 0.5], 0.));
+        self.target = target;
+        self.gain = gain;
+        self.evidence
+            .set_path("objective", Json::Str(MATCH_SCORE_OBJECTIVE.into()));
+        self.evidence
+            .set_path("decisive", Json::Bool(pref.is_some()));
+        self.evidence.set_path(
+            "alternative_better",
+            Json::Bool(self.target[1] > self.target[0]),
+        );
+        let winner = if self.target[1] > self.target[0] {
+            "alternative_plan"
+        } else {
+            "reference_plan"
+        };
+        if self.evidence.get(winner).is_obj() {
+            let kind = self.evidence.get(winner).get("next").str();
+            let kinds = [
+                "WHEAT",
+                "CARROT",
+                "TOMATO",
+                "STRAWBERRY",
+                "MELON",
+                "GOOSE",
+                "COW",
+                "SHEEP",
+                "",
+            ];
+            self.bucket = self.opponent * 27
+                + ((self.row.step.max(0) as usize / 240).min(2)) * 9
+                + kinds
+                    .iter()
+                    .position(|k| *k == kind)
+                    .ok_or("invalid production in comparison evidence")?;
+        }
+        Ok(())
     }
     pub fn json(&self) -> Json {
         Json::Obj(vec![
@@ -85,6 +135,44 @@ impl Pair {
         }
         Ok(p)
     }
+}
+/// Competition result only. Both cash arrays are learner-first.
+pub fn match_score_target(reference: [f64; 2], alternative: [f64; 2]) -> Result<f32, String> {
+    if reference
+        .iter()
+        .chain(alternative.iter())
+        .any(|v| !v.is_finite())
+    {
+        return Err("nonfinite terminal cash in match comparison".into());
+    }
+    let score = |v: [f64; 2]| {
+        if v[0] > v[1] {
+            1.
+        } else if v[0] < v[1] {
+            0.
+        } else {
+            0.5
+        }
+    };
+    Ok(score(alternative) - score(reference))
+}
+pub fn match_score_preference(
+    reference: [f64; 2],
+    alternative: [f64; 2],
+) -> Result<Option<(Vec<f32>, f64)>, String> {
+    let delta = match_score_target(reference, alternative)?;
+    Ok(if delta == 0. {
+        None
+    } else {
+        Some((
+            if delta > 0. {
+                vec![0.1, 0.9]
+            } else {
+                vec![0.9, 0.1]
+            },
+            delta.abs() as f64,
+        ))
+    })
 }
 /// Win/draw/loss is primary. For the same outcome, use actual terminal relative
 /// cash margin; differences below 0.2% are inconclusive, not success labels.
@@ -141,6 +229,17 @@ impl Bank {
             recent: filter(&self.recent)?,
         })
     }
+    pub fn relabel_match_score(&mut self) -> Result<(), String> {
+        let mut rows = self.elite.clone();
+        rows.extend(self.recent.iter().cloned());
+        for row in &mut rows {
+            row.relabel_match_score()?;
+        }
+        let mut rebuilt = Self::default();
+        rebuilt.admit(&rows);
+        *self = rebuilt;
+        Ok(())
+    }
     pub fn admit(&mut self, pairs: &[Pair]) {
         for p in pairs {
             // Fixed, finite phase/opponent/successor buckets have protected quotas.
@@ -156,6 +255,11 @@ impl Bank {
                 self.elite[*i].seed == p.seed
                     && self.elite[*i].seat == p.seat
                     && self.elite[*i].row.step == p.row.step
+                    && self.elite[*i].opponent == p.opponent
+                    && self.elite[*i].evidence.get("stage") == p.evidence.get("stage")
+                    && self.elite[*i].evidence.get("prefix_id") == p.evidence.get("prefix_id")
+                    && self.elite[*i].evidence.get("frozen_followup_version")
+                        == p.evidence.get("frozen_followup_version")
             });
             if let Some(i) = duplicate {
                 if p.gain > self.elite[i].gain {
@@ -311,12 +415,18 @@ fn improvement_metrics(p: &Policy, pairs: &[Pair]) -> Result<(f64, f64), String>
     let rows: Vec<_> = pairs.iter().map(|r| r.row.clone()).collect();
     let distributions = p.distributions(&rows)?;
     let mut correct = 0.;
+    let mut decisive = 0;
     for (pair, probabilities) in pairs.iter().zip(distributions) {
-        if (probabilities[1] > probabilities[0]) == (pair.improvement_target()? > 0.) {
+        let delta = pair.improvement_target()?;
+        if pair.evidence.get("objective").str() == MATCH_SCORE_OBJECTIVE && delta == 0. {
+            continue;
+        }
+        decisive += 1;
+        if (probabilities[1] > probabilities[0]) == (delta > 0.) {
             correct += 1.;
         }
     }
-    Ok((mse, correct / pairs.len() as f64))
+    Ok((mse, correct / decisive.max(1) as f64))
 }
 /// Fits actual local improvement under ONE accepted continuation revision.
 /// This network is only a proposal: whole-game acceptance controls deployment.
@@ -352,6 +462,19 @@ pub fn update_improvement(
             ),
         ]));
     }
+    let objective = fresh[0].evidence.get("objective").str();
+    if fresh
+        .iter()
+        .chain(active.elite.iter())
+        .chain(active.recent.iter())
+        .any(|pair| pair.evidence.get("objective").str() != objective)
+    {
+        return Err("cannot mix different improvement objectives".into());
+    }
+    let decisive_pairs = fresh
+        .iter()
+        .filter(|pair| pair.improvement_target().is_ok_and(|v| v != 0.))
+        .count();
     let checkpoint = p.checkpoint(0, rng)?;
     let (before_loss, before_accuracy) = improvement_metrics(p, fresh)?;
     let (retained_before_loss, retained_before_accuracy) = improvement_metrics(p, &active.elite)?;
@@ -412,9 +535,17 @@ pub fn update_improvement(
     Ok(Json::Obj(vec![
         (
             "objective".into(),
-            Json::Str("terminal_utility_difference_regression".into()),
+            Json::Str(
+                if objective == MATCH_SCORE_OBJECTIVE {
+                    MATCH_SCORE_OBJECTIVE
+                } else {
+                    "terminal_utility_difference_regression"
+                }
+                .into(),
+            ),
         ),
         ("incumbent_revision".into(), Json::Str(revision.to_string())),
+        ("decisive_pairs".into(), Json::Num(decisive_pairs as f64)),
         ("updates".into(), Json::Num(count as f64)),
         ("pair_loss".into(), Json::Num(loss / count.max(1) as f64)),
         ("pair_mse_before".into(), Json::Num(before_loss)),
@@ -458,6 +589,7 @@ pub fn support_report(p: &Policy, pairs: &[Pair], revision: u64) -> Result<Json,
         tested: usize,
         supported: usize,
         contradicted: usize,
+        neutral: usize,
         untested: usize,
         unchanged: usize,
         seeds: BTreeSet<i64>,
@@ -468,6 +600,9 @@ pub fn support_report(p: &Policy, pairs: &[Pair], revision: u64) -> Result<Json,
     let mut states: BTreeMap<(usize, i64, usize, i64), (Sample, usize, BTreeMap<usize, f32>)> =
         BTreeMap::new();
     for pair in pairs {
+        if pair.evidence.get("stage").str() == "followup" {
+            continue;
+        }
         if !pair.matches_revision(revision)? {
             continue;
         }
@@ -526,8 +661,10 @@ pub fn support_report(p: &Policy, pairs: &[Pair], revision: u64) -> Result<Json,
                 counts.supported += 1;
                 counts.seeds.insert(*seed);
                 counts.supported_gain += *delta as f64;
-            } else {
+            } else if *delta < 0. {
                 counts.contradicted += 1;
+            } else {
+                counts.neutral += 1;
             }
         } else {
             counts.untested += 1;
@@ -550,6 +687,7 @@ pub fn support_report(p: &Policy, pairs: &[Pair], revision: u64) -> Result<Json,
                                 "contradicted_changes".into(),
                                 Json::Num(c.contradicted as f64),
                             ),
+                            ("neutral_changes".into(), Json::Num(c.neutral as f64)),
                             ("untested_choices".into(), Json::Num(c.untested as f64)),
                             ("unchanged_choices".into(), Json::Num(c.unchanged as f64)),
                             ("supported_seeds".into(), Json::Num(c.seeds.len() as f64)),
@@ -707,6 +845,54 @@ mod tests {
                 ),
             ]),
         }
+    }
+    #[test]
+    fn match_score_objective_ignores_cash_when_outcome_is_unchanged() {
+        assert_eq!(match_score_target([100., 90.], [100000., 99.]).unwrap(), 0.);
+        assert_eq!(match_score_target([1., 100.], [99., 100.]).unwrap(), 0.);
+        assert_eq!(match_score_target([100., 100.], [1., 0.]).unwrap(), 0.5);
+        assert_eq!(match_score_target([100., 99.], [999., 1000.]).unwrap(), -1.);
+        assert_eq!(match_score_target([-5., -4.], [-5., -6.]).unwrap(), 1.);
+        assert!(match_score_preference([100., 90.], [100000., 99.])
+            .unwrap()
+            .is_none());
+        assert!(match_score_target([f64::NAN, 0.], [1., 0.]).is_err());
+    }
+    #[test]
+    fn match_score_relabel_recomputes_targets_gain_and_neutral_evidence() {
+        let mut pair = regression_pair(1., [100., 90.], [1000., 90.], 3);
+        assert!(pair.improvement_target().unwrap() > 0.);
+        pair.relabel_match_score().unwrap();
+        assert_eq!(pair.improvement_target().unwrap(), 0.);
+        assert_eq!(pair.target, vec![0.5, 0.5]);
+        assert_eq!(pair.gain, 0.);
+        assert_eq!(pair.evidence.get("decisive"), &Json::Bool(false));
+        let mut bank = Bank {
+            elite: vec![pair.clone()],
+            recent: vec![pair],
+        };
+        bank.relabel_match_score().unwrap();
+        assert!(bank
+            .elite
+            .iter()
+            .chain(&bank.recent)
+            .all(|p| p.improvement_target().unwrap() == 0.));
+    }
+    #[test]
+    fn match_score_training_rejects_mixed_objectives_and_learns_outcomes() {
+        crate::learning::tensor::worker_threads();
+        let mut p = Policy::plans(-1, 8, 0.003).unwrap();
+        let mut rows = vec![
+            regression_pair(1., [1., 2.], [2., 1.], 3),
+            regression_pair(-1., [2., 1.], [1., 2.], 3),
+        ];
+        rows[0].relabel_match_score().unwrap();
+        assert!(update_improvement(&mut p, &rows, &Bank::default(), 3, 1, 4, &mut Rng(1)).is_err());
+        rows[1].relabel_match_score().unwrap();
+        let report =
+            update_improvement(&mut p, &rows, &Bank::default(), 3, 60, 4, &mut Rng(1)).unwrap();
+        assert_eq!(report.get("objective").str(), MATCH_SCORE_OBJECTIVE);
+        assert!(report.get("pair_mse_after").f64() < report.get("pair_mse_before").f64());
     }
     #[test]
     fn improvement_target_uses_actual_magnitude_and_outcomes_before_cash() {

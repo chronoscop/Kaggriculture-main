@@ -6,3 +6,4 @@ pub mod experience;
 pub mod plan_update;
 
 pub mod plan_compare;
+pub mod score_confirmation;
