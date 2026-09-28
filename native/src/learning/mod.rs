@@ -3,3 +3,6 @@ pub mod policy;
 pub mod tensor;
 
 pub mod experience;
+pub mod plan_update;
+
+pub mod plan_compare;

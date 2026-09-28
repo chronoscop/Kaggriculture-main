@@ -8,6 +8,8 @@ type Raw = *mut c_void;
 extern "C" {
     fn ft_error() -> *const c_char;
     fn ft_threads(n: c_int);
+    fn ft_worker_threads(n: c_int);
+    fn ft_thread_count() -> c_int;
     fn ft_grad_mode(enabled: c_int) -> c_int;
     fn ft_free(t: Raw);
     fn ft_numel(t: Raw) -> i64;
@@ -71,6 +73,16 @@ pub fn threads(n: i32) {
     static INIT: std::sync::Once = std::sync::Once::new();
     assert!(n > 0);
     INIT.call_once(|| unsafe { ft_threads(n) });
+}
+/// OpenMP/MKL thread settings must also be initialized on each Rust worker.
+/// Inter-op remains process-global and is initialized once by threads().
+pub fn worker_threads() {
+    unsafe {
+        ft_worker_threads(1);
+    }
+}
+pub fn thread_count() -> i32 {
+    unsafe { ft_thread_count() }
 }
 impl Tensor {
     fn own(raw: Raw) -> Result<Self, String> {
@@ -141,7 +153,7 @@ impl Tensor {
             3 | 4 | 7 | 9 | 23 | 42 => (1, 1, 0),
             5 | 17 | 35 | 36 => (1, ints.len(), 0),
             10 => (2, 0, 1),
-            12..=15 | 20 => (2, 0, 0),
+            12..=15 | 20 | 46 => (2, 0, 0),
             19 => (1, 0, 2),
             21 | 22 => (2, 1, 0),
             27 => (1, 3, 0),
@@ -216,5 +228,51 @@ impl Tensor {
     }
     pub fn zero_grad(&mut self) {
         unsafe { ft_zero_grad(self.raw) }
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    #[test]
+    fn single_category_distribution_matches_hierarchical_distribution() {
+        super::threads(1);
+        let devices = if std::env::var_os("ROUTE_RL_TEST_CUDA").is_some() {
+            vec![-1, 0]
+        } else {
+            vec![-1]
+        };
+        for device in devices {
+            let scores =
+                super::Tensor::floats(&[0.2, 1.3, -0.7, 2., 0., 3.], &[2, 3], device, false)
+                    .unwrap();
+            let mask = super::Tensor::integers(&[1, 1, 1, 1, 1, 0], &[2, 3], device, true).unwrap();
+            let groups =
+                super::Tensor::integers(&[1, 1, 1, 1, 1, 0], &[2, 3], device, false).unwrap();
+            let head = super::Tensor::floats(&[0.3; 38], &[2, 19], device, false).unwrap();
+            let full = super::Tensor::operation(44, &[&scores, &head, &groups, &mask], &[], &[])
+                .unwrap()
+                .data()
+                .unwrap();
+            let flat = super::Tensor::operation(46, &[&scores, &mask], &[], &[])
+                .unwrap()
+                .data()
+                .unwrap();
+            for (a, b) in full.iter().zip(flat) {
+                assert!((*a - b).abs() < 1e-6);
+            }
+        }
+    }
+    #[test]
+    fn rust_worker_uses_one_tensor_thread() {
+        super::threads(1);
+        assert_eq!(
+            std::thread::spawn(|| {
+                super::worker_threads();
+                super::thread_count()
+            })
+            .join()
+            .unwrap(),
+            1
+        );
     }
 }

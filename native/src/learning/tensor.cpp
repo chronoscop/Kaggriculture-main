@@ -13,6 +13,8 @@ static thread_local std::string error;
 extern "C" {
 const char* ft_error(){return error.c_str();}
 void ft_threads(int n){at::set_num_threads(n);at::set_num_interop_threads(1);}
+void ft_worker_threads(int n){at::set_num_threads(n);at::init_num_threads();}
+int ft_thread_count(){return at::get_num_threads();}
 int ft_grad_mode(int enabled){bool old=at::GradMode::is_enabled();at::GradMode::set_enabled(enabled!=0);return old;}
 void ft_free(Tensor* t){delete t;}
 int64_t ft_numel(const Tensor* t){return t->numel();}
@@ -96,6 +98,8 @@ Tensor* ft_op(int op,const Tensor* const* in,int count,const int64_t* ints,int n
  // Actual exploration behavior distribution; used identically at sampling and PPO update.
  case 45:{auto q=*in[1];auto eps=*in[2];auto mask=*in[3];
  return new Tensor(((1.-eps)*a.exp()+eps*q).clamp_min(1e-30).log().masked_fill(mask.logical_not(),-1e9));}
+ // Plan policies have a single legal category: avoid the N x width x 19 expansion.
+ case 46:return new Tensor(a.masked_fill(in[1]->logical_not(),-1e9).log_softmax(-1));
  case 41:return new Tensor(at::addcmul(a,*in[1],*in[2],scalars[0]));
  default:throw std::runtime_error("unknown tensor operation");
  }

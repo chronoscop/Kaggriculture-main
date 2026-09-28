@@ -207,6 +207,7 @@ struct Builder {
     end: i64,
     route: Route,
     collected: i64,
+    prices: kagg_engine::state::OMap,
 }
 impl Builder {
     fn new(o: &Observation, e: &Executor, actor: usize) -> Self {
@@ -226,15 +227,23 @@ impl Builder {
             end: o.end(),
             route: Route::default(),
             collected: 0,
+            prices: o.market.prices.clone(),
         }
     }
     fn command(&mut self, op: &str, item: &str, n: i64) -> bool {
         if self.t > self.end {
             return false;
         }
-        let before_f = self.farm.clone();
-        let before_p = self.private.clone();
+        // apply_unit_action never changes money, other workers, or remote tiles.
+        // Movement changes only this actor's position; other successful commands
+        // change the standing tile and/or this actor's inventory. PLANT also uses
+        // a seed, but necessarily changes the standing tile on success.
+        #[cfg(test)]
+        let full_before = (self.farm.clone(), self.private.clone());
         let p = pos(&self.farm, self.actor);
+        let movement = matches!(op, "NORTH" | "SOUTH" | "EAST" | "WEST");
+        let initial = (!movement).then(|| tile(&self.farm, p).clone());
+        let before_inventory = (!movement).then(|| self.private.inventories[self.actor].clone());
         let a = unit(op, item, n);
         engine::apply_unit_action(
             &mut self.farm,
@@ -243,10 +252,88 @@ impl Builder {
             &a,
             self.t / 24,
         );
-        if self.farm == before_f && self.private == before_p {
+        let changed = if movement {
+            pos(&self.farm, self.actor) != p
+        } else {
+            tile(&self.farm, p) != initial.as_ref().unwrap()
+                || &self.private.inventories[self.actor] != before_inventory.as_ref().unwrap()
+        };
+        #[cfg(test)]
+        assert_eq!(
+            changed,
+            self.farm != full_before.0 || self.private != full_before.1,
+            "local action check: {op}"
+        );
+        if !changed {
             return false;
         }
-        let movement = matches!(op, "NORTH" | "SOUTH" | "EAST" | "WEST");
+        // Estimated value orders feasible routes; only actual game results train policies.
+        let price = |name: &str| self.prices.get(name).max(1) as f64;
+        let mut value = 0.;
+        if op == "HARVEST" {
+            for name in kagg_engine::state::PRODUCTS {
+                let q = (self.private.inventories[self.actor].get(name)
+                    - before_inventory.as_ref().unwrap().get(name))
+                .max(0);
+                if q > 0 {
+                    self.route.harvested_products.add(name, q);
+                }
+                value += q as f64 * price(name);
+            }
+        }
+        if let Some(Cell::Plant {
+            crop,
+            planted_day,
+            consecutive_unwatered,
+            ..
+        }) = initial.as_ref()
+        {
+            let spec = rules::crop(crop).unwrap();
+            if op == "WATER" {
+                let survival = if *consecutive_unwatered > 0 { 1.5 } else { 0.7 };
+                value += price(crop) * survival;
+            }
+            if op == "FERTILIZE" {
+                let age = self.t / 24 - planted_day;
+                if age >= spec.max_yield_day / 2 {
+                    value += price(crop) * 0.65;
+                }
+            }
+        }
+        if let Some(Cell::Structure {
+            animal: Some(a), ..
+        }) = initial.as_ref()
+        {
+            let spec = rules::animal(&a.animal).unwrap();
+            let remaining = 29 - self.t / 24;
+            if op == "FEED" && remaining > 0 {
+                value += price(spec.product) * (if a.consecutive_unfed > 0 { 2.0 } else { 1.0 })
+                    / spec.interval as f64
+                    + spec.cost as f64 / 25.;
+            }
+            if op == "CARE" && remaining > 0 {
+                value += price(spec.product) * 0.65 / spec.interval as f64;
+            }
+            if op == "COLLECT_FERTILIZER" {
+                value += price("FERTILIZER").min(80.) * 0.3;
+            }
+        }
+        if op == "PLANT" {
+            let spec = rules::crop(item).unwrap();
+            value += (price(item) * spec.max_yield as f64 - spec.seed_cost as f64).max(0.)
+                / (spec.first_yield_day as f64 + 2.)
+                + 15.;
+        }
+        if op == "PLACE" && rules::animal(item).is_some() {
+            value += 120.;
+        }
+        if op.starts_with("BUILD_") {
+            value += 30.;
+        }
+        if op == "DIG" {
+            value += 8.;
+        }
+        self.route.economic_value += value;
         self.route.walking += usize::from(movement);
         self.route.work += usize::from(!movement);
         if op == "PLANT" {
@@ -264,7 +351,7 @@ impl Builder {
         }
         if op == "HARVEST" {
             self.route.harvested += (self.private.inventories[self.actor].sum()
-                - before_p.inventories[self.actor].sum())
+                - before_inventory.as_ref().unwrap().sum())
             .max(0);
         }
         self.route.steps.push_back(Scheduled {
@@ -521,6 +608,17 @@ impl Builder {
     }
 }
 pub fn route_problem(o: &Observation, e: &Executor, actor: usize) -> Problem {
+    route_problem_impl(o, e, actor, false)
+}
+/// Opt-in prototype: existing checkpoint candidate ordering remains unchanged.
+pub fn economic_route_problem(o: &Observation, e: &Executor, actor: usize) -> Problem {
+    route_problem_impl(o, e, actor, true)
+}
+pub fn route_value(route: &Route) -> f64 {
+    route.economic_value / (route.steps.len().max(1) as f64).powf(0.65)
+        - route.walking as f64 * 0.25
+}
+fn route_problem_impl(o: &Observation, e: &Executor, actor: usize, economic: bool) -> Problem {
     let mut choices = vec![Choice::Continue];
     let (reserved, _, _) = e.reserved(actor);
     let start = Builder::new(o, e, actor);
@@ -554,7 +652,21 @@ pub fn route_problem(o: &Observation, e: &Executor, actor: usize) -> Problem {
                     .copied()
                     .filter(|p| !b.route.sites.contains(p))
                     .collect();
-                nearby.sort_by_key(|p| (distance(pos(&b.farm, actor), *p), *p));
+                nearby.sort_by_key(|p| {
+                    (
+                        if economic
+                            && e.service_deadlines
+                                .get(p)
+                                .is_some_and(|t| *t <= o.step + 24)
+                        {
+                            0
+                        } else {
+                            1
+                        },
+                        distance(pos(&b.farm, actor), *p),
+                        *p,
+                    )
+                });
                 for p in nearby.into_iter().take(8) {
                     if let Some(b) = b.service(o, e, p, mode) {
                         next.push(b);
@@ -562,6 +674,22 @@ pub fn route_problem(o: &Observation, e: &Executor, actor: usize) -> Problem {
                 }
             }
             next.sort_by(|a, b| {
+                if economic {
+                    let urgency = |r: &Route| {
+                        r.sites
+                            .iter()
+                            .filter(|site| {
+                                e.service_deadlines
+                                    .get(site)
+                                    .is_some_and(|t| *t <= o.step + 24)
+                            })
+                            .count() as f64
+                            * 20.
+                    };
+                    return (route_value(&b.route) + urgency(&b.route))
+                        .total_cmp(&(route_value(&a.route) + urgency(&a.route)))
+                        .then_with(|| a.route.sites.cmp(&b.route.sites));
+                }
                 let score = |x: &Builder| {
                     x.route.work as i64 * 4
                         + x.route.harvested * 2

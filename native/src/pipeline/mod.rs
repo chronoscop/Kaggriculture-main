@@ -20,3 +20,21 @@ pub const ENCODING: &str = "mixed-market-320x32-independent-v3";
 
 #[cfg(test)]
 mod tests;
+
+pub mod plan_prototype;
+
+#[cfg(feature = "train")]
+pub mod plan_learning;
+
+#[cfg(feature = "train")]
+pub mod plan_chain;
+
+#[cfg(feature = "train")]
+pub mod plan_portfolio;
+
+#[cfg(feature = "train")]
+pub mod event_portfolio;
+#[cfg(feature = "train")]
+pub mod plan_events;
+#[cfg(feature = "train")]
+pub mod plan_resources;

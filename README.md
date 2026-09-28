@@ -1,10 +1,13 @@
 # Kaggriculture：Rust 混合生产半 RL
 
-> 当前版本：[可学习市场决策](docs/mixed_v8_market.md)（v8-market-3）。模型学习商品优先顺序、按实际预算选择交易数量，并结合对手成熟时间、种养变化响应市场与资金事件；独立策略/价值网络。支持规则交易对照和两个检查点直接对战。
+> **当前训练主线：[事件与下一批生产对照学习](docs/event_plan_training.md)（event-plan-improvement-v4）**，入口 `event-train` / `event-agent`。支持加载第55轮v3已验收组合为冻结底座，新增可修订批次、共享资源约束和A/B/C真实对照；新实验命令见该文档。
+> [v3固定窗口版](docs/plan_improvement.md)保留用于基准与检查点读取，下方v8命令为历史实验。
+
+> 旧版：[可学习市场决策](docs/mixed_v8_market.md)（v8-market-3）。模型学习商品优先顺序、按实际预算选择交易数量，并结合对手成熟时间、种养变化响应市场与资金事件；独立策略/价值网络。支持规则交易对照和两个检查点直接对战。
 
 对手与探索沿用 [PFSP](docs/mixed_v7_pfsp.md) 和 [分对局探索](docs/mixed_v7_exploration.md)；成功经验沿用 [受保护经验](docs/mixed_v7_league.md)。历史文档中的旧检查点续训命令不适用于当前版本。
 
-当前训练 pipeline：**mixed-production-v8**。Rust 采集、LibTorch CPU/CUDA 学习；farm2945 仅用于独立评估。
+旧训练 pipeline：**mixed-production-v8**。Rust 采集、LibTorch CPU/CUDA 学习；farm2945 仅用于独立评估。
 
 ## 本版改动
 

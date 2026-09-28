@@ -1,0 +1,11 @@
+{
+  "schema": "production-plan-prototype-v1",
+  "plots_per_worker": 4.26688839370689,
+  "cash_reserve": 197.81949950814638,
+  "animal_share": 0.2606422505957404,
+  "short_share": 0.4646319352188344,
+  "expansion_fill": 0.8647740805797002,
+  "forecast_days": 5.270646329040584,
+  "economic_routes": true,
+  "renewal_lead_days": 0
+}

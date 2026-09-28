@@ -65,6 +65,7 @@ pub struct Policy {
     pub device: i32,
     pub lr: f64,
     pub market_mode: crate::pipeline::trading::MarketMode,
+    pub plan_residual: bool,
 }
 impl Policy {
     pub fn mixed_routes(device: i32, seed: u64, lr: f64) -> Result<Self, String> {
@@ -101,7 +102,20 @@ impl Policy {
             device,
             lr,
             market_mode: Default::default(),
+            plan_residual: false,
         })
+    }
+    /// Start exactly at the executable planner in greedy mode. The fixed prior
+    /// is visible in candidate feature 30; the network learns unrestricted logit
+    /// corrections. This is still a learned, on-policy categorical distribution.
+    pub fn plans(device: i32, seed: u64, lr: f64) -> Result<Self, String> {
+        let mut p = Self::mixed_routes(device, seed, lr)?;
+        p.plan_residual = true;
+        for i in [8, 9] {
+            let zero = p.parameters[i].value.unary(26)?;
+            p.parameters[i].value.copy_from(&zero)?;
+        }
+        Ok(p)
     }
     fn linear(&self, x: &Tensor, index: usize) -> Result<Tensor, String> {
         Tensor::operation(
@@ -122,11 +136,21 @@ impl Policy {
         let v = self.linear(&b.candidates, 4)?.unary(1)?;
         let expanded = Tensor::operation(5, &[&z.dim(3, 1)?], &[-1, b.width as i64, -1], &[])?;
         let joined = Tensor::operation(2, &[&v, &expanded], &[-1], &[])?;
-        let scores = self
+        let mut scores = self
             .linear(&self.linear(&joined, 6)?.unary(1)?, 8)?
             .dim(4, -1)?;
-        let head = self.linear(&z, 14)?;
-        let lp = Tensor::operation(44, &[&scores, &head, &b.groups, &b.mask], &[], &[])?;
+        if self.plan_residual {
+            // Select candidate feature 30 without making a Python-side tensor.
+            let index = Tensor::integers(&[30], &[1], self.device, false)?;
+            let prior = Tensor::operation(22, &[&b.candidates, &index], &[2], &[])?.dim(4, 2)?;
+            scores = scores.binary(12, &prior)?;
+        }
+        let lp = if self.plan_residual {
+            Tensor::operation(46, &[&scores, &b.mask], &[], &[])?
+        } else {
+            let head = self.linear(&z, 14)?;
+            Tensor::operation(44, &[&scores, &head, &b.groups, &b.mask], &[], &[])?
+        };
         // Value regression must not update the actor context representation.
         let critic_z = self
             .linear(&self.linear(&b.context, 16)?.unary(1)?, 18)?
@@ -149,7 +173,11 @@ impl Policy {
         let batch = Batch::new(rows, self.device)?;
         let (lp, value) = self.forward(&batch)?;
         let base = lp.data()?;
-        let behavior = self.behavior(&lp, &batch)?.data()?;
+        let behavior = if deterministic {
+            Vec::new()
+        } else {
+            self.behavior(&lp, &batch)?.data()?
+        };
         let lp = if deterministic { &base } else { &behavior };
         let values = value.data()?;
         let mut decisions = Vec::with_capacity(rows.len());
@@ -314,6 +342,7 @@ impl Policy {
                 "market_mode".into(),
                 Json::Str(self.market_mode.name().into()),
             ),
+            ("plan_residual".into(), Json::Bool(self.plan_residual)),
             ("weights".into(), self.weights_json()?),
             ("optimizer".into(), Json::Obj(optimizer)),
         ]))
@@ -358,12 +387,13 @@ impl Policy {
         }
         self.lr = lr;
         self.market_mode = market_mode;
+        self.plan_residual = matches!(checkpoint.get("plan_residual"), Json::Bool(true));
         Ok((iteration, rng))
     }
     fn is_critic(name: &str) -> bool {
         name.starts_with("critic_context.") || name.starts_with("value.")
     }
-    fn adam(&mut self) -> Result<(), String> {
+    pub(crate) fn adam(&mut self) -> Result<(), String> {
         let _guard = NoGrad::new();
         // Clip separately: a large critic gradient must not scale down actor updates.
         for critic in [false, true] {

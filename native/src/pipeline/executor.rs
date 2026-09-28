@@ -114,6 +114,9 @@ pub struct Route {
     pub reused_fertilizer: usize,
     pub harvested: i64,
     pub replants: usize,
+    /// Prototype planning estimates, never used as training rewards.
+    pub economic_value: f64,
+    pub harvested_products: OMap,
 }
 impl Route {
     pub fn remaining(&self) -> usize {
@@ -157,6 +160,8 @@ pub struct Stats {
 }
 #[derive(Clone, Default)]
 pub struct Executor {
+    pub service_deadlines: BTreeMap<Pos, i64>,
+    pub plan_wheat_reserve: i64,
     pub projects: BTreeMap<Pos, Project>,
     pub routes: Vec<Option<Route>>,
     pub stats: Stats,
@@ -419,7 +424,7 @@ impl Executor {
             let reserve = if o.step >= 694 {
                 0
             } else if item == "WHEAT" {
-                animals * 2
+                (animals * 2).max(self.plan_wheat_reserve)
             } else if item == "FERTILIZER" {
                 self.projects.len().min(8) as i64
             } else {
