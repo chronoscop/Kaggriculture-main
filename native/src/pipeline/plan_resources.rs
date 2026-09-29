@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Stage {
+    pub route_handoff: bool,
     pub conditional: bool,
     pub links: Vec<usize>,
     pub lead_steps: i64,
@@ -27,6 +28,7 @@ impl BatchPlan {
         Json::Obj(vec![
             ("id".into(), Json::Num(self.id as f64)),
             ("conditional".into(), Json::Bool(self.stage.conditional)),
+            ("route_handoff".into(), Json::Bool(self.stage.route_handoff)),
             ("revision".into(), Json::Num(self.revision as f64)),
             ("lead_steps".into(), Json::Num(self.stage.lead_steps as f64)),
             ("cash_floor".into(), Json::Num(self.stage.cash_floor)),
@@ -1116,5 +1118,122 @@ mod conditional_tests {
         assert!(ledger.needs.iter().all(|n| !n.feed_stocked));
         c.observe(&o);
         assert!(c.progress.iter().all(|p| !p.armed));
+    }
+}
+
+#[cfg(test)]
+mod harvest_handoff_tests {
+    use super::*;
+    use kagg_engine::engine;
+    #[test]
+    fn handoff_connects_early_harvest_to_successor_and_confirms_real_receipts() {
+        let (mut state, mut c) = tests::fixture(73);
+        state.private[0].seeds.add("CARROT", 1);
+        let o = Observation::from_state(&state, 0);
+        let batch = c
+            .revise_batch_mode(
+                &o,
+                &[(3, 4)],
+                Some(Production::Crop("CARROT".into())),
+                1,
+                24,
+                180.,
+                true,
+            )
+            .unwrap();
+        c.batches[batch].stage.route_handoff = true;
+        let mut saw_route = false;
+        while state.step < 200 {
+            let o = Observation::from_state(&state, 0);
+            c.observe(&o);
+            if c.progress[0].first_harvests == 0 {
+                assert!(
+                    !c.progress[0].armed,
+                    "route proposal must not commit before actual harvest"
+                );
+                assert_eq!(
+                    c.agent.executor.projects[&(3, 4)].production.name(),
+                    "WHEAT"
+                );
+            }
+            let action = if super::super::plan_prototype::Agent::planning_due(&o) {
+                c.execute_choice(
+                    &o,
+                    super::super::plan_chain::Choice {
+                        base: None,
+                        links: vec![],
+                        features: vec![],
+                    },
+                )
+            } else {
+                c.continue_action(&o)
+            };
+            for route in c.agent.executor.routes.iter().flatten() {
+                if route.production_handoffs.contains_key(&(3, 4)) {
+                    saw_route = true;
+                    let ops: Vec<_> = route
+                        .steps
+                        .iter()
+                        .filter(|s| s.position == (3, 4))
+                        .collect();
+                    if let Some(h) = ops.iter().position(|s| s.action.op == "HARVEST") {
+                        let p = ops
+                            .iter()
+                            .position(|s| s.action.op == "PLANT" && s.action.item == "CARROT")
+                            .unwrap();
+                        assert!(h < p);
+                    }
+                }
+            }
+            engine::step(&mut state, &[action, Default::default()]);
+        }
+        c.observe(&Observation::from_state(&state, 0));
+        assert!(
+            saw_route,
+            "must exercise same-route handoff rather than old boundary arming"
+        );
+        assert!(
+            c.progress[0].successor_started && c.progress[0].successor_yielded,
+            "{}",
+            c.report().dump()
+        );
+    }
+    #[test]
+    fn handoff_respects_the_promised_extra_cycle() {
+        let (mut state, mut c) = tests::fixture(73);
+        state.private[0].shed.add("SHEEP", 1);
+        state.private[0].shed.add("WHEAT", 8);
+        let batch = c
+            .revise_batch_mode(
+                &Observation::from_state(&state, 0),
+                &[(3, 4)],
+                Some(Production::Animal("SHEEP".into())),
+                2,
+                24,
+                180.,
+                true,
+            )
+            .unwrap();
+        c.batches[batch].stage.route_handoff = true;
+        while state.step < 430 {
+            let o = Observation::from_state(&state, 0);
+            c.observe(&o);
+            assert!(!c.progress[0].successor_started || c.progress[0].first_harvests >= 2);
+            let a = if super::super::plan_prototype::Agent::planning_due(&o) {
+                c.execute_choice(
+                    &o,
+                    super::super::plan_chain::Choice {
+                        base: None,
+                        links: vec![],
+                        features: vec![],
+                    },
+                )
+            } else {
+                c.continue_action(&o)
+            };
+            engine::step(&mut state, &[a, Default::default()]);
+        }
+        c.observe(&Observation::from_state(&state, 0));
+        assert!(c.progress[0].successor_yielded, "{}", c.report().dump());
     }
 }

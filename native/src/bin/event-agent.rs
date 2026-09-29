@@ -11,8 +11,9 @@ fn load_deployment(
     String,
 > {
     use route_rl_native::pipeline::event_policy::{
-        BATCH_CONTRACT, CONDITIONAL_CONTRACT, CONTRACT, EVIDENCE_SCHEMA, LEGACY_SCHEMA,
-        MENU_BATCH_CONTRACT, MENU_CONTRACT, MENU_SCHEMA, NORMALIZED_SCHEMA, PREFIX_SCHEMA, SCHEMA,
+        BATCH_CONTRACT, CONDITIONAL_CONTRACT, CONDITIONAL_SCHEMA, CONTEXTUAL_CONTRACT, CONTRACT,
+        EVIDENCE_SCHEMA, HANDOFF_CONTRACT, HANDOFF_SCHEMA, LEGACY_SCHEMA, MENU_BATCH_CONTRACT,
+        MENU_CONTRACT, MENU_SCHEMA, NORMALIZED_SCHEMA, PREFIX_SCHEMA, SCHEMA,
     };
     use route_rl_native::pipeline::{
         event_portfolio::{Portfolio, Runtime},
@@ -20,7 +21,14 @@ fn load_deployment(
     };
     if matches!(
         checkpoint.get("schema").str(),
-        SCHEMA | MENU_SCHEMA | PREFIX_SCHEMA | NORMALIZED_SCHEMA | EVIDENCE_SCHEMA | LEGACY_SCHEMA
+        SCHEMA
+            | CONDITIONAL_SCHEMA
+            | HANDOFF_SCHEMA
+            | MENU_SCHEMA
+            | PREFIX_SCHEMA
+            | NORMALIZED_SCHEMA
+            | EVIDENCE_SCHEMA
+            | LEGACY_SCHEMA
     ) {
         let contract = CONTRACT;
         if checkpoint.get("policy_contract").str() != contract
@@ -31,29 +39,45 @@ fn load_deployment(
                     | MENU_CONTRACT
                     | MENU_BATCH_CONTRACT
                     | CONDITIONAL_CONTRACT
+                    | HANDOFF_CONTRACT
+                    | CONTEXTUAL_CONTRACT
             )
         {
             return Err("wrong shared event execution contract".into());
         }
         if !matches!(
             checkpoint.get("schema").str(),
-            SCHEMA | MENU_SCHEMA | PREFIX_SCHEMA
+            SCHEMA | CONDITIONAL_SCHEMA | HANDOFF_SCHEMA | MENU_SCHEMA | PREFIX_SCHEMA
         ) && checkpoint.get("deployment").get("contract").str() != CONTRACT
         {
             return Err("legacy wrapper cannot reinterpret batch responsibility".into());
         }
-        if !matches!(checkpoint.get("schema").str(), SCHEMA | MENU_SCHEMA)
-            && matches!(
-                checkpoint.get("deployment").get("contract").str(),
-                MENU_CONTRACT | MENU_BATCH_CONTRACT
-            )
-        {
+        if !matches!(
+            checkpoint.get("schema").str(),
+            SCHEMA | CONDITIONAL_SCHEMA | HANDOFF_SCHEMA | MENU_SCHEMA
+        ) && matches!(
+            checkpoint.get("deployment").get("contract").str(),
+            MENU_CONTRACT | MENU_BATCH_CONTRACT
+        ) {
             return Err("legacy wrapper cannot reinterpret menu policy".into());
         }
         if checkpoint.get("deployment").get("contract").str() == CONDITIONAL_CONTRACT
-            && checkpoint.get("schema").str() != SCHEMA
+            && !matches!(
+                checkpoint.get("schema").str(),
+                SCHEMA | CONDITIONAL_SCHEMA | HANDOFF_SCHEMA
+            )
         {
             return Err("conditional policy requires v10 wrapper".into());
+        }
+        if checkpoint.get("deployment").get("contract").str() == HANDOFF_CONTRACT
+            && !matches!(checkpoint.get("schema").str(), SCHEMA | HANDOFF_SCHEMA)
+        {
+            return Err("harvest route contract requires v11 or newer".into());
+        }
+        if checkpoint.get("deployment").get("contract").str() == CONTEXTUAL_CONTRACT
+            && checkpoint.get("schema").str() != SCHEMA
+        {
+            return Err("resource-ranked menus require v12".into());
         }
         let config = Config::parse(checkpoint.get("config"))?;
         let accepted =

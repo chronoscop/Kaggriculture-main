@@ -423,6 +423,7 @@ pub struct Choice {
     pub keep: bool,
     /// Preserve current production until observed funding, stock and work permit conversion.
     pub conditional: bool,
+    pub route_handoff: bool,
     pub features: Vec<f32>,
 }
 impl Choice {
@@ -430,6 +431,7 @@ impl Choice {
         Json::Obj(vec![
             ("keep".into(), Json::Bool(self.keep)),
             ("conditional".into(), Json::Bool(self.conditional)),
+            ("route_handoff".into(), Json::Bool(self.route_handoff)),
             (
                 "sites".into(),
                 Json::Arr(
@@ -453,7 +455,7 @@ impl Choice {
     }
     pub fn apply(&self, c: &mut Controller, o: &Observation) -> Result<(), String> {
         if !self.keep {
-            c.revise_batch_mode(
+            let id = c.revise_batch_mode(
                 o,
                 &self.sites,
                 self.next.clone(),
@@ -462,6 +464,7 @@ impl Choice {
                 self.floor,
                 self.conditional,
             )?;
+            c.batches[id].stage.route_handoff = self.route_handoff && self.conditional;
         }
         Ok(())
     }
@@ -537,6 +540,7 @@ pub fn choices_mode(c: &Controller, o: &Observation, e: &Event, conditional: boo
         floor: 0.,
         keep: true,
         conditional: false,
+        route_handoff: false,
         features: vec![],
     }];
     for kind in kinds() {
@@ -563,6 +567,7 @@ pub fn choices_mode(c: &Controller, o: &Observation, e: &Event, conditional: boo
                     floor: c.agent.config.cash_reserve + extra_reserve,
                     keep: false,
                     conditional,
+                    route_handoff: false,
                     features: vec![],
                 };
                 let extra = p
@@ -598,6 +603,7 @@ pub fn choices_mode(c: &Controller, o: &Observation, e: &Event, conditional: boo
             floor: 0.,
             keep: false,
             conditional,
+            route_handoff: false,
             features: vec![],
         });
     }

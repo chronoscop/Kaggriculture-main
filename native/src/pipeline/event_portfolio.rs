@@ -175,6 +175,8 @@ impl Portfolio {
 }
 pub struct Runtime {
     pub conditional_plans: bool,
+    pub route_handoff: bool,
+    pub contextual_menu: bool,
     pub menu_reference: Option<Box<Runtime>>,
     pub batch_lifetime: bool,
     pub foundation: legacy::Runtime,
@@ -210,8 +212,17 @@ impl Runtime {
                     } else {
                         anchor.select(Some(slot), &row)?
                     };
-                let choices = if self.conditional_plans {
-                    super::plan_menu::build_conditional(c, o, e, &raw, index)?
+                let choices = if self.contextual_menu {
+                    super::plan_menu::build_contextual(c, o, e, &raw, index)?
+                } else if self.conditional_plans {
+                    super::plan_menu::build_conditional_mode(
+                        c,
+                        o,
+                        e,
+                        &raw,
+                        index,
+                        self.route_handoff,
+                    )?
                 } else {
                     super::plan_menu::build(c, o, e, &raw, index)?
                 };
@@ -264,6 +275,8 @@ impl Runtime {
         let followup_portfolio = p.followups();
         Ok(Self {
             conditional_plans: false,
+            route_handoff: false,
+            contextual_menu: false,
             menu_reference: None,
             batch_lifetime: false,
             foundation: legacy::Runtime::load(&p.foundation, device)?,

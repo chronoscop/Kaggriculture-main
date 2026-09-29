@@ -414,8 +414,41 @@ impl Builder {
         (!b.route.steps.is_empty()).then_some(b.route)
     }
     fn service(&self, o: &Observation, e: &Executor, target: Pos, mode: usize) -> Option<Self> {
+        self.service_mode(o, e, target, mode, true).or_else(|| {
+            e.harvest_successors
+                .contains_key(&target)
+                .then(|| self.service_mode(o, e, target, mode, false))
+                .flatten()
+        })
+    }
+    fn service_mode(
+        &self,
+        o: &Observation,
+        e: &Executor,
+        target: Pos,
+        mode: usize,
+        allow_handoff: bool,
+    ) -> Option<Self> {
         let mut b = self.clone();
-        let desired = e.projects.get(&target).map(|p| p.production.clone());
+        let mut desired = e.projects.get(&target).map(|p| p.production.clone());
+        let successor = if allow_handoff {
+            e.harvest_successors.get(&target).cloned()
+        } else {
+            None
+        };
+        let handoff_animal = successor.as_ref().and_then(|p| {
+            if let Production::Animal(a) = p {
+                Some(a)
+            } else {
+                None
+            }
+        });
+        if let Some(animal) = handoff_animal {
+            if !b.pickup(animal, 1) {
+                return None;
+            }
+        }
+
         let initial = tile(&b.farm, target).clone();
         // Reserve confirmed seed stock for earlier approved projects before optional renewal.
         let seed_for_target = |name: &str, available: i64| {
@@ -551,6 +584,22 @@ impl Builder {
             }
             _ => {}
         }
+        if let Some(next) = &successor {
+            // Actual simulated HARVEST must precede the successor. Never clear an
+            // immature crop just because a batch owns a future promise.
+            if !b
+                .route
+                .steps
+                .iter()
+                .any(|s| s.position == target && s.action.op == "HARVEST")
+            {
+                return None;
+            }
+            if matches!(tile(&b.farm, target), Cell::Plant { .. }) && !b.command("DIG", "", 0) {
+                return None;
+            }
+            desired = Some(next.clone());
+        }
         match desired {
             Some(Production::Crop(c)) => {
                 if matches!(tile(&b.farm, target), Cell::Structure { animal: None, .. }) {
@@ -598,6 +647,30 @@ impl Builder {
                 }
             }
             None => {}
+        }
+        if let Some(next) = successor {
+            let placed = b.route.steps.iter().any(|s| {
+                s.position == target
+                    && s.action.item == next.name()
+                    && matches!(s.action.op.as_str(), "PLANT" | "PLACE")
+            });
+            if !placed {
+                return None;
+            }
+            if e.harvest_successor_deadlines
+                .get(&target)
+                .is_some_and(|deadline| {
+                    b.route.steps.iter().any(|s| {
+                        s.position == target
+                            && s.action.item == next.name()
+                            && matches!(s.action.op.as_str(), "PLANT" | "PLACE")
+                            && s.at > *deadline
+                    })
+                })
+            {
+                return None;
+            }
+            b.route.production_handoffs.insert(target, next);
         }
         if b.route.work == work_before {
             return None;

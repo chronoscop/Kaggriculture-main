@@ -1,6 +1,6 @@
 # Kaggriculture：Rust 混合生产半 RL
 
-> **当前实验：[条件生产段学习](docs/event_policy_conditional.md)（event-policy-iteration-v10）**，入口 `event-train` / `event-agent`。先续种回款，现金、饲料和工时满足后转产，真实条件变化后修订同一批次；完整终局对照、胜负目标和独立验收保留。运行 `bash tools/run_conditional_trial.sh` 做20轮实验。
+> **当前实验：[资源与市场条件驱动的生产提案](docs/event_policy_contextual.md)（event-policy-iteration-v12）**。保留已验收底座与收获衔接，完整比较续种、换作物、小批转养和延后；只按终局胜负学习和验收。夜间命令：`bash tools/run_contextual_overnight.sh runs/event_policy_contextual_overnight 10`。这是待验证的训练实验，尚未证明长训收益。此前证据见[执行审计](docs/conditional_execution_audit.md)。
 > [v3固定窗口版](docs/plan_improvement.md)保留用于基准与检查点读取，下方v8命令为历史实验。
 
 > 旧版：[可学习市场决策](docs/mixed_v8_market.md)（v8-market-3）。模型学习商品优先顺序、按实际预算选择交易数量，并结合对手成熟时间、种养变化响应市场与资金事件；独立策略/价值网络。支持规则交易对照和两个检查点直接对战。

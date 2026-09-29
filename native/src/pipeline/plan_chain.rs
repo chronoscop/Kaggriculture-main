@@ -363,6 +363,7 @@ impl Controller {
             revision: 0,
             sites: sites.to_vec(),
             stage: super::plan_resources::Stage {
+                route_handoff: false,
                 conditional,
                 links: ids,
                 lead_steps: lead,
@@ -391,6 +392,58 @@ impl Controller {
                         p.successor_yielded = true;
                     } else {
                         p.first_harvests += 1;
+                        // Commit only after the real harvest receipt. The route
+                        // already owns its prepared successor; stale/cancelled
+                        // routes cannot prematurely change the current project.
+                        let handoff = self
+                            .agent
+                            .executor
+                            .routes
+                            .get(r.actor)
+                            .and_then(Option::as_ref)
+                            .and_then(|route| route.production_handoffs.get(&r.site));
+                        if handoff == Some(&p.link.next) && p.first_harvests >= p.link.cycles {
+                            p.armed = true;
+                            self.agent.executor.projects.insert(
+                                r.site,
+                                Project {
+                                    production: p.link.next.clone(),
+                                    requested: o.step,
+                                    confirmed: false,
+                                    failures: 0,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Resource arrival may happen AFTER a normal harvest/renewal route was
+        // assigned. At the confirmed empty boundary revise just that renewal,
+        // not the worker's other committed tasks or existing reservations.
+        if !self.hold_transitions && self.event_mode() {
+            let ledger = super::plan_resources::Schedule::build(self, o);
+            let mut work = 0.;
+            for n in &ledger.needs {
+                let p = &self.progress[n.id];
+                let routed = self.batches.iter().any(|b| {
+                    !b.cancelled && b.stage.route_handoff && b.stage.links.contains(&n.id)
+                });
+                if routed
+                    && matches!(tile(&o.farm, n.site), Cell::Empty)
+                    && p.first_harvests >= p.link.cycles
+                    && n.stocked
+                    && n.feed_stocked
+                    && o.farm.money >= n.cash_floor
+                    && o.step <= n.deadline
+                    && work + n.work <= ledger.free_work
+                {
+                    if self
+                        .agent
+                        .executor
+                        .release_harvested_renewal(n.site, &p.link.first)
+                    {
+                        work += n.work;
                     }
                 }
             }
@@ -904,10 +957,40 @@ impl Controller {
     }
     fn execute(&mut self, o: &Observation, orders: Vec<Vec<String>>) -> PlayerAction {
         self.agent.executor.service_deadlines.clear();
+        self.agent.executor.harvest_successors.clear();
+        self.agent.executor.harvest_successor_deadlines.clear();
         self.agent.executor.plan_wheat_reserve = 0;
         if self.event_mode() {
             let ledger = super::plan_resources::Schedule::build(self, o);
             self.agent.executor.plan_wheat_reserve = ledger.feed_keep;
+            let mut allocated_work = 0.;
+            for n in &ledger.needs {
+                let p = &self.progress[n.id];
+                let routed = self.batches.iter().any(|b| {
+                    !b.cancelled && b.stage.route_handoff && b.stage.links.contains(&n.id)
+                });
+                let harvestable = matches!(tile(&o.farm,n.site),Cell::Plant{crop,planted_day,yield_units,..}
+                    if *yield_units>0 && o.day()-planted_day>=rules::crop(crop).unwrap().first_yield_day);
+                if routed
+                    && p.first_harvests + 1 >= p.link.cycles
+                    && harvestable
+                    && n.stocked
+                    && n.feed_stocked
+                    && o.farm.money >= n.cash_floor
+                    && o.step <= n.deadline
+                    && allocated_work + n.work <= ledger.free_work
+                {
+                    self.agent
+                        .executor
+                        .harvest_successors
+                        .insert(n.site, n.production.clone());
+                    self.agent
+                        .executor
+                        .harvest_successor_deadlines
+                        .insert(n.site, n.deadline);
+                    allocated_work += n.work;
+                }
+            }
             for (&site, &id) in &self.active {
                 let p = &self.progress[id];
                 if !p.failed && !p.successor_yielded {

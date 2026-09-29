@@ -2,7 +2,11 @@
 //! immutable; one shared network replaces the declared event scope as a whole.
 use super::event_portfolio::{Portfolio, Runtime, SLOTS};
 use kagg_engine::json::Json;
-pub const SCHEMA: &str = "event-policy-iteration-v10";
+pub const SCHEMA: &str = "event-policy-iteration-v12";
+pub const HANDOFF_SCHEMA: &str = "event-policy-iteration-v11";
+pub const CONTEXTUAL_CONTRACT: &str = "event-resource-ranked-menu-v1";
+pub const CONDITIONAL_SCHEMA: &str = "event-policy-iteration-v10";
+pub const HANDOFF_CONTRACT: &str = "event-conditional-harvest-route-v1";
 pub const MENU_SCHEMA: &str = "event-policy-iteration-v9";
 pub const CONDITIONAL_CONTRACT: &str = "event-conditional-batch-menu-v1";
 pub const PREFIX_SCHEMA: &str = "event-policy-iteration-v8";
@@ -13,7 +17,7 @@ pub const EVIDENCE_SCHEMA: &str = "event-policy-iteration-v6";
 pub const LEGACY_SCHEMA: &str = "event-policy-iteration-v5";
 pub const CONTRACT: &str = "event-shared-policy-season-scope-v5";
 pub const BATCH_CONTRACT: &str = "event-shared-policy-batch-lineage-v8";
-pub const COLLECTION_CONTRACT: &str = "complete-conditional-menu-v2";
+pub const COLLECTION_CONTRACT: &str = "complete-resource-ranked-menu-v4";
 #[derive(Clone, Debug, PartialEq)]
 pub struct Version {
     pub revision: u64,
@@ -23,6 +27,8 @@ pub struct Version {
     pub weights: Option<Json>,
     pub batch_lifetime: bool,
     pub conditional_plans: bool,
+    pub route_handoff: bool,
+    pub contextual_menu: bool,
     pub menu_anchor: Option<Box<Version>>,
 }
 impl Version {
@@ -41,6 +47,8 @@ impl Version {
             weights: None,
             batch_lifetime: false,
             conditional_plans: false,
+            route_handoff: false,
+            contextual_menu: false,
             menu_anchor: None,
         })
     }
@@ -59,6 +67,9 @@ impl Version {
             || next.foundation != self.foundation
             || next.scope != self.scope
             || next.weights.is_none()
+            || (self.contextual_menu && !next.contextual_menu)
+            || (next.contextual_menu && (!next.route_handoff || !next.conditional_plans))
+            || (self.route_handoff && !next.route_handoff)
             || (self.conditional_plans && !next.conditional_plans)
             || (self.batch_lifetime && !next.batch_lifetime)
             || (self.menu_anchor.is_some() && self.menu_anchor != next.menu_anchor)
@@ -77,6 +88,8 @@ impl Version {
             Runtime::unified(&self.foundation, &self.scope, self.weights.as_ref(), device)?;
         runtime.batch_lifetime = self.batch_lifetime;
         runtime.conditional_plans = self.conditional_plans;
+        runtime.route_handoff = self.route_handoff;
+        runtime.contextual_menu = self.contextual_menu;
         runtime.menu_reference = self
             .menu_anchor
             .as_ref()
@@ -85,7 +98,11 @@ impl Version {
         Ok(runtime)
     }
     pub fn contract(&self) -> &'static str {
-        if self.conditional_plans {
+        if self.contextual_menu {
+            CONTEXTUAL_CONTRACT
+        } else if self.route_handoff {
+            HANDOFF_CONTRACT
+        } else if self.conditional_plans {
             CONDITIONAL_CONTRACT
         } else if self.menu_anchor.is_some() {
             if self.batch_lifetime {
@@ -123,7 +140,13 @@ impl Version {
     pub fn parse(j: &Json) -> Result<Self, String> {
         if !matches!(
             j.get("contract").str(),
-            CONTRACT | BATCH_CONTRACT | MENU_CONTRACT | MENU_BATCH_CONTRACT | CONDITIONAL_CONTRACT
+            CONTRACT
+                | BATCH_CONTRACT
+                | MENU_CONTRACT
+                | MENU_BATCH_CONTRACT
+                | CONDITIONAL_CONTRACT
+                | HANDOFF_CONTRACT
+                | CONTEXTUAL_CONTRACT
         ) {
             return Err("wrong stable event contract".into());
         }
@@ -138,7 +161,11 @@ impl Version {
         Self::initial(foundation.clone(), scope.clone())?;
         let menu_contract = matches!(
             j.get("contract").str(),
-            MENU_CONTRACT | MENU_BATCH_CONTRACT | CONDITIONAL_CONTRACT
+            MENU_CONTRACT
+                | MENU_BATCH_CONTRACT
+                | CONDITIONAL_CONTRACT
+                | HANDOFF_CONTRACT
+                | CONTEXTUAL_CONTRACT
         );
         let menu_anchor = if menu_contract {
             let a = j.get("menu_anchor");
@@ -158,7 +185,15 @@ impl Version {
         };
         let v = Self {
             menu_anchor,
-            conditional_plans: j.get("contract").str() == CONDITIONAL_CONTRACT,
+            conditional_plans: matches!(
+                j.get("contract").str(),
+                CONDITIONAL_CONTRACT | HANDOFF_CONTRACT | CONTEXTUAL_CONTRACT
+            ),
+            route_handoff: matches!(
+                j.get("contract").str(),
+                HANDOFF_CONTRACT | CONTEXTUAL_CONTRACT
+            ),
+            contextual_menu: j.get("contract").str() == CONTEXTUAL_CONTRACT,
             revision: j
                 .get("revision")
                 .str()
@@ -174,8 +209,10 @@ impl Version {
             batch_lifetime: matches!(
                 j.get("contract").str(),
                 BATCH_CONTRACT | MENU_BATCH_CONTRACT
-            ) || (j.get("contract").str() == CONDITIONAL_CONTRACT
-                && matches!(j.get("batch_lifetime"), Json::Bool(true))),
+            ) || (matches!(
+                j.get("contract").str(),
+                CONDITIONAL_CONTRACT | HANDOFF_CONTRACT | CONTEXTUAL_CONTRACT
+            ) && matches!(j.get("batch_lifetime"), Json::Bool(true))),
             weights: match j.get("weights") {
                 Json::Null => None,
                 w => Some(w.clone()),
@@ -215,16 +252,20 @@ mod tests {
     };
     #[test]
     fn complete_menu_zero_head_preserves_legacy_actions_and_frozen_anchor() {
-        zero_head(false);
-        zero_head(true);
+        zero_head(false, false, false);
+        zero_head(true, false, false);
+        zero_head(true, true, false);
+        zero_head(true, true, true);
     }
-    fn zero_head(conditional: bool) {
+    fn zero_head(conditional: bool, handoff: bool, contextual: bool) {
         tensor::worker_threads();
         let base = Version::initial(Portfolio::empty(), vec![0, 1, 2, 3]).unwrap();
         let p = Policy::event_plans(-1, 17, 0.0003).unwrap();
         let mut menu = base.propose(1, p.weights_json().unwrap()).unwrap();
         menu.menu_anchor = Some(Box::new(base.clone()));
         menu.conditional_plans = conditional;
+        menu.route_handoff = handoff;
+        menu.contextual_menu = contextual;
         base.validate_successor(&menu).unwrap();
         assert_eq!(Version::parse(&menu.json()).unwrap(), menu);
         let old = base.runtime(-1).unwrap();
@@ -239,7 +280,7 @@ mod tests {
             let y = if let Some(mut d) = b.prepare(&obs, &new).unwrap() {
                 if d.slot.is_some_and(|s| menu.scope.contains(&s)) {
                     events += 1;
-                    assert!(d.choices.len() <= 4);
+                    assert!(d.choices.len() <= if contextual { 6 } else { 4 });
                     assert_eq!(d.selected, 0);
                     let event = b.last_event.as_ref().unwrap();
                     let raw = crate::pipeline::plan_events::choices(&b.controller, &obs, event);

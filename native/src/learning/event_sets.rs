@@ -22,7 +22,7 @@ pub fn validate(p: &Pair) -> Result<(), String> {
     if e.get("candidate_set_id").str().is_empty()
         || e.get("objective").str() != MATCH_SCORE_OBJECTIVE
         || row.features.len() < 2
-        || row.features.len() > 4
+        || row.features.len() > crate::pipeline::plan_menu::MAX_CONTEXTUAL_CHOICES
         || cash.len() != row.features.len()
         || e.get("reference_index").i64() != 0
         || e.get("terminal_step").i64() != 719

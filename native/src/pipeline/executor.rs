@@ -103,6 +103,8 @@ pub struct Scheduled {
 }
 #[derive(Clone, Debug, Default)]
 pub struct Route {
+    /// Accepted route includes a harvest followed by this promised successor.
+    pub production_handoffs: BTreeMap<Pos, Production>,
     pub steps: VecDeque<Scheduled>,
     pub sites: BTreeSet<Pos>,
     pub seeds: OMap,
@@ -160,6 +162,9 @@ pub struct Stats {
 }
 #[derive(Clone, Default)]
 pub struct Executor {
+    /// Only observed, funded conditional commitments; absent for legacy policies.
+    pub harvest_successors: BTreeMap<Pos, Production>,
+    pub harvest_successor_deadlines: BTreeMap<Pos, i64>,
     pub service_deadlines: BTreeMap<Pos, i64>,
     pub plan_wheat_reserve: i64,
     pub projects: BTreeMap<Pos, Project>,
@@ -320,6 +325,37 @@ impl Executor {
             }
         }
         (sites, seeds, pickups)
+    }
+    /// Current crop was actually harvested. Release ONLY its unexecuted
+    /// renewal suffix, preserving every movement, other site and cargo action.
+    /// PASS retains timestamps, so no route is shifted or silently invalidated.
+    pub fn release_harvested_renewal(&mut self, site: Pos, previous: &Production) -> bool {
+        let owns = |r: &Route| r.sites.contains(&site);
+        if self.routes.iter().flatten().filter(|r| owns(r)).any(|r| {
+            r.production_handoffs.contains_key(&site)
+                || r.steps.iter().any(|s| {
+                    s.position == site
+                        && match s.action.op.as_str() {
+                            "PLANT" => s.action.item != previous.name(),
+                            "WATER" | "FERTILIZE" | "PASS" | "NORTH" | "SOUTH" | "EAST"
+                            | "WEST" => false,
+                            _ => true,
+                        }
+                })
+        }) {
+            return false;
+        }
+        for r in self.routes.iter_mut().flatten().filter(|r| owns(r)) {
+            for step in &mut r.steps {
+                if step.position == site
+                    && matches!(step.action.op.as_str(), "PLANT" | "WATER" | "FERTILIZE")
+                {
+                    step.action = unit("PASS", "", 0);
+                }
+            }
+            r.sites.remove(&site);
+        }
+        true
     }
     pub fn assign(&mut self, actor: usize, route: Route) {
         self.routes.resize_with(actor + 1, || None);
@@ -502,4 +538,63 @@ pub fn action_json(a: &PlayerAction) -> kagg_engine::json::Json {
             ),
         ),
     ])
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    fn renewal_route() -> Route {
+        let mut r = Route::default();
+        r.sites.extend([(1, 1), (2, 1)]);
+        for (at, position, op, item) in [
+            (100, (1, 1), "PLANT", "WHEAT"),
+            (101, (1, 1), "WATER", ""),
+            (102, (1, 1), "EAST", ""),
+            (103, (2, 1), "HARVEST", ""),
+            (104, (2, 1), "WEST", ""),
+        ] {
+            r.steps.push_back(Scheduled {
+                at,
+                position,
+                action: unit(op, item, 1),
+            });
+        }
+        r
+    }
+    #[test]
+    fn handoff_releases_only_unexecuted_renewal_preserving_route_timing() {
+        let mut e = Executor::default();
+        e.assign(0, renewal_route());
+        assert!(e.release_harvested_renewal((1, 1), &Production::Crop("WHEAT".into())));
+        let r = e.routes[0].as_ref().unwrap();
+        assert_eq!(
+            r.steps
+                .iter()
+                .map(|s| s.action.op.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PASS", "PASS", "EAST", "HARVEST", "WEST"]
+        );
+        assert_eq!(
+            r.steps.iter().map(|s| s.at).collect::<Vec<_>>(),
+            vec![100, 101, 102, 103, 104]
+        );
+        assert!(!r.sites.contains(&(1, 1)));
+        assert!(r.sites.contains(&(2, 1)));
+        assert_eq!(e.reserved(usize::MAX).1.get("WHEAT"), 0);
+    }
+    #[test]
+    fn handoff_cannot_release_unharvested_or_committed_successor() {
+        let mut e = Executor::default();
+        let mut r = renewal_route();
+        r.steps.front_mut().unwrap().action = unit("HARVEST", "", 0);
+        e.assign(0, r);
+        assert!(!e.release_harvested_renewal((1, 1), &Production::Crop("WHEAT".into())));
+        assert_eq!(e.routes[0].as_ref().unwrap().steps[0].action.op, "HARVEST");
+        let mut r = renewal_route();
+        r.production_handoffs
+            .insert((1, 1), Production::Animal("SHEEP".into()));
+        e.assign(0, r);
+        assert!(!e.release_harvested_renewal((1, 1), &Production::Crop("WHEAT".into())));
+        assert_eq!(e.routes[0].as_ref().unwrap().steps[0].action.op, "PLANT");
+    }
 }

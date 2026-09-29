@@ -14,9 +14,10 @@ mod app {
         },
         pipeline::{
             event_policy::{
-                Version, BATCH_CONTRACT, COLLECTION_CONTRACT, CONDITIONAL_CONTRACT, CONTRACT,
-                MENU_BATCH_CONTRACT, MENU_CONTRACT, MENU_SCHEMA, NORMALIZED_SCHEMA, PREFIX_SCHEMA,
-                SCHEMA,
+                Version, BATCH_CONTRACT, COLLECTION_CONTRACT, CONDITIONAL_CONTRACT,
+                CONDITIONAL_SCHEMA, CONTEXTUAL_CONTRACT, CONTRACT, HANDOFF_CONTRACT,
+                HANDOFF_SCHEMA, MENU_BATCH_CONTRACT, MENU_CONTRACT, MENU_SCHEMA, NORMALIZED_SCHEMA,
+                PREFIX_SCHEMA, SCHEMA,
             },
             event_portfolio::{Deployed, Portfolio, Runtime, SLOTS},
             executor::Observation,
@@ -63,6 +64,7 @@ mod app {
         resume: Option<String>,
         evaluate_checkpoint: Option<String>,
         diagnose_revisions: Option<String>,
+        audit_plan_cases: Option<String>,
         init: Option<String>,
         warm_start: Option<String>,
         batch_lifetime: Option<bool>,
@@ -75,6 +77,7 @@ mod app {
         alternatives: usize,
         branch_steps: usize,
         max_branches: usize,
+        max_seconds: u64,
         epochs: usize,
         batch: usize,
         eval_every: usize,
@@ -92,6 +95,7 @@ mod app {
                 resume: None,
                 evaluate_checkpoint: None,
                 diagnose_revisions: None,
+                audit_plan_cases: None,
                 init: None,
                 warm_start: None,
                 batch_lifetime: None,
@@ -102,8 +106,9 @@ mod app {
                 workers: 7,
                 points: 2,
                 alternatives: 2,
-                branch_steps: 4320,
-                max_branches: 8,
+                branch_steps: 8640,
+                max_branches: 12,
+                max_seconds: 0,
                 epochs: 8,
                 batch: 64,
                 eval_every: 5,
@@ -116,10 +121,12 @@ mod app {
             };
             let args: Vec<_> = std::env::args().skip(1).collect();
             if args.iter().any(|s| s == "--help") {
-                println!("event-train --out NEW_DIR [--init-from accepted_event.json | --base-checkpoint v3_best.json | --resume v10_latest.json] --iterations 100 --games-per-update 16 --workers 7 --device cuda|cpu --branch-points 2 --alternatives 2 --branch-steps-per-game 4320 --max-branches-per-game 8 --epochs 8 --batch-size 64 --learning-rate 0.0003 --eval-every 5 --eval-games 8 --confirm-games 16\nOne shared network, fixed accepted continuation until promotion. Four seasonal arrangement entries; legacy choices keep their single revision, new conditional choices retain ownership of that batch until conversion/expiry. Outcome-independent replay. Independent confirmation progresses at the next scheduled evaluations, preserving the exact frozen candidate. iterations are additional; --warm-start v10_latest.json preserves normalized proposal weights but resets Adam, labels and confirmation. --init-from preserves deployment (and accepted normalized weights after v8 confirmation). --followup-scope single|batch: batch requires prior v8 independent acceptance; resume cannot change scope. Two base trajectories per training condition; local and same-prefix segment arms share accepted continuation; full candidate sequence outcomes never label individual choices.");
-                println!("v10 conditional menus: 2–4 deterministic executable choices, all terminal arms compared atomically. Replay/batches use complete sets. Legacy init-from preserves accepted actions and starts a fresh menu learner. --alternatives is unused for complete menus; branch budgets still apply. Unrelated scopes remain frozen. observations.jsonl reports the latest learner against fixed opponents/seeds; independent promotion never uses this panel.");
+                println!("event-train --out NEW_DIR [--init-from accepted_event.json | --base-checkpoint v3_best.json | --resume v12_latest.json] --iterations 100 --games-per-update 16 --workers 7 --device cuda|cpu --branch-points 2 --alternatives 2 --branch-steps-per-game 8640 --max-branches-per-game 12 --epochs 8 --batch-size 64 --learning-rate 0.0003 --eval-every 5 --eval-games 8 --confirm-games 16\nOne shared network, fixed accepted continuation until promotion. Four seasonal arrangement entries; legacy choices keep their single revision, new conditional choices retain ownership of that batch until conversion/expiry. Outcome-independent replay. Independent confirmation progresses at the next scheduled evaluations, preserving the exact frozen candidate. iterations are additional; --warm-start v12_latest.json preserves normalized proposal weights but resets Adam, labels and confirmation. --init-from preserves deployment (and accepted normalized weights after v8 confirmation). --followup-scope single|batch: batch requires prior v8 independent acceptance; resume cannot change scope. Two base trajectories per training condition; local and same-prefix segment arms share accepted continuation; full candidate sequence outcomes never label individual choices.");
+                println!("v12 resource-ranked menus: 2–6 deterministic executable choices, all terminal arms compared atomically. Replay/batches use complete sets. Legacy init-from preserves accepted actions and starts a fresh menu learner. --alternatives is unused for complete menus; branch budgets still apply. Unrelated scopes remain frozen. observations.jsonl reports the latest learner against fixed opponents/seeds; independent promotion never uses this panel.");
                 println!("Read-only diagnostic: --evaluate-checkpoint v8_latest.json --out NEW_DIR --eval-games 64 --eval-seed NEW_SEED --workers 7 --device cpu. Evaluates the latest learner, ignores pending candidates, performs no training or promotion; eval-games counts both seats per opponent (64 = 32 seeds). ");
                 println!("Mechanism diagnostic: --diagnose-revisions v8_latest.json --out NEW_DIR --eval-games 8 --eval-seed SEED --workers 7 --device cpu. Compares accepted, new arrangements only, new revisions only, and both; tests changed revisions individually under accepted continuation. Maximum 16 games per opponent (8 seeds). Writes traces and comparisons only; never trains or promotes.");
+                println!("--max-seconds N: finish and checkpoint the current iteration before stopping (0 = unlimited); includes initialization time.");
+                println!("Archived execution audit: --audit-plan-cases request.json --out NEW_DIR --workers 4 --device cpu. Replays archived collection sources and checks original terminal results; optional audit_route_handoff applies only to the selected arm. Never trains or promotes.");
                 std::process::exit(0);
             }
             if args.len() % 2 != 0 {
@@ -129,10 +136,14 @@ mod app {
                 let v = &a[1];
                 let u = || v.parse::<usize>().map_err(|_| format!("invalid {}", a[0]));
                 match a[0].as_str() {
+                    "--max-seconds" => {
+                        o.max_seconds = v.parse().map_err(|_| "invalid max-seconds")?
+                    }
                     "--out" => o.out = v.into(),
                     "--resume" => o.resume = Some(v.clone()),
                     "--evaluate-checkpoint" => o.evaluate_checkpoint = Some(v.clone()),
                     "--diagnose-revisions" => o.diagnose_revisions = Some(v.clone()),
+                    "--audit-plan-cases" => o.audit_plan_cases = Some(v.clone()),
                     "--init-from" => o.init = Some(v.clone()),
                     "--warm-start" => o.warm_start = Some(v.clone()),
                     "--followup-scope" => {
@@ -193,7 +204,7 @@ mod app {
                 || o.alternatives > 2
                 || o.branch_steps < 719
                 || o.max_branches == 0
-                || o.max_branches > 8
+                || o.max_branches > 12
                 || o.batch < 2
                 || !o.lr.is_finite()
                 || o.lr <= 0.
@@ -206,13 +217,14 @@ mod app {
                     o.foundation.is_some(),
                     o.evaluate_checkpoint.is_some(),
                     o.diagnose_revisions.is_some(),
+                    o.audit_plan_cases.is_some(),
                 ]
                 .iter()
                 .filter(|x| **x)
                 .count()
                     > 1
             {
-                return Err("invalid sizes/seed partition: even games, points 1..4, alternatives 1..2, branch budget >=719, max branches 1..8, and one initialization source".into());
+                return Err("invalid sizes/seed partition: even games, points 1..4, alternatives 1..2, branch budget >=719, max branches 1..12, and one initialization source".into());
             }
             Ok(o)
         }
@@ -989,7 +1001,11 @@ mod app {
                 (
                     "continuation_contract",
                     Json::Str(
-                        if accepted.conditional_plans {
+                        if accepted.contextual_menu {
+                            CONTEXTUAL_CONTRACT
+                        } else if accepted.route_handoff {
+                            HANDOFF_CONTRACT
+                        } else if accepted.conditional_plans {
                             CONDITIONAL_CONTRACT
                         } else if accepted.menu_reference.is_some() {
                             if accepted.batch_lifetime {
@@ -1030,6 +1046,24 @@ mod app {
                 ),
                 ("all_conditional_execution", Json::Arr(executions)),
                 (
+                    "candidate_families",
+                    Json::Arr(
+                        f.choices
+                            .iter()
+                            .map(|p| {
+                                Json::Str(
+                                    route_rl_native::pipeline::plan_menu::family_name(
+                                        &f.world.own.controller,
+                                        &Observation::from_state(&f.world.game, job.seat),
+                                        p,
+                                    )
+                                    .into(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
                     "candidate_encoding",
                     Json::Str(route_rl_native::pipeline::plan_menu::ENCODING.into()),
                 ),
@@ -1052,7 +1086,11 @@ mod app {
                 (
                     "scope_contract",
                     Json::Str(
-                        if candidate.conditional_plans {
+                        if candidate.contextual_menu {
+                            CONTEXTUAL_CONTRACT
+                        } else if candidate.route_handoff {
+                            HANDOFF_CONTRACT
+                        } else if candidate.conditional_plans {
                             CONDITIONAL_CONTRACT
                         } else if candidate.batch_lifetime {
                             MENU_BATCH_CONTRACT
@@ -1777,6 +1815,8 @@ mod app {
                             | MENU_CONTRACT
                             | MENU_BATCH_CONTRACT
                             | CONDITIONAL_CONTRACT
+                            | HANDOFF_CONTRACT
+                            | CONTEXTUAL_CONTRACT
                     )
                     || p.evidence.get("source_snapshot").str().is_empty()
                     || p.evidence.get("learner_input_encoding").str()
@@ -1825,6 +1865,70 @@ mod app {
             );
         }
         Ok(result)
+    }
+    fn menu_opportunities(gs: &[Game]) -> Json {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut families = std::collections::BTreeMap::<String, [usize; 4]>::new();
+        let mut sets = 0;
+        let mut improving = 0;
+        let score = |v: &Json| {
+            if v.arr()[0].f64() > v.arr()[1].f64() {
+                1.
+            } else if v.arr()[0].f64() == v.arr()[1].f64() {
+                0.5
+            } else {
+                0.
+            }
+        };
+        for p in gs.iter().flat_map(|g| &g.pairs) {
+            let e = &p.evidence;
+            let id = e.get("candidate_set_id").str();
+            if id.is_empty() || !seen.insert(id.to_string()) {
+                continue;
+            }
+            let cash = e.get("all_terminal_cash").arr();
+            if cash.is_empty() {
+                continue;
+            }
+            sets += 1;
+            let base = score(&cash[0]);
+            improving += usize::from(cash.iter().skip(1).any(|x| score(x) > base));
+            for (kind, cash) in e.get("candidate_families").arr().iter().zip(cash).skip(1) {
+                let v = families.entry(kind.str().to_string()).or_default();
+                v[0] += 1;
+                let d = score(cash) - base;
+                v[if d > 0. {
+                    1
+                } else if d < 0. {
+                    2
+                } else {
+                    3
+                }] += 1;
+            }
+        }
+        Json::Obj(vec![
+            ("sets".into(), n(sets as f64)),
+            ("sets_with_better_choice".into(), n(improving as f64)),
+            (
+                "families".into(),
+                Json::Obj(
+                    families
+                        .into_iter()
+                        .map(|(k, v)| {
+                            (
+                                k,
+                                Json::Obj(vec![
+                                    ("tested".into(), n(v[0] as f64)),
+                                    ("better".into(), n(v[1] as f64)),
+                                    ("worse".into(), n(v[2] as f64)),
+                                    ("tied".into(), n(v[3] as f64)),
+                                ]),
+                            )
+                        })
+                        .collect(),
+                ),
+            ),
+        ])
     }
     /// Unique measured states, evaluated AFTER the update with the full legal
     /// candidate list. A new untested argmax is UNKNOWN, never counted a success.
@@ -2076,6 +2180,8 @@ mod app {
             let mut candidate = self.accepted.propose(iteration, weights)?;
             candidate.batch_lifetime = self.target_batch_lifetime;
             candidate.conditional_plans = self.menu_learning;
+            candidate.route_handoff = self.menu_learning;
+            candidate.contextual_menu = self.menu_learning;
             if self.menu_learning && candidate.menu_anchor.is_none() {
                 candidate.menu_anchor = Some(Box::new(self.accepted.clone()));
             }
@@ -2146,7 +2252,7 @@ mod app {
                 || j.get("policy_contract").str() != CONTRACT
                 || j.get("objective").str() != plan_compare::MATCH_SCORE_OBJECTIVE
             {
-                return Err("--resume requires full event-policy-iteration-v10 checkpoint; use --init-from to preserve accepted deployment and invalidate old labels/Adam".into());
+                return Err("--resume requires full event-policy-iteration-v12 checkpoint; use --init-from to preserve accepted deployment and invalidate old labels/Adam".into());
             }
             if matches!(j.get("menu_learning"), Json::Bool(true))
                 && j.get("candidate_encoding").str()
@@ -2476,6 +2582,8 @@ mod app {
                 | NORMALIZED_SCHEMA
                 | PREFIX_SCHEMA
                 | MENU_SCHEMA
+                | CONDITIONAL_SCHEMA
+                | HANDOFF_SCHEMA
                 | SCHEMA
         ) || j.get("policy_contract").str() != CONTRACT
         {
@@ -2583,6 +2691,314 @@ mod app {
             },
             forks,
         ))
+    }
+    /// Replay archived training comparisons with their exact collection policies.
+    /// Read-only: no new labels, updates, or promotion. Outcomes must match the archive.
+    fn audit_plan_cases(o: &Options, path: &str) -> Result<(), String> {
+        use route_rl_native::pipeline::{
+            executor::{action_json, pos, tile},
+            plan_resources::Schedule,
+        };
+        let request = read(path)?;
+        let run = PathBuf::from(request.get("run").str());
+        let cases = Arc::new(request.get("cases").arr().to_vec());
+        if cases.is_empty() || cases.len() > 16 {
+            return Err("audit requires 1..16 archived cases".into());
+        }
+        if o.out.exists()
+            && std::fs::read_dir(&o.out)
+                .map_err(|e| e.to_string())?
+                .next()
+                .is_some()
+        {
+            return Err("audit output must be empty".into());
+        }
+        std::fs::create_dir_all(&o.out).map_err(|e| e.to_string())?;
+        write(&o.out.join("request.json"), &request)?;
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let mut threads = vec![];
+        for _ in 0..o.workers.min(cases.len()).min(4) {
+            let cases = cases.clone();
+            let cursor = cursor.clone();
+            let run = run.clone();
+            let out = o.out.clone();
+            threads.push(std::thread::spawn(move || -> Result<Vec<Json>, String> {
+                tensor::worker_threads();
+                let mut results = vec![];
+                loop {
+                    let ix = cursor.fetch_add(1, Ordering::Relaxed);
+                    if ix >= cases.len() {
+                        break;
+                    }
+                    let r = &cases[ix];
+                    let source = read(
+                        run.join("collection_sources")
+                            .join(format!("{}.json", r.get("source_snapshot").str()))
+                            .to_str()
+                            .ok_or("invalid path")?,
+                    )?;
+                    if !matches!(
+                        source.get("collection_contract").str(),
+                        COLLECTION_CONTRACT
+                            | "complete-conditional-menu-v2"
+                            | "complete-conditional-harvest-menu-v3"
+                    ) {
+                        return Err("source execution contract mismatch".into());
+                    }
+                    let av = Version::parse(source.get("local_continuation_policy"))?;
+                    let cv = Version::parse(source.get("candidate_prefix_policy"))?;
+                    let accepted = av.runtime(-1)?;
+                    let candidate = cv.runtime(-1)?;
+                    let opponents = vec![
+                        Version::parse(source.get("accepted_opponent"))?.runtime(-1)?,
+                        Version::parse(source.get("previous_opponent"))?.runtime(-1)?,
+                    ];
+                    let config = Config::parse(source.get("config"))?;
+                    let mut learner = Policy::event_plans(-1, 0, 0.0003)?;
+                    learner.load_weights(cv.weights.as_ref().ok_or("no candidate weights")?)?;
+                    let job = Job {
+                        seed: r.get("seed").i64(),
+                        seat: r.get("seat").i64() as usize,
+                        opponent: r.get("opponent").i64() as usize,
+                        rng: 0,
+                        slots: vec![r.get("slot_id").i64() as usize],
+                    };
+                    let use_candidate = r.get("source").str() == "candidate_prefix";
+                    let source_name = format!(
+                        "{}:{}",
+                        r.get("source_snapshot").str(),
+                        if use_candidate {
+                            "candidate"
+                        } else {
+                            "accepted"
+                        }
+                    );
+                    let (_, forks) = menu_trajectory(
+                        &job,
+                        &accepted,
+                        &candidate,
+                        &learner,
+                        &opponents,
+                        &config,
+                        &av.scope,
+                        &source_name,
+                        use_candidate,
+                    )?;
+                    let f = forks
+                        .into_iter()
+                        .find(|f| f.prefix == r.get("candidate_set_id").str())
+                        .ok_or("archived fork not found")?;
+                    let archived = r.get("candidate_plans").arr();
+                    let menu_matches = archived.len() == f.choices.len()
+                        && f.choices.iter().zip(archived).all(|(p, expected)| {
+                            let actual = p.json();
+                            [
+                                "keep",
+                                "conditional",
+                                "sites",
+                                "next",
+                                "cycles",
+                                "lead_steps",
+                                "cash_floor",
+                            ]
+                            .iter()
+                            .all(|k| actual.get(k) == expected.get(k))
+                                && (matches!(expected.get("route_handoff"), Json::Null)
+                                    && !p.route_handoff
+                                    || actual.get("route_handoff") == expected.get("route_handoff"))
+                        });
+                    if f.row.json() != *r.get("full_row") || !menu_matches {
+                        return Err(format!("case {ix}: archived state/menu not reproduced"));
+                    }
+                    let alt = r.get("audit_arm").i64() as usize;
+                    if alt == 0 || alt >= f.choices.len() {
+                        return Err("bad audit arm".into());
+                    }
+                    let mut reports = vec![];
+                    for arm in [0, alt] {
+                        let mut w = f.world.clone();
+                        let sites = f.choices[alt].sites.clone();
+                        let first_id = w.own.controller.progress.len();
+                        let trace = out.join(format!("case_{ix:02}_arm_{arm}.jsonl"));
+                        let obs = Observation::from_state(&w.game, job.seat);
+                        let mut choice = f.choices[arm].clone();
+                        let intervention =
+                            arm == alt && matches!(r.get("audit_route_handoff"), Json::Bool(true));
+                        if intervention {
+                            choice.route_handoff = true;
+                        }
+                        let executed_choice = choice.json();
+                        let action = w.own.execute_choice(&obs, choice, &accepted)?;
+                        append(
+                            &trace,
+                            &Json::Obj(vec![
+                                ("step".into(), n(obs.step as f64)),
+                                ("archived_choice".into(), f.choices[arm].json()),
+                                ("choice".into(), executed_choice),
+                                ("action".into(), action_json(&action)),
+                            ]),
+                        )?;
+                        w.advance(&job, action, &opponents)?;
+                        while w.game.step < 719 {
+                            let obs = Observation::from_state(&w.game, job.seat);
+                            let d = w.own.prepare(&obs, &accepted)?;
+                            let c = &w.own.controller;
+                            let ledger = Schedule::build(c, &obs);
+                            let reserved = c.agent.executor.reserved(usize::MAX).0;
+                            let site_rows = sites
+                                .iter()
+                                .map(|site| {
+                                    let id = c.pending_id(*site);
+                                    let need =
+                                        id.and_then(|id| ledger.needs.iter().find(|n| n.id == id));
+                                    let progress =
+                                        id.map(|id| c.progress[id].json()).unwrap_or(Json::Null);
+                                    Json::Obj(vec![
+                                        (
+                                            "site".into(),
+                                            Json::Arr(vec![n(site.0 as f64), n(site.1 as f64)]),
+                                        ),
+                                        (
+                                            "tile".into(),
+                                            Json::Str(format!("{:?}", tile(&obs.farm, *site))),
+                                        ),
+                                        (
+                                            "route_reserved".into(),
+                                            Json::Bool(reserved.contains(site)),
+                                        ),
+                                        (
+                                            "project".into(),
+                                            Json::Str(
+                                                c.agent
+                                                    .executor
+                                                    .projects
+                                                    .get(site)
+                                                    .map(|p| format!("{:?}", p))
+                                                    .unwrap_or_default(),
+                                            ),
+                                        ),
+                                        ("progress".into(), progress),
+                                        (
+                                            "need".into(),
+                                            need.map(|need| {
+                                                Json::Obj(vec![
+                                                    ("stocked".into(), Json::Bool(need.stocked)),
+                                                    (
+                                                        "feed_stocked".into(),
+                                                        Json::Bool(need.feed_stocked),
+                                                    ),
+                                                    (
+                                                        "cash_ok".into(),
+                                                        Json::Bool(
+                                                            obs.farm.money >= need.cash_floor,
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "work_ok".into(),
+                                                        Json::Bool(need.work <= ledger.free_work),
+                                                    ),
+                                                    ("ready".into(), n(need.ready as f64)),
+                                                    ("deadline".into(), n(need.deadline as f64)),
+                                                    ("work".into(), n(need.work)),
+                                                    ("cost".into(), n(need.cost)),
+                                                ])
+                                            })
+                                            .unwrap_or(Json::Null),
+                                        ),
+                                    ])
+                                })
+                                .collect();
+                            let before = Json::Obj(vec![
+                                ("step".into(), n(obs.step as f64)),
+                                ("cash".into(), n(obs.farm.money)),
+                                ("free_work".into(), n(ledger.free_work)),
+                                ("work_due".into(), n(ledger.work_due)),
+                                ("material_cash".into(), n(ledger.material_cash)),
+                                ("cash_floor".into(), n(ledger.cash_floor)),
+                                ("shed".into(), Json::Str(format!("{:?}", obs.private.shed))),
+                                (
+                                    "seeds".into(),
+                                    Json::Str(format!("{:?}", obs.private.seeds)),
+                                ),
+                                ("workers".into(), n((obs.farm.hands.len() + 1) as f64)),
+                                (
+                                    "positions".into(),
+                                    Json::Arr(
+                                        (0..=obs.farm.hands.len())
+                                            .map(|i| Json::Str(format!("{:?}", pos(&obs.farm, i))))
+                                            .collect(),
+                                    ),
+                                ),
+                                ("sites".into(), Json::Arr(site_rows)),
+                            ]);
+                            let action = match d {
+                                Some(mut d) => w.own.execute_choice(
+                                    &obs,
+                                    d.choices.swap_remove(d.selected),
+                                    &accepted,
+                                )?,
+                                None => w.own.continue_action(&obs, &accepted)?,
+                            };
+                            let mut row = before;
+                            row.set_path("action", action_json(&action));
+                            append(&trace, &row)?;
+                            w.advance(&job, action, &opponents)?;
+                        }
+                        w.own
+                            .controller
+                            .observe(&Observation::from_state(&w.game, job.seat));
+                        let cash = Json::Arr(w.cash(job.seat).map(n).to_vec());
+                        if !intervention && cash != r.get("all_terminal_cash").arr()[arm] {
+                            return Err(format!(
+                                "case {ix} arm {arm} terminal mismatch {}",
+                                cash.dump()
+                            ));
+                        }
+                        let mut report = w.result(&job);
+                        report.set_path("arm", n(arm as f64));
+                        report.set_path("intervention", Json::Bool(intervention));
+                        report.set_path(
+                            "audited_new_links",
+                            Json::Arr(
+                                w.own
+                                    .controller
+                                    .progress
+                                    .iter()
+                                    .skip(first_id)
+                                    .map(|p| p.json())
+                                    .collect(),
+                            ),
+                        );
+                        reports.push(report);
+                    }
+                    let result = Json::Obj(vec![
+                        ("case".into(), n(ix as f64)),
+                        ("set_id".into(), r.get("candidate_set_id").clone()),
+                        ("category".into(), r.get("audit_category").clone()),
+                        ("reference_verified".into(), Json::Bool(true)),
+                        (
+                            "archived_both_verified".into(),
+                            Json::Bool(!matches!(r.get("audit_route_handoff"), Json::Bool(true))),
+                        ),
+                        ("reports".into(), Json::Arr(reports)),
+                    ]);
+                    write(&out.join(format!("case_{ix:02}.json")), &result)?;
+                    eprintln!(
+                        "audit case {ix}: archived reference verified; intervention={}",
+                        matches!(r.get("audit_route_handoff"), Json::Bool(true))
+                    );
+                    results.push(result);
+                }
+                Ok(results)
+            }));
+        }
+        let mut results = vec![];
+        for t in threads {
+            results.extend(t.join().map_err(|_| "audit worker panic")??);
+        }
+        results.sort_by_key(|r| r.get("case").i64());
+        write(&o.out.join("summary.json"), &Json::Arr(results))?;
+        Ok(())
     }
     /// Bounded read-only intervention study; never updates weights or deployment.
     fn diagnose_menu(o: &Options, path: &str, s: &State, p: &Policy) -> Result<(), String> {
@@ -3065,8 +3481,12 @@ mod app {
     }
     pub fn run() -> Result<(), String> {
         let o = Options::parse()?;
+        let run_started = Instant::now();
         tensor::threads(1);
         tensor::worker_threads();
+        if let Some(path) = &o.audit_plan_cases {
+            return audit_plan_cases(&o, path);
+        }
         if let Some(path) = &o.diagnose_revisions {
             return diagnose_revisions(&o, path);
         }
@@ -3101,9 +3521,9 @@ mod app {
             imported = Some(import_reference(&j)?);
             if imported
                 .as_ref()
-                .is_some_and(|(v, _)| v.menu_anchor.is_some() && !v.conditional_plans)
+                .is_some_and(|(v, _)| v.menu_anchor.is_some() && !v.contextual_menu)
             {
-                return Err("v9 accepted menu weights retain their old contract; initialize this experiment from a legacy accepted checkpoint, or use the original binary to deploy v9".into());
+                return Err("old accepted menu policies retain their original candidates; initialize v12 from a legacy accepted foundation or a v12 checkpoint. Older menu checkpoints remain supported for deployment".into());
             }
             expansion_authorized = j.get("schema").str() == SCHEMA
                 && matches!(j.get("scope_confirmed"), Json::Bool(true));
@@ -3113,7 +3533,7 @@ mod app {
                     || !matches!(j.get("menu_learning"), Json::Bool(true))
                 {
                     return Err(
-                        "warm-start requires v10 conditional menu weights; use init-from for older deployments"
+                        "warm-start requires v12 resource-ranked menu weights; use init-from for older deployments"
                             .into(),
                     );
                 }
@@ -3215,8 +3635,9 @@ mod app {
                     "learning_unit".into(),
                     Json::Str("complete_candidate_set".into()),
                 ),
-                ("max_menu_choices".into(), n(4.)),
+                ("max_menu_choices".into(), n(6.)),
                 ("iterations_additional".into(), n(o.iterations as f64)),
+                ("max_seconds".into(), n(o.max_seconds as f64)),
                 ("base_games_per_update".into(), n(o.games as f64)),
                 ("candidate_games_per_update".into(), n(o.games as f64)),
                 (
@@ -3303,8 +3724,13 @@ mod app {
                 ("deployed_vs_rule".into(), s.monitor.clone()),
             ]),
         )?;
-        println!("event-policy-iteration-v10 accepted_revision={} fixed_continuation=true shared_network=true scope={:?} budget_per_game={}steps/{}branches",s.accepted.revision,s.accepted.scope,o.branch_steps,o.max_branches);
+        println!("event-policy-iteration-v12 accepted_revision={} fixed_continuation=true shared_network=true scope={:?} budget_per_game={}steps/{}branches",s.accepted.revision,s.accepted.scope,o.branch_steps,o.max_branches);
         for _ in 0..o.iterations {
+            if o.max_seconds > 0 && run_started.elapsed().as_secs() >= o.max_seconds {
+                write(&o.out.join("latest.json"), &s.checkpoint(&p)?)?;
+                println!("time budget reached; saved iteration {}", s.iteration);
+                break;
+            }
             let started = Instant::now();
             let iteration = s.iteration + 1;
             if s.next_seed + o.games as u64 / 2 >= 1_000_000_000 {
@@ -3408,6 +3834,7 @@ mod app {
                 ),
                 ("comparison_pairs", n(pairs.len() as f64)),
                 ("candidate_coverage", candidate_coverage(&gs)),
+                ("menu_opportunities", menu_opportunities(&gs)),
                 (
                     "candidate_prefix_pairs",
                     n(pairs
@@ -3508,6 +3935,23 @@ mod app {
             }
             write(&o.out.join("latest.json"), &s.checkpoint(&p)?)?;
         }
+        write(
+            &o.out.join("finished.json"),
+            &Json::Obj(vec![
+                ("iteration".into(), n(s.iteration as f64)),
+                ("accepted_revision".into(), n(s.accepted.revision as f64)),
+                (
+                    "elapsed_seconds".into(),
+                    n(run_started.elapsed().as_secs_f64()),
+                ),
+                (
+                    "time_budget_reached".into(),
+                    Json::Bool(
+                        o.max_seconds > 0 && run_started.elapsed().as_secs() >= o.max_seconds,
+                    ),
+                ),
+            ]),
+        )?;
         Ok(())
     }
     #[cfg(test)]
@@ -3554,6 +3998,7 @@ mod app {
                     floor: 0.,
                     keep: i == 0,
                     conditional: false,
+                    route_handoff: false,
                     features: vec![i as f32; 32],
                 })
                 .collect();
@@ -3631,7 +4076,7 @@ mod app {
                     e.get("all_conditional_execution").arr().len(),
                     e.get("candidate_plans").arr().len()
                 );
-                assert_eq!(e.get("scope_contract").str(), CONDITIONAL_CONTRACT);
+                assert_eq!(e.get("scope_contract").str(), CONTEXTUAL_CONTRACT);
                 assert!(e.get("production_candidate_count").i64() > 0);
             }
             let metrics = route_rl_native::learning::event_sets::metrics(&p, &g.pairs).unwrap();
