@@ -174,6 +174,8 @@ impl Portfolio {
     }
 }
 pub struct Runtime {
+    pub menu_reference: Option<Box<Runtime>>,
+    pub batch_lifetime: bool,
     pub foundation: legacy::Runtime,
     patches: legacy::Runtime,
     followups: legacy::Runtime,
@@ -182,6 +184,36 @@ pub struct Runtime {
     unified: Option<(Vec<usize>, Option<Policy>)>,
 }
 impl Runtime {
+    fn event_choices(
+        &self,
+        c: &Controller,
+        o: &Observation,
+        e: &plan_events::Event,
+        slot: usize,
+        followup: bool,
+    ) -> Result<(Vec<Choice>, Sample), String> {
+        let raw = plan_events::choices(c, o, e);
+        let mut row = plan_events::sample(c, o, e, &raw);
+        row.context[295] = f32::from(followup);
+        if let Some(anchor) = &self.menu_reference {
+            if self
+                .unified
+                .as_ref()
+                .is_some_and(|(scope, _)| scope.contains(&slot))
+            {
+                let index = if followup {
+                    anchor.select_followup(slot, &row)?
+                } else {
+                    anchor.select(Some(slot), &row)?
+                };
+                let choices = super::plan_menu::build(c, o, e, &raw, index)?;
+                row.features = choices.iter().map(|v| v.features.clone()).collect();
+                super::plan_menu::annotate_context(&mut row, o);
+                return Ok((choices, row));
+            }
+        }
+        Ok((raw, row))
+    }
     pub fn select(&self, slot: Option<usize>, row: &Sample) -> Result<usize, String> {
         if let Some((scope, Some(model))) = &self.unified {
             if slot.is_some_and(|s| scope.contains(&s)) {
@@ -223,6 +255,8 @@ impl Runtime {
     pub fn load(p: &Portfolio, device: i32) -> Result<Self, String> {
         let followup_portfolio = p.followups();
         Ok(Self {
+            menu_reference: None,
+            batch_lifetime: false,
             foundation: legacy::Runtime::load(&p.foundation, device)?,
             patches: legacy::Runtime::load(&p.patches(), device)?,
             followups: legacy::Runtime::load(&followup_portfolio, device)?,
@@ -257,6 +291,7 @@ impl Runtime {
 #[derive(Clone, Debug)]
 struct FollowupToken {
     batch: usize,
+    lifetime: bool,
     revision: u64,
     not_before: i64,
 }
@@ -266,7 +301,7 @@ pub struct Deployed {
     pub tracker: Tracker,
     foundation_cursor: legacy::Cursor,
     pub last_event: Option<plan_events::Event>,
-    followups: BTreeMap<usize, FollowupToken>,
+    followups: BTreeMap<(usize, usize), FollowupToken>,
     last_slot: Option<usize>,
     last_followup: bool,
 }
@@ -291,12 +326,16 @@ impl Deployed {
         }
     }
     pub fn arm_followup(&mut self, slot: usize, batch: usize, step: i64) {
+        self.arm_owned_followup(slot, batch, step, false);
+    }
+    fn arm_owned_followup(&mut self, slot: usize, batch: usize, step: i64, lifetime: bool) {
         if slot < SLOTS {
             if let Some(b) = self.controller.batches.get(batch).filter(|b| !b.cancelled) {
                 self.followups.insert(
-                    slot,
+                    (slot, batch),
                     FollowupToken {
                         batch,
+                        lifetime,
                         revision: b.revision,
                         not_before: step,
                     },
@@ -305,7 +344,7 @@ impl Deployed {
         }
     }
     pub fn cancel_followup(&mut self, slot: usize) {
-        self.followups.remove(&slot);
+        self.followups.retain(|(owner, _), _| *owner != slot);
     }
     pub fn prepare(&mut self, o: &Observation, p: &Runtime) -> Result<Option<Decision>, String> {
         self.last_slot = None;
@@ -321,14 +360,21 @@ impl Deployed {
         }
         self.tracker.observe(&self.controller, o);
         self.followups.retain(|_, token| {
-            self.controller
-                .batches
-                .get(token.batch)
-                .is_some_and(|b| !b.cancelled && b.revision == token.revision)
+            self.controller.batches.get(token.batch).is_some_and(|b| {
+                !b.cancelled
+                    && b.revision == token.revision
+                    && (!(p.batch_lifetime || token.lifetime)
+                        || b.stage.links.iter().any(|id| {
+                            let progress = &self.controller.progress[*id];
+                            self.controller.is_active(*id)
+                                && !progress.failed
+                                && !progress.successor_started
+                        }))
+            })
         });
         // A later real event for the same batch is handled before ordinary
         // scopes, so collection and deployment consume the identical event.
-        for (&slot, token) in &self.followups {
+        for (&(slot, batch), token) in &self.followups {
             if !p.has_followup(slot) {
                 continue;
             }
@@ -338,18 +384,16 @@ impl Deployed {
             else {
                 continue;
             };
-            let choices = plan_events::choices(&self.controller, o, &event);
+            let (choices, row) = p.event_choices(&self.controller, o, &event, slot, true)?;
             if choices.len() < 2 {
                 self.tracker.defer(event);
                 continue;
             }
-            let mut row = plan_events::sample(&self.controller, o, &event, &choices);
-            row.context[295] = 1.;
             let selected = p.select_followup(slot, &row)?;
             self.last_event = Some(event);
             self.last_slot = Some(slot);
             self.last_followup = true;
-            self.followups.remove(&slot);
+            self.followups.remove(&(slot, batch));
             return Ok(Some(Decision {
                 slot: Some(slot),
                 followup: true,
@@ -361,7 +405,7 @@ impl Deployed {
         let protected_batches: Vec<_> = self
             .followups
             .iter()
-            .filter(|(slot, _)| p.has_followup(**slot))
+            .filter(|((slot, _), _)| p.has_followup(*slot))
             .map(|(_, token)| token.batch)
             .collect();
         for _ in 0..8 {
@@ -371,12 +415,11 @@ impl Deployed {
             else {
                 break;
             };
-            let choices = plan_events::choices(&self.controller, o, &event);
+            let (choices, row) = p.event_choices(&self.controller, o, &event, slot, false)?;
             if choices.len() < 2 {
                 self.tracker.defer(event);
                 continue;
             }
-            let row = plan_events::sample(&self.controller, o, &event, &choices);
             let selected = p.select(Some(slot), &row)?;
             self.last_event = Some(event);
             self.last_slot = Some(slot);
@@ -402,13 +445,25 @@ impl Deployed {
             self.tracker.refresh_after_edit(&self.controller, o);
         }
         if let Some(slot) = self.last_slot.take() {
-            if !self.last_followup
+            if self.last_followup && p.batch_lifetime && p.has_followup(slot) {
+                // A partial edit splits ownership: retain the untouched suffix
+                // and its replacement, never acquiring an unrelated batch.
+                if let Some(batch) = self.last_event.as_ref().and_then(|e| e.batch) {
+                    self.arm_owned_followup(slot, batch, o.step, p.batch_lifetime);
+                }
+                if !choice.keep
+                    && choice.next.is_some()
+                    && self.controller.batches.len() > previous_batches
+                {
+                    self.arm_owned_followup(slot, previous_batches, o.step, p.batch_lifetime);
+                }
+            } else if !self.last_followup
                 && p.has_followup(slot)
                 && choice.next.is_some()
                 && !choice.keep
                 && self.controller.batches.len() > previous_batches
             {
-                self.arm_followup(slot, previous_batches, o.step);
+                self.arm_owned_followup(slot, previous_batches, o.step, p.batch_lifetime);
             }
         }
         self.continue_action(o, p)
@@ -626,6 +681,81 @@ mod tests {
         assert!(runtime.override_followup(SLOTS, &follower).is_err());
     }
     #[test]
+    fn batch_responsibility_rearms_keep_and_tracks_partial_suffixes() {
+        use super::super::executor::Production;
+        tensor::worker_threads();
+        let mut runtime = Runtime::unified(&Portfolio::empty(), &[0, 1, 2, 3], None, -1).unwrap();
+        runtime.batch_lifetime = true;
+        let (mut s, mut c) = super::super::plan_resources::tests::fixture(73);
+        s.farms[0].money = 0.;
+        let obs = Observation::from_state(&s, 0);
+        let batch = c
+            .revise_batch(
+                &obs,
+                &[(2, 4), (3, 4)],
+                Some(Production::Crop("CARROT".into())),
+                1,
+                24,
+                180.,
+            )
+            .unwrap();
+        let mut a = Deployed::new(Config::default());
+        a.controller = c;
+        a.tracker.observe(&a.controller, &obs);
+        a.arm_followup(0, batch, obs.step);
+        s.step = 74;
+        s.farms[0].money = 2000.;
+        let obs = Observation::from_state(&s, 0);
+        let first = a.prepare(&obs, &runtime).unwrap().unwrap();
+        assert!(first.followup);
+        let mut kept = a.clone();
+        kept.execute_choice(&obs, first.choices[0].clone(), &runtime)
+            .unwrap();
+        assert_eq!(kept.followups.len(), 1);
+        assert_eq!(kept.followups[&(0, batch)].not_before, 74);
+        assert!(kept
+            .prepare(&obs, &runtime)
+            .unwrap()
+            .is_none_or(|d| !d.followup));
+        let choice = first
+            .choices
+            .iter()
+            .find(|p| p.sites.len() == 1 && p.next.as_ref().is_some_and(|p| p.name() == "WHEAT"))
+            .unwrap()
+            .clone();
+        a.execute_choice(&obs, choice, &runtime).unwrap();
+        assert_eq!(a.followups.len(), 2);
+        assert!(a.followups.contains_key(&(0, batch)));
+        assert!(a.followups.contains_key(&(0, batch + 1)));
+        assert_eq!(a.controller.batches[batch].sites.len(), 1);
+        assert_eq!(a.controller.batches[batch + 1].sites.len(), 1);
+        a.controller.agent.executor.routes.clear();
+        s.step = 75;
+        s.market.prices.add("CARROT", 100);
+        let next = Observation::from_state(&s, 0);
+        let d = a.prepare(&next, &runtime).unwrap().unwrap();
+        assert!(d.followup);
+        assert_eq!(d.slot, Some(0));
+        assert_eq!(a.last_event.as_ref().unwrap().batch, Some(batch));
+        let cancel = d
+            .choices
+            .iter()
+            .find(|p| !p.keep && p.next.is_none())
+            .unwrap()
+            .clone();
+        a.execute_choice(&next, cancel, &runtime).unwrap();
+        assert!(!a.followups.contains_key(&(0, batch)));
+        assert!(a.followups.contains_key(&(0, batch + 1)));
+        for id in a.controller.batches[batch + 1].stage.links.clone() {
+            a.controller.progress[id].successor_started = true;
+        }
+        a.controller.agent.executor.routes.clear();
+        s.step = 76;
+        a.prepare(&Observation::from_state(&s, 0), &runtime)
+            .unwrap();
+        assert!(a.followups.is_empty());
+    }
+    #[test]
     fn primary_edit_arms_one_batch_and_keep_does_not() {
         tensor::worker_threads();
         let p = Portfolio::empty()
@@ -650,8 +780,8 @@ mod tests {
             .unwrap();
         a.execute_choice(&o, edit, &runtime).unwrap();
         assert_eq!(a.followups.len(), 1);
-        assert_eq!(a.followups[&0].batch, 0);
-        assert_eq!(a.followups[&0].not_before, o.step);
+        assert_eq!(a.followups[&(0, 0)].batch, 0);
+        assert_eq!(a.followups[&(0, 0)].not_before, o.step);
         a.cancel_followup(0);
         assert!(a.followups.is_empty());
     }
@@ -662,8 +792,11 @@ mod tests {
         let p = Portfolio::empty()
             .propose_paired(0, 1, weights(40), weights(41))
             .unwrap();
-        let runtime = Runtime::load(&p, -1).unwrap();
-        for ordinary_claimed in [false, true] {
+        for (ordinary_claimed, lifetime) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut runtime = Runtime::load(&p, -1).unwrap();
+            runtime.batch_lifetime = lifetime;
             let (mut s, mut c) = super::super::plan_resources::tests::fixture(72);
             s.farms[0].money = 0.;
             let o = Observation::from_state(&s, 0);
@@ -791,8 +924,9 @@ mod tests {
         let package = Portfolio::empty()
             .propose_paired(0, 1, weights(51), weights(52))
             .unwrap();
-        let runtime = Runtime::load(&package, -1).unwrap();
-        for funded in [true, false] {
+        for (funded, lifetime) in [(true, false), (false, false), (true, true), (false, true)] {
+            let mut runtime = Runtime::load(&package, -1).unwrap();
+            runtime.batch_lifetime = lifetime;
             let (mut state, mut controller) = super::super::plan_resources::tests::fixture(70);
             let before = Observation::from_state(&state, 0);
             let batch = controller

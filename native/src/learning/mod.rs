@@ -7,3 +7,4 @@ pub mod plan_update;
 
 pub mod plan_compare;
 pub mod score_confirmation;
+pub mod event_sets;

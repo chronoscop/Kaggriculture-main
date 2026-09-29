@@ -40,3 +40,6 @@ pub mod plan_events;
 pub mod plan_resources;
 #[cfg(feature = "train")]
 pub mod event_policy;
+
+#[cfg(feature = "train")]
+pub mod plan_menu;

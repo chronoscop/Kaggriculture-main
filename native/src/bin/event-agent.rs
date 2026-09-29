@@ -11,7 +11,8 @@ fn load_deployment(
     String,
 > {
     use route_rl_native::pipeline::event_policy::{
-        CONTRACT, EVIDENCE_SCHEMA, LEGACY_SCHEMA, SCHEMA,
+        BATCH_CONTRACT, CONTRACT, EVIDENCE_SCHEMA, LEGACY_SCHEMA, MENU_BATCH_CONTRACT,
+        MENU_CONTRACT, NORMALIZED_SCHEMA, PREFIX_SCHEMA, SCHEMA,
     };
     use route_rl_native::pipeline::{
         event_portfolio::{Portfolio, Runtime},
@@ -19,13 +20,29 @@ fn load_deployment(
     };
     if matches!(
         checkpoint.get("schema").str(),
-        SCHEMA | EVIDENCE_SCHEMA | LEGACY_SCHEMA
+        SCHEMA | PREFIX_SCHEMA | NORMALIZED_SCHEMA | EVIDENCE_SCHEMA | LEGACY_SCHEMA
     ) {
         let contract = CONTRACT;
         if checkpoint.get("policy_contract").str() != contract
-            || checkpoint.get("deployment").get("contract").str() != contract
+            || !matches!(
+                checkpoint.get("deployment").get("contract").str(),
+                CONTRACT | BATCH_CONTRACT | MENU_CONTRACT | MENU_BATCH_CONTRACT
+            )
         {
             return Err("wrong shared event execution contract".into());
+        }
+        if !matches!(checkpoint.get("schema").str(), SCHEMA | PREFIX_SCHEMA)
+            && checkpoint.get("deployment").get("contract").str() != CONTRACT
+        {
+            return Err("legacy wrapper cannot reinterpret batch responsibility".into());
+        }
+        if checkpoint.get("schema").str() != SCHEMA
+            && matches!(
+                checkpoint.get("deployment").get("contract").str(),
+                MENU_CONTRACT | MENU_BATCH_CONTRACT
+            )
+        {
+            return Err("legacy wrapper cannot reinterpret menu policy".into());
         }
         let config = Config::parse(checkpoint.get("config"))?;
         let accepted =
@@ -177,7 +194,7 @@ mod tests {
     #[test]
     fn legacy_v5_v6_and_v7_wrappers_preserve_deployed_decisions() {
         use route_rl_native::pipeline::event_policy::{
-            Version, CONTRACT, EVIDENCE_SCHEMA, LEGACY_SCHEMA, SCHEMA,
+            Version, CONTRACT, EVIDENCE_SCHEMA, LEGACY_SCHEMA, NORMALIZED_SCHEMA, SCHEMA,
         };
         tensor::worker_threads();
         let p = Version::initial(Portfolio::empty(), vec![0, 1, 2, 3])
@@ -201,6 +218,16 @@ mod tests {
             .1
             .select(Some(0), &row())
             .unwrap();
+        j.set_path("schema", Json::Str(NORMALIZED_SCHEMA.into()));
+        assert!(!load_deployment(&j).unwrap().1.batch_lifetime);
+        assert_eq!(
+            load_deployment(&j)
+                .unwrap()
+                .1
+                .select(Some(0), &row())
+                .unwrap(),
+            current
+        );
         j.set_path("schema", Json::Str(EVIDENCE_SCHEMA.into()));
         assert_eq!(
             load_deployment(&j)
@@ -219,6 +246,34 @@ mod tests {
                 .unwrap(),
             current
         );
+    }
+    #[test]
+    fn batch_scope_is_loaded_only_from_the_accepted_version() {
+        use route_rl_native::pipeline::event_policy::{Version, CONTRACT, SCHEMA};
+        tensor::worker_threads();
+        let old = Version::initial(Portfolio::empty(), vec![0, 1, 2, 3]).unwrap();
+        let mut batch = old
+            .propose(
+                1,
+                Policy::event_plans(-1, 9, 0.0003)
+                    .unwrap()
+                    .weights_json()
+                    .unwrap(),
+            )
+            .unwrap();
+        batch.batch_lifetime = true;
+        let mut j = Json::Obj(vec![
+            ("schema".into(), Json::Str(SCHEMA.into())),
+            ("policy_contract".into(), Json::Str(CONTRACT.into())),
+            ("config".into(), Config::default().json()),
+            ("target_batch_lifetime".into(), Json::Bool(true)),
+            ("deployment".into(), old.json()),
+            ("candidate".into(), batch.json()),
+        ]);
+        assert!(!load_deployment(&j).unwrap().1.batch_lifetime);
+        j.set_path("deployment", batch.json());
+        assert!(load_deployment(&j).unwrap().1.batch_lifetime);
+        assert_eq!(Version::parse(&batch.json()).unwrap(), batch);
     }
     #[test]
     fn deployment_rejects_legacy_contract_and_missing_portfolio() {

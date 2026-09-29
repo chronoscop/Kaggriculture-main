@@ -1,3 +1,5 @@
+> 本文记录历史v7。当前候选前缀采集、连续段证据及实验命令见 [event_policy_candidate_prefix.md](event_policy_candidate_prefix.md)。
+
 # 事件策略：修复局面输入饱和
 
 训练格式 `event-policy-iteration-v7`；原始事件行和实际执行契约仍为 `event-shared-policy-season-scope-v5`。权重自带 `_event_input_encoding=event-centered-bounded-v1`，无此字段的旧网络严格走旧编码。

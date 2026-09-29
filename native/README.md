@@ -1,6 +1,6 @@
 # 原生混合生产 pipeline
 
-> **当前训练主线：[事件策略输入归一化](../docs/event_policy_normalization.md)（event-policy-iteration-v7）**，入口 `event-train` / `event-agent`。固定参考、整套验收，修复局面编码饱和；旧已验收策略保留原编码。实验命令与兼容说明见该文档。
+> **当前实验：[完整可执行方案集合学习](../docs/event_policy_complete_sets.md)（event-policy-iteration-v9）**，入口 `event-train` / `event-agent`。采集、集合损失与部署使用同一小菜单，沿候选和底座轨迹补完整终局对照；保留比赛得分目标与独立验收。旧检查点只导入已验收底座，命令及边界见文档。
 > [v3固定窗口版](../docs/plan_improvement.md)保留用于基准与检查点读取，下方v8命令为历史实验。
 
 > 旧版：[可学习市场决策](../docs/mixed_v8_market.md)（v8-market-3）。模型控制交易顺序和数量，新增对手潜在供给信息与事件触发，支持规则交易对照；320 维观测、19 类动作，旧 v7 / v8-market-1 / v8-market-2 检查点不兼容。

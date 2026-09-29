@@ -13,7 +13,10 @@ mod app {
             score_confirmation, tensor,
         },
         pipeline::{
-            event_policy::{Version, CONTRACT, SCHEMA},
+            event_policy::{
+                Version, BATCH_CONTRACT, COLLECTION_CONTRACT, CONTRACT, MENU_BATCH_CONTRACT,
+                MENU_CONTRACT, NORMALIZED_SCHEMA, PREFIX_SCHEMA, SCHEMA,
+            },
             event_portfolio::{Deployed, Portfolio, Runtime, SLOTS},
             executor::Observation,
             plan_events::Choice,
@@ -60,6 +63,8 @@ mod app {
         evaluate_checkpoint: Option<String>,
         diagnose_revisions: Option<String>,
         init: Option<String>,
+        warm_start: Option<String>,
+        batch_lifetime: Option<bool>,
         foundation: Option<String>,
         config: String,
         iterations: usize,
@@ -87,6 +92,8 @@ mod app {
                 evaluate_checkpoint: None,
                 diagnose_revisions: None,
                 init: None,
+                warm_start: None,
+                batch_lifetime: None,
                 foundation: None,
                 config: "native/configs/plan_prototype_v1.json".into(),
                 iterations: 100,
@@ -94,8 +101,8 @@ mod app {
                 workers: 7,
                 points: 2,
                 alternatives: 2,
-                branch_steps: 1440,
-                max_branches: 4,
+                branch_steps: 4320,
+                max_branches: 8,
                 epochs: 8,
                 batch: 64,
                 eval_every: 5,
@@ -108,9 +115,10 @@ mod app {
             };
             let args: Vec<_> = std::env::args().skip(1).collect();
             if args.iter().any(|s| s == "--help") {
-                println!("event-train --out NEW_DIR [--init-from accepted_event.json | --base-checkpoint v3_best.json | --resume v7_latest.json] --iterations 100 --games-per-update 16 --workers 7 --device cuda|cpu --branch-points 2 --alternatives 2 --branch-steps-per-game 1440 --max-branches-per-game 4 --epochs 8 --batch-size 64 --learning-rate 0.0003 --eval-every 5 --eval-games 8 --confirm-games 16\nOne shared network, fixed accepted continuation until promotion. Default scope unchanged: four seasonal harvest arrangements and one same-batch revision each. Outcome-independent replay. Independent confirmation progresses at the next scheduled evaluations, preserving the exact frozen candidate. iterations are additional; init-from preserves accepted deployment ONLY; proposal, labels and Adam start fresh with normalized inputs.");
-                println!("Read-only diagnostic: --evaluate-checkpoint v7_latest.json --out NEW_DIR --eval-games 64 --eval-seed NEW_SEED --workers 7 --device cpu. Evaluates the latest learner, ignores pending candidates, performs no training or promotion; eval-games counts both seats per opponent (64 = 32 seeds). ");
-                println!("Mechanism diagnostic: --diagnose-revisions v7_latest.json --out NEW_DIR --eval-games 8 --eval-seed SEED --workers 7 --device cpu. Compares accepted, new arrangements only, new revisions only, and both; tests changed revisions individually under accepted continuation. Maximum 16 games per opponent (8 seeds). Writes traces and comparisons only; never trains or promotes.");
+                println!("event-train --out NEW_DIR [--init-from accepted_event.json | --base-checkpoint v3_best.json | --resume v9_latest.json] --iterations 100 --games-per-update 16 --workers 7 --device cuda|cpu --branch-points 2 --alternatives 2 --branch-steps-per-game 4320 --max-branches-per-game 8 --epochs 8 --batch-size 64 --learning-rate 0.0003 --eval-every 5 --eval-games 8 --confirm-games 16\nOne shared network, fixed accepted continuation until promotion. Default scope unchanged: four seasonal harvest arrangements and one same-batch revision each. Outcome-independent replay. Independent confirmation progresses at the next scheduled evaluations, preserving the exact frozen candidate. iterations are additional; --warm-start v9_latest.json preserves normalized proposal weights but resets Adam, labels and confirmation. --init-from preserves deployment (and accepted normalized weights after v8 confirmation). --followup-scope single|batch: batch requires prior v8 independent acceptance; resume cannot change scope. Two base trajectories per training condition; local and same-prefix segment arms share accepted continuation; full candidate sequence outcomes never label individual choices.");
+                println!("v9 complete menus: 2–4 deterministic executable choices, all terminal arms compared atomically. Replay/batches use complete sets. Legacy init-from preserves accepted actions and starts a fresh menu learner. --alternatives is unused for complete menus; branch budgets still apply. Scope expansion is disabled. observations.jsonl reports the latest learner against fixed opponents/seeds; independent promotion never uses this panel.");
+                println!("Read-only diagnostic: --evaluate-checkpoint v8_latest.json --out NEW_DIR --eval-games 64 --eval-seed NEW_SEED --workers 7 --device cpu. Evaluates the latest learner, ignores pending candidates, performs no training or promotion; eval-games counts both seats per opponent (64 = 32 seeds). ");
+                println!("Mechanism diagnostic: --diagnose-revisions v8_latest.json --out NEW_DIR --eval-games 8 --eval-seed SEED --workers 7 --device cpu. Compares accepted, new arrangements only, new revisions only, and both; tests changed revisions individually under accepted continuation. Maximum 16 games per opponent (8 seeds). Writes traces and comparisons only; never trains or promotes.");
                 std::process::exit(0);
             }
             if args.len() % 2 != 0 {
@@ -125,6 +133,14 @@ mod app {
                     "--evaluate-checkpoint" => o.evaluate_checkpoint = Some(v.clone()),
                     "--diagnose-revisions" => o.diagnose_revisions = Some(v.clone()),
                     "--init-from" => o.init = Some(v.clone()),
+                    "--warm-start" => o.warm_start = Some(v.clone()),
+                    "--followup-scope" => {
+                        o.batch_lifetime = Some(match v.as_str() {
+                            "single" => false,
+                            "batch" => true,
+                            _ => return Err("followup-scope: single or batch".into()),
+                        })
+                    }
                     "--base-checkpoint" => o.foundation = Some(v.clone()),
                     "--config" => o.config = v.clone(),
                     "--iterations" => o.iterations = u()?,
@@ -185,6 +201,7 @@ mod app {
                 || [
                     o.resume.is_some(),
                     o.init.is_some(),
+                    o.warm_start.is_some(),
                     o.foundation.is_some(),
                     o.evaluate_checkpoint.is_some(),
                     o.diagnose_revisions.is_some(),
@@ -277,6 +294,7 @@ mod app {
         report: Json,
         pairs: Vec<Pair>,
         comparisons: Vec<Json>,
+        sequence: Option<Json>,
         steps: usize,
         branches: usize,
     }
@@ -303,6 +321,19 @@ mod app {
                 Json::Str(plan_compare::MATCH_SCORE_OBJECTIVE.into()),
             ),
             ("policy_contract", Json::Str(CONTRACT.into())),
+            ("collection_contract", Json::Str(COLLECTION_CONTRACT.into())),
+            (
+                "continuation_contract",
+                if evidence.get("continuation_contract").str().is_empty() {
+                    Json::Str(CONTRACT.into())
+                } else {
+                    evidence.get("continuation_contract").clone()
+                },
+            ),
+            (
+                "source_snapshot",
+                Json::Str(format!("collection_{iteration:06}")),
+            ),
             (
                 "learner_input_encoding",
                 Json::Str(route_rl_native::learning::policy::EVENT_INPUT_ENCODING.into()),
@@ -595,6 +626,7 @@ mod app {
             report,
             pairs: vec![],
             comparisons: vec![],
+            sequence: None,
             steps: 719,
             branches: 0,
         };
@@ -679,10 +711,639 @@ mod app {
         result.branches = budget.branches;
         Ok(result)
     }
+    /// Candidate state distribution is collected with the exact deployment runtime.
+    /// Local targets instead share the stable accepted suffix policy. In particular,
+    /// the candidate's terminal result is NEVER reused as a local reference label.
+    fn candidate_trajectory(
+        job: &Job,
+        candidate: &Runtime,
+        learner: &Policy,
+        opponents: &[Runtime],
+        config: &Config,
+        scope: &[usize],
+        source_id: &str,
+    ) -> Result<(World, Vec<Fork>, Vec<Json>), String> {
+        let mut world = World::new(job.seed, config);
+        let mut forks = vec![];
+        let mut trace = vec![];
+        while world.game.step < 719 {
+            let obs = Observation::from_state(&world.game, job.seat);
+            let action = if let Some(mut d) = world.own.prepare(&obs, candidate)? {
+                if d.slot.is_some_and(|s| scope.contains(&s)) {
+                    let prefix = format!(
+                        "{source_id}:{}:{}:{}:{}",
+                        job.seed,
+                        job.seat,
+                        job.opponent,
+                        trace.len()
+                    );
+                    forks.push(snapshot(&world, &d, learner, prefix.clone())?);
+                    trace.push(Json::Obj(vec![
+                        ("prefix_id".into(), Json::Str(prefix)),
+                        ("step".into(), n(obs.step as f64)),
+                        ("slot".into(), n(d.slot.unwrap() as f64)),
+                        ("followup".into(), Json::Bool(d.followup)),
+                        ("legal_candidates".into(), n(d.choices.len() as f64)),
+                        (
+                            "production_candidates".into(),
+                            n(d.choices.iter().filter(|c| c.next.is_some()).count() as f64),
+                        ),
+                        ("selected".into(), n(d.selected as f64)),
+                        ("plan".into(), d.choices[d.selected].json()),
+                        (
+                            "event".into(),
+                            world.own.last_event.as_ref().unwrap().json(),
+                        ),
+                    ]));
+                }
+                world
+                    .own
+                    .execute_choice(&obs, d.choices.swap_remove(d.selected), candidate)?
+            } else {
+                world.own.continue_action(&obs, candidate)?
+            };
+            world.advance(job, action, opponents)?;
+        }
+        world
+            .own
+            .controller
+            .observe(&Observation::from_state(&world.game, job.seat));
+        Ok((world, forks, trace))
+    }
+    /// Change a bounded same-batch segment. Other scopes and the suffix after
+    /// its last editable event use the SAME accepted runtime as both local arms.
+    fn rollout_segment(
+        f: &Fork,
+        job: &Job,
+        accepted: &Runtime,
+        candidate: &Runtime,
+        learner: &Policy,
+        opponents: &[Runtime],
+    ) -> Result<(World, Vec<Json>), String> {
+        let mut world = f.world.clone();
+        let mut edits = vec![];
+        let obs = Observation::from_state(&world.game, job.seat);
+        let action = world
+            .own
+            .execute_choice(&obs, f.choices[f.proposed].clone(), candidate)?;
+        world.advance(job, action, opponents)?;
+        while world.game.step < 719 {
+            let obs = Observation::from_state(&world.game, job.seat);
+            let action = if let Some(mut d) = world.own.prepare(&obs, accepted)? {
+                let same_batch = d.followup && d.slot == Some(f.slot);
+                let runtime = if same_batch { candidate } else { accepted };
+                if same_batch {
+                    d.selected = learner.infer(&[d.row.clone()], true, &mut Rng(0))?[0].action;
+                    edits.push(Json::Obj(vec![
+                        ("step".into(), n(obs.step as f64)),
+                        (
+                            "event".into(),
+                            world.own.last_event.as_ref().unwrap().json(),
+                        ),
+                        ("selected".into(), d.choices[d.selected].json()),
+                        ("legal_candidates".into(), n(d.choices.len() as f64)),
+                    ]));
+                }
+                world
+                    .own
+                    .execute_choice(&obs, d.choices.swap_remove(d.selected), runtime)?
+            } else {
+                world.own.continue_action(&obs, accepted)?
+            };
+            world.advance(job, action, opponents)?;
+        }
+        world
+            .own
+            .controller
+            .observe(&Observation::from_state(&world.game, job.seat));
+        Ok((world, edits))
+    }
+    /// Execute the actual incumbent/candidate prefix. Both use the versioned
+    /// menu; before the first promotion its first choice is the exact old policy.
+    fn menu_trajectory(
+        job: &Job,
+        accepted: &Runtime,
+        candidate: &Runtime,
+        learner: &Policy,
+        opponents: &[Runtime],
+        config: &Config,
+        scope: &[usize],
+        source: &str,
+        use_candidate: bool,
+    ) -> Result<(World, Vec<Fork>), String> {
+        let mut world = World::new(job.seed, config);
+        let mut forks = vec![];
+        let runtime = if use_candidate { candidate } else { accepted };
+        while world.game.step < 719 {
+            let obs = Observation::from_state(&world.game, job.seat);
+            let action = if let Some(mut d) = world.own.prepare(&obs, candidate)? {
+                if d.slot.is_some_and(|s| scope.contains(&s)) {
+                    if !use_candidate {
+                        d.selected = if accepted.menu_reference.is_some() {
+                            accepted.select(d.slot, &d.row)?
+                        } else {
+                            0
+                        };
+                    }
+                    if d.choices.len() > 1 {
+                        forks.push(snapshot(
+                            &world,
+                            &d,
+                            learner,
+                            format!(
+                                "{source}:{}:{}:{}:{}",
+                                job.seed, job.seat, job.opponent, obs.step
+                            ),
+                        )?);
+                    }
+                }
+                world
+                    .own
+                    .execute_choice(&obs, d.choices.swap_remove(d.selected), runtime)?
+            } else {
+                world.own.continue_action(&obs, runtime)?
+            };
+            world.advance(job, action, opponents)?;
+        }
+        world
+            .own
+            .controller
+            .observe(&Observation::from_state(&world.game, job.seat));
+        Ok((world, forks))
+    }
+    fn play_menu_training(
+        job: &Job,
+        accepted: &Runtime,
+        candidate: &Runtime,
+        learner: &Policy,
+        opponents: &[Runtime],
+        config: &Config,
+        iteration: u64,
+        revision: u64,
+        scope: &[usize],
+        step_limit: usize,
+        count_limit: usize,
+    ) -> Result<Game, String> {
+        // Lifetime expansion requires its own accepted scope; no legacy-to-menu
+        // migration is allowed to quietly expand the data collection scope.
+        if accepted.batch_lifetime != candidate.batch_lifetime {
+            return Err("complete-set training requires the accepted follow-up scope; do not expand scope during migration".into());
+        }
+        let (aw, af) = menu_trajectory(
+            job,
+            accepted,
+            candidate,
+            learner,
+            opponents,
+            config,
+            scope,
+            &format!("collection_{iteration:06}:accepted"),
+            false,
+        )?;
+        let (cw, cf) = menu_trajectory(
+            job,
+            accepted,
+            candidate,
+            learner,
+            opponents,
+            config,
+            scope,
+            &format!("collection_{iteration:06}:candidate"),
+            true,
+        )?;
+        let mut result = Game {
+            report: aw.result(job),
+            pairs: vec![],
+            comparisons: vec![],
+            sequence: None,
+            steps: 1438,
+            branches: 0,
+        };
+        let mut budget = Budget::default();
+        let mut sets = vec![];
+        let rotation = (job.seed as usize).wrapping_add(iteration as usize);
+        let accepted_ids = select_forks(&af, &job.slots, rotation);
+        let mut candidate_ids = select_forks(&cf, &job.slots, rotation + 1);
+        // With two sets, cover an accepted arrangement and a real candidate
+        // follow-up, rather than sampling the first arrangement twice.
+        if let Some(at) = candidate_ids.iter().position(|i| cf[*i].followup) {
+            candidate_ids.swap(0, at);
+        }
+
+        let mut queue = vec![];
+        for i in 0..accepted_ids.len().max(candidate_ids.len()) {
+            let a = accepted_ids
+                .get(i)
+                .map(|j| (&af[*j], "accepted_trajectory"));
+            let c = candidate_ids.get(i).map(|j| (&cf[*j], "candidate_prefix"));
+            for item in if rotation % 2 == 0 { [a, c] } else { [c, a] } {
+                if let Some(v) = item {
+                    queue.push(v);
+                }
+            }
+        }
+        for (f, source) in queue {
+            if sets.len() >= job.slots.len() {
+                break;
+            }
+            let arms = f.choices.len();
+            let cost = (719 - f.row.step) as usize;
+            // Atomic reservation: never train an incompletely compared menu.
+            if budget.branches + arms > count_limit || budget.steps + arms * cost > step_limit {
+                continue;
+            }
+            let mut outcomes = vec![];
+            for j in 0..arms {
+                let (end, _) = rollout_edit(f, j, job, accepted, opponents, None, scope)?;
+                outcomes.push(end.cash(job.seat));
+            }
+            budget.branches += arms;
+            budget.steps += arms * cost;
+            let mut ev = evidence(f, source, revision, true);
+            for (k, v) in [
+                (
+                    "continuation_contract",
+                    Json::Str(
+                        if accepted.menu_reference.is_some() {
+                            if accepted.batch_lifetime {
+                                MENU_BATCH_CONTRACT
+                            } else {
+                                MENU_CONTRACT
+                            }
+                        } else if accepted.batch_lifetime {
+                            BATCH_CONTRACT
+                        } else {
+                            CONTRACT
+                        }
+                        .into(),
+                    ),
+                ),
+                ("candidate_set_id", Json::Str(f.prefix.clone())),
+                (
+                    "candidate_encoding",
+                    Json::Str(route_rl_native::pipeline::plan_menu::ENCODING.into()),
+                ),
+                (
+                    "all_terminal_cash",
+                    Json::Arr(
+                        outcomes
+                            .iter()
+                            .map(|c| Json::Arr(c.map(n).to_vec()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "candidate_plans",
+                    Json::Arr(f.choices.iter().map(Choice::json).collect()),
+                ),
+                ("terminal_step", n(719.)),
+                ("rollin_selected", n(f.reference as f64)),
+                ("learner_selected", n(f.proposed as f64)),
+                (
+                    "scope_contract",
+                    Json::Str(
+                        if candidate.batch_lifetime {
+                            MENU_BATCH_CONTRACT
+                        } else {
+                            MENU_CONTRACT
+                        }
+                        .into(),
+                    ),
+                ),
+            ] {
+                ev.set_path(k, v);
+            }
+            for j in 1..arms {
+                record_pair(
+                    &mut result,
+                    job,
+                    iteration,
+                    revision,
+                    f.slot,
+                    &f.row,
+                    &f.choices,
+                    0,
+                    j,
+                    outcomes[0],
+                    outcomes[j],
+                    ev.clone(),
+                )?;
+            }
+            sets.push(ev);
+        }
+        result.steps += budget.steps;
+        result.branches = budget.branches;
+        result.sequence = Some(Json::Obj(vec![
+            ("iteration".into(), n(iteration as f64)),
+            ("seed".into(), n(job.seed as f64)),
+            ("seat".into(), n(job.seat as f64)),
+            ("opponent".into(), n(job.opponent as f64)),
+            ("accepted_outcome".into(), aw.result(job)),
+            ("candidate_outcome".into(), cw.result(job)),
+            ("complete_sets".into(), Json::Arr(sets)),
+            ("accepted_events".into(), n(af.len() as f64)),
+            ("candidate_events".into(), n(cf.len() as f64)),
+            (
+                "collection_contract".into(),
+                Json::Str(COLLECTION_CONTRACT.into()),
+            ),
+        ]));
+        Ok(result)
+    }
+    fn play_training(
+        job: &Job,
+        accepted: &Runtime,
+        candidate: &Runtime,
+        learner: &Policy,
+        opponents: &[Runtime],
+        config: &Config,
+        iteration: u64,
+        revision: u64,
+        scope: &[usize],
+        alt_count: usize,
+        step_limit: usize,
+        count_limit: usize,
+    ) -> Result<Game, String> {
+        if candidate.menu_reference.is_some() {
+            return play_menu_training(
+                job,
+                accepted,
+                candidate,
+                learner,
+                opponents,
+                config,
+                iteration,
+                revision,
+                scope,
+                step_limit,
+                count_limit,
+            );
+        }
+        let source_id = format!("collection_{iteration:06}");
+        let (world, forks, trace) = candidate_trajectory(
+            job, candidate, learner, opponents, config, scope, &source_id,
+        )?;
+        // Reserve an entire two-suffix comparison before starting either arm.
+        // Source priority rotates by seed (both seats use the same priority),
+        // independent of outcomes. Limited budgets cannot erase champion evidence.
+        let candidate_first = (job.seed as u64 + iteration) % 2 == 0;
+        let accepted_steps = if candidate_first { 0 } else { step_limit / 2 };
+        let accepted_count = if candidate_first { 0 } else { count_limit / 2 };
+        let mut result = if candidate_first {
+            Game {
+                report: Json::Null,
+                pairs: vec![],
+                comparisons: vec![],
+                sequence: None,
+                steps: 719,
+                branches: 0,
+            }
+        } else {
+            play(
+                job,
+                accepted,
+                Some(learner),
+                opponents,
+                config,
+                iteration,
+                revision,
+                scope,
+                alt_count,
+                accepted_steps,
+                accepted_count,
+            )?
+        };
+        let mut budget = Budget {
+            steps: result.steps - 719,
+            branches: result.branches,
+        };
+        let mut ids: Vec<_> = (0..forks.len()).collect();
+        // Rotate among actual follow-ups, including later events of an owned
+        // batch. No selection depends on the branch's eventual win/loss.
+        if !ids.is_empty() {
+            let rotate = (job.seed as usize + iteration as usize) % ids.len();
+            ids.rotate_left(rotate);
+            ids.sort_by_key(|i| (!forks[*i].followup, forks[*i].proposed == 0));
+            // One revision and one arrangement when both exist. This keeps a
+            // first-arrangement + follow-up segment measurable in the single stage.
+            if job.slots.len() > 1 && forks[ids[0]].followup {
+                if let Some(at) = ids.iter().position(|i| !forks[*i].followup) {
+                    let arrangement = ids.remove(at);
+                    ids.insert(1, arrangement);
+                }
+            }
+        }
+        let mut segments = vec![];
+        let mut rng = Rng(job.rng ^ 0x645cdf12);
+        let mut tested = 0;
+        for i in ids {
+            if tested >= job.slots.len() {
+                break;
+            }
+            let mut f = forks[i].clone();
+            f.reference = 0; // Explicit Keep, not the candidate's selected revision.
+            let cost = (719 - f.row.step) as usize;
+            let needs_segment = (f.followup && candidate.batch_lifetime)
+                || (!f.followup && f.proposed != 0 && f.choices[f.proposed].next.is_some());
+            let arms = if needs_segment { 3 } else { 2 };
+            if budget.branches + arms > count_limit || budget.steps + arms * cost > step_limit {
+                continue;
+            }
+            let Some(alternative) = alternatives(&f, 1, &mut rng).first().copied() else {
+                continue;
+            };
+            let (keep, _) = rollout_edit(&f, 0, job, accepted, opponents, None, scope)?;
+            let (changed, _) =
+                rollout_edit(&f, alternative, job, accepted, opponents, None, scope)?;
+            let (segment_cash, segment_events) = if needs_segment {
+                let (segment, events) =
+                    rollout_segment(&f, job, accepted, candidate, learner, opponents)?;
+                (segment.cash(job.seat), events)
+            } else {
+                // No later owned edit can occur. Reuse an identical completed arm.
+                (
+                    if f.proposed == 0 {
+                        keep.cash(job.seat)
+                    } else {
+                        changed.cash(job.seat)
+                    },
+                    vec![],
+                )
+            };
+            budget.steps += arms * cost;
+            budget.branches += arms;
+            tested += 1;
+            segments.push(Json::Obj(vec![
+                ("prefix_id".into(), Json::Str(f.prefix.clone())),
+                ("slot".into(), n(f.slot as f64)),
+                ("step".into(), n(f.row.step as f64)),
+                (
+                    "event".into(),
+                    f.world.own.last_event.as_ref().unwrap().json(),
+                ),
+                ("candidate_first_index".into(), n(f.proposed as f64)),
+                (
+                    "reference_cash".into(),
+                    Json::Arr(keep.cash(job.seat).map(n).to_vec()),
+                ),
+                (
+                    "single_edit_cash".into(),
+                    Json::Arr(changed.cash(job.seat).map(n).to_vec()),
+                ),
+                ("single_edit_index".into(), n(alternative as f64)),
+                (
+                    "segment_cash".into(),
+                    Json::Arr(segment_cash.map(n).to_vec()),
+                ),
+                (
+                    "segment_score_gain".into(),
+                    n(score(segment_cash) - score(keep.cash(job.seat))),
+                ),
+                ("later_segment_events".into(), Json::Arr(segment_events)),
+                (
+                    "continuation_revision".into(),
+                    Json::Str(revision.to_string()),
+                ),
+                (
+                    "continuation_contract".into(),
+                    Json::Str(
+                        if accepted.batch_lifetime {
+                            BATCH_CONTRACT
+                        } else {
+                            CONTRACT
+                        }
+                        .into(),
+                    ),
+                ),
+                ("terminal_step".into(), n(719.)),
+                ("reused_local_arm".into(), Json::Bool(!needs_segment)),
+                ("local_target".into(), Json::Bool(false)),
+            ]));
+            let mut ev = evidence(
+                &f,
+                "candidate_prefix",
+                revision,
+                f.proposed == 0 || alternative == f.proposed,
+            );
+            ev.set_path("reference_execution", keep.own.controller.report());
+            ev.set_path("execution", changed.own.controller.report());
+            ev.set_path("candidate_selected_index", n(f.proposed as f64));
+            ev.set_path("legal_candidate_count", n(f.choices.len() as f64));
+            ev.set_path(
+                "production_candidate_count",
+                n(f.choices.iter().filter(|c| c.next.is_some()).count() as f64),
+            );
+            ev.set_path("reference_terminal_step", n(keep.game.step as f64));
+            ev.set_path("alternative_terminal_step", n(changed.game.step as f64));
+            record_pair(
+                &mut result,
+                job,
+                iteration,
+                revision,
+                f.slot,
+                &f.row,
+                &f.choices,
+                0,
+                alternative,
+                keep.cash(job.seat),
+                changed.cash(job.seat),
+                ev,
+            )?;
+        }
+        if candidate_first {
+            // Spend the remaining budget on champion states. Each source runs
+            // exactly one full base trajectory, in addition to counted suffixes.
+            let extra = play(
+                job,
+                accepted,
+                Some(learner),
+                opponents,
+                config,
+                iteration,
+                revision,
+                scope,
+                alt_count,
+                step_limit - budget.steps,
+                count_limit - budget.branches,
+            )?;
+            budget.steps += extra.steps - 719;
+            budget.branches += extra.branches;
+            result.report = extra.report;
+            result.pairs.extend(extra.pairs);
+            result.comparisons.extend(extra.comparisons);
+        }
+        let sequence = Json::Obj(vec![
+            (
+                "collection_contract".into(),
+                Json::Str(COLLECTION_CONTRACT.into()),
+            ),
+            ("source_snapshot".into(), Json::Str(source_id.clone())),
+            ("iteration".into(), n(iteration as f64)),
+            ("seed".into(), n(job.seed as f64)),
+            ("seat".into(), n(job.seat as f64)),
+            ("opponent".into(), n(job.opponent as f64)),
+            (
+                "candidate_contract".into(),
+                Json::Str(
+                    if candidate.batch_lifetime {
+                        BATCH_CONTRACT
+                    } else {
+                        CONTRACT
+                    }
+                    .into(),
+                ),
+            ),
+            ("candidate_events".into(), Json::Arr(trace)),
+            ("same_prefix_segments".into(), Json::Arr(segments)),
+            ("candidate_outcome".into(), world.result(job)),
+            ("accepted_outcome".into(), result.report.clone()),
+            ("terminal_step".into(), n(world.game.step as f64)),
+            (
+                "score_gain".into(),
+                n(score(world.cash(job.seat)) - result.report.get("score").f64()),
+            ),
+            ("local_target".into(), Json::Bool(false)),
+            ("promotion_evidence".into(), Json::Bool(false)),
+            ("local_candidate_pairs".into(), n(tested as f64)),
+        ]);
+        result.sequence = Some(sequence);
+        for p in &mut result.pairs {
+            p.evidence
+                .set_path("source_snapshot", Json::Str(source_id.clone()));
+            p.evidence.set_path(
+                "continuation_contract",
+                Json::Str(
+                    if accepted.batch_lifetime {
+                        BATCH_CONTRACT
+                    } else {
+                        CONTRACT
+                    }
+                    .into(),
+                ),
+            );
+        }
+        for e in &mut result.comparisons {
+            e.set_path("source_snapshot", Json::Str(source_id.clone()));
+            e.set_path(
+                "continuation_contract",
+                Json::Str(
+                    if accepted.batch_lifetime {
+                        BATCH_CONTRACT
+                    } else {
+                        CONTRACT
+                    }
+                    .into(),
+                ),
+            );
+        }
+        result.steps = 1438 + budget.steps;
+        result.branches = budget.branches;
+        Ok(result)
+    }
     fn collect(
         jobs: Vec<Job>,
         accepted: &Version,
-        learner: Option<&Json>,
+        learner: Option<&Version>,
         opponents: &[Version],
         config: &Config,
         workers: usize,
@@ -708,7 +1369,9 @@ mod app {
                 move || -> Result<Vec<(usize, Game)>, String> {
                     tensor::worker_threads();
                     let runtime = version.runtime(-1)?;
-                    let lp = if let Some(w) = lw {
+                    let candidate = lw.as_ref().map(|v| v.runtime(-1)).transpose()?;
+                    let lp = if let Some(v) = &lw {
+                        let w = v.weights.as_ref().ok_or("candidate missing weights")?;
                         let mut p = Policy::event_plans(-1, 0, 0.0003)?;
                         p.load_weights(&w)?;
                         Some(p)
@@ -725,8 +1388,22 @@ mod app {
                         if i >= js.len() {
                             break;
                         }
-                        result.push((
-                            i,
+                        let game = if let (Some(candidate), Some(learner)) = (&candidate, &lp) {
+                            play_training(
+                                &js[i],
+                                &runtime,
+                                candidate,
+                                learner,
+                                &opponents,
+                                &c,
+                                iteration,
+                                version.revision,
+                                &version.scope,
+                                alt_count,
+                                step_limit,
+                                count_limit,
+                            )?
+                        } else {
                             play(
                                 &js[i],
                                 &runtime,
@@ -739,8 +1416,9 @@ mod app {
                                 alt_count,
                                 step_limit,
                                 count_limit,
-                            )?,
-                        ));
+                            )?
+                        };
+                        result.push((i, game));
                     }
                     Ok(result)
                 },
@@ -949,7 +1627,12 @@ mod app {
     impl EvidenceBank {
         const CAPACITY: usize = 2048;
         fn admit(&mut self, pairs: &[Pair]) {
+            let mut set_ids = std::collections::BTreeSet::new();
             for pair in pairs {
+                let id = pair.evidence.get("candidate_set_id").str();
+                if !id.is_empty() && !set_ids.insert(id.to_string()) {
+                    continue;
+                }
                 self.seen += 1;
                 if self.history.len() < Self::CAPACITY {
                     self.history.push(pair.clone());
@@ -1024,9 +1707,18 @@ mod app {
                 return Err("invalid evidence reservoir size".into());
             }
             for p in out.history.iter().chain(&out.recent) {
+                if !p.evidence.get("candidate_set_id").str().is_empty() {
+                    route_rl_native::learning::event_sets::validate(p)?;
+                }
                 if p.incumbent_revision()? != version
                     || p.evidence.get("continuation_revision").str() != version.to_string()
                     || p.evidence.get("policy_contract").str() != CONTRACT
+                    || p.evidence.get("collection_contract").str() != COLLECTION_CONTRACT
+                    || !matches!(
+                        p.evidence.get("continuation_contract").str(),
+                        CONTRACT | BATCH_CONTRACT | MENU_CONTRACT | MENU_BATCH_CONTRACT
+                    )
+                    || p.evidence.get("source_snapshot").str().is_empty()
                     || p.evidence.get("learner_input_encoding").str()
                         != route_rl_native::learning::policy::EVENT_INPUT_ENCODING
                     || p.evidence.get("objective").str() != plan_compare::MATCH_SCORE_OBJECTIVE
@@ -1076,6 +1768,75 @@ mod app {
     }
     /// Unique measured states, evaluated AFTER the update with the full legal
     /// candidate list. A new untested argmax is UNKNOWN, never counted a success.
+    fn candidate_coverage(gs: &[Game]) -> Json {
+        let local: Vec<_> = gs
+            .iter()
+            .flat_map(|g| &g.pairs)
+            .filter(|p| {
+                p.evidence.get("source").str() == "candidate_prefix"
+                    && p.evidence.get("stage").str() == "revision"
+            })
+            .collect();
+        let sizes: Vec<_> = local
+            .iter()
+            .map(|p| p.evidence.get("legal_candidate_count").i64())
+            .collect();
+        let sequences: Vec<_> = gs.iter().filter_map(|g| g.sequence.as_ref()).collect();
+        Json::Obj(vec![
+            ("revision_states_tested".into(), n(local.len() as f64)),
+            (
+                "legal_candidates_min".into(),
+                sizes
+                    .iter()
+                    .min()
+                    .map(|x| n(*x as f64))
+                    .unwrap_or(Json::Null),
+            ),
+            (
+                "legal_candidates_max".into(),
+                sizes
+                    .iter()
+                    .max()
+                    .map(|x| n(*x as f64))
+                    .unwrap_or(Json::Null),
+            ),
+            (
+                "keep_cancel_only".into(),
+                n(local
+                    .iter()
+                    .filter(|p| p.evidence.get("production_candidate_count").i64() == 0)
+                    .count() as f64),
+            ),
+            (
+                "sequences_without_revision".into(),
+                n(sequences
+                    .iter()
+                    .filter(|s| {
+                        !s.get("candidate_events")
+                            .arr()
+                            .iter()
+                            .any(|e| matches!(e.get("followup"), Json::Bool(true)))
+                    })
+                    .count() as f64),
+            ),
+            (
+                "segments_with_later_events".into(),
+                n(sequences
+                    .iter()
+                    .flat_map(|s| s.get("same_prefix_segments").arr())
+                    .filter(|s| !s.get("later_segment_events").arr().is_empty())
+                    .count() as f64),
+            ),
+            (
+                "training_sequence_score_gain".into(),
+                n(sequences
+                    .iter()
+                    .map(|s| s.get("score_gain").f64())
+                    .sum::<f64>()
+                    / sequences.len().max(1) as f64),
+            ),
+        ])
+    }
     fn selection_report(p: &Policy, pairs: &[Pair]) -> Result<Json, String> {
         use std::collections::BTreeMap;
         let mut groups: BTreeMap<String, Vec<&Pair>> = BTreeMap::new();
@@ -1169,6 +1930,7 @@ mod app {
                 report: r.clone(),
                 pairs: vec![],
                 comparisons: vec![],
+                sequence: None,
                 steps: 719,
                 branches: 0,
             })
@@ -1237,11 +1999,32 @@ mod app {
         monitor: Json,
         pending: Option<Pending>,
         evaluation_games: u64,
+        target_batch_lifetime: bool,
+        menu_learning: bool,
+        scope_confirmed: bool,
     }
     impl State {
+        fn proposal(&self, iteration: u64, weights: Json) -> Result<Version, String> {
+            let mut candidate = self.accepted.propose(iteration, weights)?;
+            candidate.batch_lifetime = self.target_batch_lifetime;
+            if self.menu_learning && candidate.menu_anchor.is_none() {
+                candidate.menu_anchor = Some(Box::new(self.accepted.clone()));
+            }
+            self.accepted.validate_successor(&candidate)?;
+            Ok(candidate)
+        }
         fn checkpoint(&self, p: &Policy) -> Result<Json, String> {
             Ok(Json::Obj(vec![
                 ("schema".into(), Json::Str(SCHEMA.into())),
+                ("menu_learning".into(), Json::Bool(self.menu_learning)),
+                (
+                    "candidate_encoding".into(),
+                    Json::Str(route_rl_native::pipeline::plan_menu::ENCODING.into()),
+                ),
+                (
+                    "collection_contract".into(),
+                    Json::Str(COLLECTION_CONTRACT.into()),
+                ),
                 (
                     "learner_input_encoding".into(),
                     Json::Str(route_rl_native::learning::policy::EVENT_INPUT_ENCODING.into()),
@@ -1255,6 +2038,11 @@ mod app {
                 ("model".into(), p.checkpoint(self.iteration, &self.rng)?),
                 ("config".into(), self.config.json()),
                 ("deployment".into(), self.accepted.json()),
+                (
+                    "target_batch_lifetime".into(),
+                    Json::Bool(self.target_batch_lifetime),
+                ),
+                ("scope_confirmed".into(), Json::Bool(self.scope_confirmed)),
                 ("previous_accepted".into(), self.previous.json()),
                 ("comparison_bank".into(), self.bank.json()),
                 (
@@ -1285,10 +2073,17 @@ mod app {
         }
         fn restore(j: &Json, p: &mut Policy) -> Result<Self, String> {
             if j.get("schema").str() != SCHEMA
+                || j.get("collection_contract").str() != COLLECTION_CONTRACT
                 || j.get("policy_contract").str() != CONTRACT
                 || j.get("objective").str() != plan_compare::MATCH_SCORE_OBJECTIVE
             {
-                return Err("--resume requires full event-policy-iteration-v7 checkpoint; use --init-from for an older accepted deployment and a fresh normalized learner".into());
+                return Err("--resume requires full event-policy-iteration-v9 checkpoint; use --init-from to preserve accepted deployment and invalidate old labels/Adam".into());
+            }
+            if matches!(j.get("menu_learning"), Json::Bool(true))
+                && j.get("candidate_encoding").str()
+                    != route_rl_native::pipeline::plan_menu::ENCODING
+            {
+                return Err("incompatible candidate encoding".into());
             }
             let (iteration, rng) = p.restore(j.get("model"))?;
             if iteration != uint(j, "iteration")? || !p.plan_residual || !p.event_input_scaling {
@@ -1296,14 +2091,21 @@ mod app {
             }
             let accepted = Version::parse(j.get("deployment"))?;
             let previous = Version::parse(j.get("previous_accepted"))?;
-            if j.get("deployment").get("contract").str() != CONTRACT
-                || previous.revision > accepted.revision
+            if previous.revision > accepted.revision
                 || previous.scope != accepted.scope
                 || previous.foundation != accepted.foundation
             {
                 return Err("invalid previous accepted strategy".into());
             }
             let bank = EvidenceBank::parse(j.get("comparison_bank"), accepted.revision)?;
+            if bank
+                .history
+                .iter()
+                .chain(&bank.recent)
+                .any(|p| p.evidence.get("continuation_contract").str() != accepted.contract())
+            {
+                return Err("cached labels use a different continuation execution contract".into());
+            }
             let pending = if j.get("pending_candidate").is_obj() {
                 Some(Pending::parse(
                     j.get("pending_candidate"),
@@ -1316,6 +2118,9 @@ mod app {
             let out = Self {
                 iteration,
                 rng,
+                menu_learning: matches!(j.get("menu_learning"), Json::Bool(true)),
+                target_batch_lifetime: matches!(j.get("target_batch_lifetime"), Json::Bool(true)),
+                scope_confirmed: matches!(j.get("scope_confirmed"), Json::Bool(true)),
                 config: Config::parse(j.get("config"))?,
                 accepted,
                 previous,
@@ -1330,7 +2135,22 @@ mod app {
                 evaluation_games: uint(j, "evaluation_games")?,
                 monitor: j.get("deployed_vs_rule").clone(),
             };
-            if out.next_seed >= 1_000_000_000
+            if out.menu_learning
+                && out
+                    .bank
+                    .history
+                    .iter()
+                    .chain(&out.bank.recent)
+                    .any(|p| p.evidence.get("candidate_set_id").str().is_empty())
+            {
+                return Err("menu replay requires complete sets".into());
+            }
+            if out.accepted.batch_lifetime && !out.target_batch_lifetime
+                || out
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.candidate.batch_lifetime != out.target_batch_lifetime)
+                || out.next_seed >= 1_000_000_000
                 || out.eval_seed < 1_000_000_000
                 || out.next_eval_seed < out.eval_seed + 1_000_000
             {
@@ -1340,8 +2160,12 @@ mod app {
         }
         fn promote(&mut self, candidate: Version) -> Result<(), String> {
             self.accepted.validate_successor(&candidate)?;
+            if candidate.batch_lifetime != self.target_batch_lifetime {
+                return Err("promotion must use the collected and evaluated responsibility".into());
+            }
             self.previous = self.accepted.clone();
             self.accepted = candidate;
+            self.scope_confirmed = true;
             self.bank = EvidenceBank::default();
             self.pending = None;
             Ok(())
@@ -1389,6 +2213,82 @@ mod app {
             .set_path("accepted_revision", n(s.accepted.revision as f64));
         Ok(())
     }
+    fn observe_latest(o: &Options, s: &mut State, p: &Policy) -> Result<(), String> {
+        if !s.menu_learning {
+            return Ok(());
+        }
+        let candidate = s.proposal(s.iteration, p.weights_json()?)?;
+        let anchor = candidate
+            .menu_anchor
+            .as_deref()
+            .ok_or("missing menu anchor")?;
+        let js = eval_jobs(s.eval_seed, o.eval_games, &[0, 1]);
+        let cache = o.out.join("observation_reference.json");
+        let key = Json::Obj(vec![
+            ("anchor".into(), anchor.json()),
+            ("config".into(), s.config.json()),
+            ("seed".into(), n(s.eval_seed as f64)),
+            ("games".into(), n(o.eval_games as f64)),
+        ]);
+        let saved = if cache.exists() {
+            read(cache.to_str().unwrap())?
+        } else {
+            Json::Null
+        };
+        let reference = if saved.get("key") == &key {
+            saved.get("summary").clone()
+        } else {
+            let gs = collect(
+                js.clone(),
+                anchor,
+                None,
+                &[anchor.clone()],
+                &s.config,
+                o.workers,
+                s.iteration,
+                0,
+                0,
+                0,
+            )?;
+            s.evaluation_games += gs.len() as u64;
+            let summary = summary(&gs);
+            write(
+                &cache,
+                &Json::Obj(vec![
+                    ("key".into(), key),
+                    ("summary".into(), summary.clone()),
+                ]),
+            )?;
+            summary
+        };
+        let gs = collect(
+            js,
+            &candidate,
+            None,
+            &[anchor.clone()],
+            &s.config,
+            o.workers,
+            s.iteration,
+            0,
+            0,
+            0,
+        )?;
+        s.evaluation_games += gs.len() as u64;
+        let current = summary(&gs);
+        let row = Json::Obj(vec![
+            ("iteration".into(), n(s.iteration as f64)),
+            ("latest_candidate".into(), current.clone()),
+            ("fixed_reference".into(), reference.clone()),
+            (
+                "mean_score_gain".into(),
+                n(current.get("score_rate").f64() - reference.get("score_rate").f64()),
+            ),
+            ("used_for_promotion".into(), Json::Bool(false)),
+        ]);
+        append(&o.out.join("observations.jsonl"), &row)?;
+        println!("observation {}", row.dump());
+        Ok(())
+    }
     fn evaluate(o: &Options, s: &mut State, p: &mut Policy) -> Result<(), String> {
         let before = s.accepted.revision;
         let start = Instant::now();
@@ -1399,7 +2299,7 @@ mod app {
         ]);
         let roster = roster(&s.accepted, &s.previous);
         if s.pending.is_none() {
-            let candidate = s.accepted.propose(s.iteration, p.weights_json()?)?;
+            let candidate = s.proposal(s.iteration, p.weights_json()?)?;
             let seed = s.eval_seeds(o.eval_games)?;
             let js = eval_jobs(seed, o.eval_games, &roster);
             let cs = full_games(js.clone(), &candidate, s, o)?;
@@ -1502,7 +2402,11 @@ mod app {
     fn import_reference(j: &Json) -> Result<(Version, Version), String> {
         if !matches!(
             j.get("schema").str(),
-            "event-policy-iteration-v5" | "event-policy-iteration-v6" | SCHEMA
+            "event-policy-iteration-v5"
+                | "event-policy-iteration-v6"
+                | NORMALIZED_SCHEMA
+                | PREFIX_SCHEMA
+                | SCHEMA
         ) || j.get("policy_contract").str() != CONTRACT
         {
             return Err("init-from requires an accepted shared event policy checkpoint".into());
@@ -1603,6 +2507,7 @@ mod app {
                 report,
                 pairs: vec![],
                 comparisons: vec![],
+                sequence: None,
                 steps: 719,
                 branches: 0,
             },
@@ -1624,12 +2529,23 @@ mod app {
         let source = read(path)?;
         let mut policy = Policy::event_plans(-1, 0, o.lr)?;
         let s = State::restore(&source, &mut policy)?;
+        if s.menu_learning {
+            return Err("legacy intervention diagnostic does not support complete menus; use evaluate-checkpoint".into());
+        }
         let js = Arc::new(eval_jobs(
             o.eval_seed,
             o.eval_games,
             &roster(&s.accepted, &s.previous),
         ));
         std::fs::create_dir_all(&o.out).map_err(|e| e.to_string())?;
+        if o.batch_lifetime
+            .is_some_and(|mode| mode != s.target_batch_lifetime)
+        {
+            return Err(
+                "resume cannot change responsibility; use init-from after independent acceptance"
+                    .into(),
+            );
+        }
         write(
             &o.out.join("manifest.json"),
             &Json::Obj(vec![
@@ -1712,6 +2628,7 @@ mod app {
                                     report: Json::Null,
                                     pairs: vec![],
                                     comparisons: vec![],
+                                    sequence: None,
                                     steps: 0,
                                     branches: 0,
                                 };
@@ -1771,9 +2688,46 @@ mod app {
         println!("mechanism diagnostic complete; no training or promotion");
         Ok(())
     }
+    // Read-only compatibility does not convert old labels into active v8 replay.
+    fn diagnostic_state(j: &Json, p: &mut Policy) -> Result<State, String> {
+        if j.get("schema").str() == SCHEMA {
+            return State::restore(j, p);
+        }
+        if !matches!(j.get("schema").str(), NORMALIZED_SCHEMA | PREFIX_SCHEMA)
+            || j.get("policy_contract").str() != CONTRACT
+            || j.get("objective").str() != plan_compare::MATCH_SCORE_OBJECTIVE
+        {
+            return Err("diagnostic requires v7/v8 normalized checkpoint".into());
+        }
+        let (iteration, rng) = p.restore(j.get("model"))?;
+        if iteration != uint(j, "iteration")? || !p.event_input_scaling {
+            return Err("diagnostic model/iteration mismatch".into());
+        }
+        let (accepted, previous) = import_reference(j)?;
+        Ok(State {
+            iteration,
+            rng,
+            config: Config::parse(j.get("config"))?,
+            menu_learning: accepted.menu_anchor.is_some(),
+            target_batch_lifetime: accepted.batch_lifetime,
+            scope_confirmed: false,
+            accepted,
+            previous,
+            bank: EvidenceBank::default(),
+            pending: None,
+            next_seed: uint(j, "next_seed")?,
+            eval_seed: uint(j, "eval_seed")?,
+            next_eval_seed: uint(j, "next_eval_seed")?,
+            steps: uint(j, "training_steps")?,
+            base_games: uint(j, "base_games")?,
+            branches: uint(j, "branch_rollouts")?,
+            evaluation_games: uint(j, "evaluation_games")?,
+            monitor: j.get("deployed_vs_rule").clone(),
+        })
+    }
     fn diagnostic_candidate(s: &State, p: &Policy) -> Result<Version, String> {
         // Read the current learner explicitly, never a pending or accepted model.
-        s.accepted.propose(s.iteration, p.weights_json()?)
+        s.proposal(s.iteration, p.weights_json()?)
     }
     fn evaluate_checkpoint(o: &Options, path: &str) -> Result<(), String> {
         if o.out.exists()
@@ -1785,7 +2739,10 @@ mod app {
             return Err("diagnostic requires a new/empty output directory".into());
         }
         let mut p = Policy::event_plans(-1, 0, o.lr)?;
-        let s = State::restore(&read(path)?, &mut p)?;
+        let s = diagnostic_state(&read(path)?, &mut p)?;
+        if s.target_batch_lifetime {
+            return Err("revision ablation covers single scope only; use --evaluate-checkpoint for batch scope".into());
+        }
         if o.eval_seed < s.next_eval_seed {
             return Err(
                 "diagnostic seed must be beyond the checkpoint's used evaluation range".into(),
@@ -1878,12 +2835,42 @@ mod app {
             config = Config::parse(j.get("config"))?;
         }
         let mut imported = None;
-        if let Some(path) = &o.init {
+        let mut expansion_authorized = false;
+        let mut imported_eval_cursor = 0;
+        if let Some(path) = o.init.as_ref().or(o.warm_start.as_ref()) {
             let j = read(path)?;
             imported = Some(import_reference(&j)?);
+            expansion_authorized = j.get("schema").str() == SCHEMA
+                && matches!(j.get("scope_confirmed"), Json::Bool(true));
+            imported_eval_cursor = uint(&j, "next_eval_seed")?;
+            if o.warm_start.is_some() {
+                if j.get("schema").str() != SCHEMA
+                    || !matches!(j.get("menu_learning"), Json::Bool(true))
+                {
+                    return Err(
+                        "warm-start requires v9 menu weights; use init-from for older deployments"
+                            .into(),
+                    );
+                }
+                p.load_weights(j.get("model").get("weights"))?;
+                if !p.event_input_scaling {
+                    return Err("warm-start requires normalized weights".into());
+                }
+            } else if imported
+                .as_ref()
+                .is_some_and(|(v, _)| v.menu_anchor.is_some())
+            {
+                // Scope expansion starts from demonstrated choices, preserving the
+                // accepted normalized learner instead of randomizing its abilities.
+                let weights = j.get("deployment").get("weights");
+                p.load_weights(weights)?;
+                if !p.event_input_scaling {
+                    return Err("scope expansion needs normalized accepted weights".into());
+                }
+            }
             config = Config::parse(j.get("config"))?;
             next_seed = uint(&j, "next_seed")?.max(o.seed);
-            eprintln!("initialization: accepted deployment retains its original input encoding; fresh normalized proposal, Adam and evidence; source unchanged");
+            eprintln!("initialization: accepted deployment unchanged; proposal source explicit; fresh Adam, labels and confirmation; source unchanged");
         }
         let (initial, initial_previous) = match imported {
             Some(versions) => versions,
@@ -1892,11 +2879,28 @@ mod app {
                 (v.clone(), v)
             }
         };
+        let target_batch_lifetime = o.batch_lifetime.unwrap_or(initial.batch_lifetime);
+        if o.resume.is_none()
+            && target_batch_lifetime
+            && !initial.batch_lifetime
+            && !(expansion_authorized && o.init.is_some())
+        {
+            return Err("batch scope requires --init-from a v8 checkpoint whose deployed policy passed independent confirmation; first run the single stage".into());
+        }
+        if o.resume.is_none() && initial.batch_lifetime != target_batch_lifetime {
+            return Err("complete menus preserve accepted scope; scope expansion is not supported by this experiment".into());
+        }
+        if initial.batch_lifetime && !target_batch_lifetime {
+            return Err("cannot shrink accepted batch responsibility".into());
+        }
         let mut s = if let Some(path) = &o.resume {
             State::restore(&read(path)?, &mut p)?
         } else {
             State {
                 iteration: 0,
+                target_batch_lifetime,
+                menu_learning: true,
+                scope_confirmed: false,
                 rng: Rng(o.seed ^ 0x1acf789),
                 config,
                 accepted: initial.clone(),
@@ -1904,7 +2908,7 @@ mod app {
                 bank: EvidenceBank::default(),
                 next_seed,
                 eval_seed: o.eval_seed,
-                next_eval_seed: o.eval_seed + 1_000_000,
+                next_eval_seed: (o.eval_seed + 1_000_000).max(imported_eval_cursor),
                 steps: 0,
                 base_games: 0,
                 branches: 0,
@@ -1913,10 +2917,22 @@ mod app {
                 pending: None,
             }
         };
+        if o.batch_lifetime
+            .is_some_and(|mode| mode != s.target_batch_lifetime)
+        {
+            return Err(
+                "resume cannot change responsibility; use init-from after independent acceptance"
+                    .into(),
+            );
+        }
         write(
             &o.out.join("manifest.json"),
             &Json::Obj(vec![
                 ("schema".into(), Json::Str(SCHEMA.into())),
+                (
+                    "collection_contract".into(),
+                    Json::Str(COLLECTION_CONTRACT.into()),
+                ),
                 (
                     "learner_input_encoding".into(),
                     Json::Str(route_rl_native::learning::policy::EVENT_INPUT_ENCODING.into()),
@@ -1926,10 +2942,31 @@ mod app {
                     "objective".into(),
                     Json::Str(plan_compare::MATCH_SCORE_OBJECTIVE.into()),
                 ),
+                (
+                    "candidate_encoding".into(),
+                    Json::Str(route_rl_native::pipeline::plan_menu::ENCODING.into()),
+                ),
+                (
+                    "learning_unit".into(),
+                    Json::Str("complete_candidate_set".into()),
+                ),
+                ("max_menu_choices".into(), n(4.)),
                 ("iterations_additional".into(), n(o.iterations as f64)),
                 ("base_games_per_update".into(), n(o.games as f64)),
+                ("candidate_games_per_update".into(), n(o.games as f64)),
+                (
+                    "target_batch_lifetime".into(),
+                    Json::Bool(s.target_batch_lifetime),
+                ),
+                (
+                    "warm_start".into(),
+                    o.warm_start.clone().map(Json::Str).unwrap_or(Json::Null),
+                ),
                 ("branch_points".into(), n(o.points as f64)),
-                ("alternatives".into(), n(o.alternatives as f64)),
+                (
+                    "legacy_alternatives_unused".into(),
+                    n(o.alternatives as f64),
+                ),
                 ("branch_steps_per_game".into(), n(o.branch_steps as f64)),
                 ("max_branches_per_game".into(), n(o.max_branches as f64)),
                 ("epochs".into(), n(o.epochs as f64)),
@@ -1947,7 +2984,14 @@ mod app {
                     "continuation_refresh".into(),
                     Json::Str("ONLY after whole-policy promotion".into()),
                 ),
-                ("conditional_comparisons_per_game_max".into(), n(1.)),
+                (
+                    "candidate_prefix_comparisons_per_game_max".into(),
+                    n(o.points as f64),
+                ),
+                (
+                    "sequence_targets_used_for_local_learning".into(),
+                    Json::Bool(false),
+                ),
                 (
                     "replay_sampling".into(),
                     Json::Str("outcome_independent_reservoir_v1".into()),
@@ -1994,7 +3038,7 @@ mod app {
                 ("deployed_vs_rule".into(), s.monitor.clone()),
             ]),
         )?;
-        println!("event-policy-iteration-v7 accepted_revision={} fixed_continuation=true shared_network=true scope={:?} budget_per_game={}steps/{}branches",s.accepted.revision,s.accepted.scope,o.branch_steps,o.max_branches);
+        println!("event-policy-iteration-v9 accepted_revision={} fixed_continuation=true shared_network=true scope={:?} budget_per_game={}steps/{}branches",s.accepted.revision,s.accepted.scope,o.branch_steps,o.max_branches);
         for _ in 0..o.iterations {
             let started = Instant::now();
             let iteration = s.iteration + 1;
@@ -2016,10 +3060,28 @@ mod app {
             }
             s.next_seed += o.games as u64 / 2;
             let before = p.weights_json()?;
+            let candidate = s.proposal(iteration, before.clone())?;
+            let snapshot_dir = o.out.join("collection_sources");
+            std::fs::create_dir_all(&snapshot_dir).map_err(|e| e.to_string())?;
+            write(
+                &snapshot_dir.join(format!("collection_{iteration:06}.json")),
+                &Json::Obj(vec![
+                    (
+                        "collection_contract".into(),
+                        Json::Str(COLLECTION_CONTRACT.into()),
+                    ),
+                    ("iteration".into(), n(iteration as f64)),
+                    ("candidate_prefix_policy".into(), candidate.json()),
+                    ("local_continuation_policy".into(), s.accepted.json()),
+                    ("accepted_opponent".into(), s.accepted.json()),
+                    ("previous_opponent".into(), s.previous.json()),
+                    ("config".into(), s.config.json()),
+                ]),
+            )?;
             let gs = collect(
                 js,
                 &s.accepted,
-                Some(&before),
+                Some(&candidate),
                 &[s.accepted.clone(), s.previous.clone()],
                 &s.config,
                 o.workers,
@@ -2031,13 +3093,21 @@ mod app {
             let collect_seconds = started.elapsed().as_secs_f64();
             let pairs: Vec<_> = gs.iter().flat_map(|g| g.pairs.iter().cloned()).collect();
             for g in &gs {
+                if let Some(sequence) = &g.sequence {
+                    append(&o.out.join("sequences.jsonl"), sequence)?;
+                }
                 for c in &g.comparisons {
                     append(&o.out.join("comparisons.jsonl"), c)?;
                 }
             }
             let timer = Instant::now();
             let replay = s.bank.training(&mut s.rng);
-            let update = plan_compare::update_improvement(
+            let update_fn = if s.menu_learning {
+                route_rl_native::learning::event_sets::update
+            } else {
+                plan_compare::update_improvement
+            };
+            let update = update_fn(
                 &mut p,
                 &pairs,
                 &replay,
@@ -2053,7 +3123,7 @@ mod app {
             s.steps += steps;
             s.branches += branches;
             s.base_games += gs.len() as u64;
-            if steps > o.games as u64 * (719 + o.branch_steps) as u64
+            if steps > o.games as u64 * (1438 + o.branch_steps) as u64
                 || branches > o.games as u64 * o.max_branches as u64
             {
                 return Err("simulation budget exceeded".into());
@@ -2069,9 +3139,32 @@ mod app {
                 ("continuation_revision", n(s.accepted.revision as f64)),
                 (
                     "rollout_policy",
-                    Json::Str("fixed_accepted_complete_policy".into()),
+                    Json::Str("accepted_and_frozen_candidate_prefixes".into()),
                 ),
                 ("comparison_pairs", n(pairs.len() as f64)),
+                ("candidate_coverage", candidate_coverage(&gs)),
+                (
+                    "candidate_prefix_pairs",
+                    n(pairs
+                        .iter()
+                        .filter(|p| p.evidence.get("source").str() == "candidate_prefix")
+                        .count() as f64),
+                ),
+                (
+                    "candidate_revision_pairs",
+                    n(pairs
+                        .iter()
+                        .filter(|p| {
+                            p.evidence.get("source").str() == "candidate_prefix"
+                                && p.evidence.get("stage").str() == "revision"
+                        })
+                        .count() as f64),
+                ),
+                (
+                    "candidate_sequence_games",
+                    n(gs.iter().filter(|g| g.sequence.is_some()).count() as f64),
+                ),
+                ("target_batch_lifetime", Json::Bool(s.target_batch_lifetime)),
                 (
                     "decisive_pairs",
                     n(pairs.iter().filter(|p| p.gain > 0.).count() as f64),
@@ -2122,6 +3215,14 @@ mod app {
                 ("fresh_outcomes", outcome_summary(&pairs)?),
                 ("post_update_choices", selection_report(&p, &pairs)?),
                 (
+                    "complete_set_choices",
+                    if s.menu_learning {
+                        route_rl_native::learning::event_sets::metrics(&p, &pairs)?
+                    } else {
+                        Json::Null
+                    },
+                ),
+                (
                     "input_health",
                     p.input_diagnostics(&pairs.iter().map(|r| r.row.clone()).collect::<Vec<_>>())?,
                 ),
@@ -2133,6 +3234,7 @@ mod app {
             append(&o.out.join("metrics.jsonl"), &metric)?;
             println!("{}", metric.dump());
             if iteration % o.eval_every as u64 == 0 {
+                observe_latest(&o, &mut s, &p)?;
                 evaluate(&o, &mut s, &mut p)?;
                 write(
                     &o.out.join(format!("checkpoint_{iteration:06}.json")),
@@ -2150,6 +3252,9 @@ mod app {
             let accepted = Version::initial(Portfolio::empty(), vec![0, 1, 2, 3]).unwrap();
             State {
                 iteration: 0,
+                target_batch_lifetime: false,
+                menu_learning: false,
+                scope_confirmed: false,
                 rng: Rng(19),
                 config: Config::default(),
                 accepted: accepted.clone(),
@@ -2171,6 +3276,7 @@ mod app {
                 report: Json::Null,
                 pairs: vec![],
                 comparisons: vec![],
+                sequence: None,
                 steps: 0,
                 branches: 0,
             };
@@ -2215,6 +3321,65 @@ mod app {
             )
             .unwrap();
             g.pairs.remove(0)
+        }
+        #[test]
+        fn complete_menu_collection_is_atomic_replayable_and_covers_actual_argmax() {
+            tensor::worker_threads();
+            let mut s = state();
+            s.menu_learning = true;
+            let p = Policy::event_plans(-1, 19, 0.0003).unwrap();
+            let v = s.proposal(1, p.weights_json().unwrap()).unwrap();
+            let accepted = s.accepted.runtime(-1).unwrap();
+            let candidate = v.runtime(-1).unwrap();
+            let job = Job {
+                seed: 37,
+                seat: 0,
+                opponent: 0,
+                rng: 0,
+                slots: vec![0, 1],
+            };
+            let g = play_menu_training(
+                &job,
+                &accepted,
+                &candidate,
+                &p,
+                &[],
+                &s.config,
+                1,
+                0,
+                &s.accepted.scope,
+                4320,
+                8,
+            )
+            .unwrap();
+            assert!(!g.pairs.is_empty());
+            assert!(g.steps <= 1438 + 4320 && g.branches <= 8);
+            for pair in &g.pairs {
+                route_rl_native::learning::event_sets::validate(pair).unwrap();
+            }
+            let metrics = route_rl_native::learning::event_sets::metrics(&p, &g.pairs).unwrap();
+            assert_eq!(metrics.get("all").get("unsupported_argmax").i64(), 0);
+            s.bank.admit(&g.pairs);
+            assert_eq!(s.bank.seen, metrics.get("all").get("sets").i64() as u64);
+            let mut restored = Policy::event_plans(-1, 0, 0.0003).unwrap();
+            State::restore(&s.checkpoint(&p).unwrap(), &mut restored).unwrap();
+            let short = play_menu_training(
+                &job,
+                &accepted,
+                &candidate,
+                &p,
+                &[],
+                &s.config,
+                1,
+                0,
+                &s.accepted.scope,
+                1,
+                1,
+            )
+            .unwrap();
+            assert!(short.pairs.is_empty());
+            assert_eq!(short.branches, 0);
+            assert_eq!(short.steps, 1438);
         }
         #[test]
         fn diagnostic_uses_latest_learner_without_replacing_pending_or_accepted() {
@@ -2447,6 +3612,7 @@ mod app {
                         ]),
                         pairs: vec![],
                         comparisons: vec![],
+                        sequence: None,
                         steps: 719,
                         branches: 0,
                     })
@@ -2467,6 +3633,188 @@ mod app {
             let a = s.eval_seeds(8).unwrap();
             let b = s.eval_seeds(16).unwrap();
             assert_eq!(b, a + 4);
+        }
+        #[test]
+        fn candidate_prefixes_share_terminal_suffix_without_segment_labels() {
+            tensor::worker_threads();
+            let s = state();
+            let accepted = s.accepted.runtime(-1).unwrap();
+            let mut p = Policy::event_plans(-1, 2, 0.0003).unwrap();
+            // A test-only production preference exercises real follow-ups.
+            // A fresh zero residual head ties every event choice and Keeps;
+            // inventing a follow-up for that policy would test a false prefix.
+            for parameter in &mut p.parameters[..10] {
+                let mut data = vec![0.; parameter.shape.iter().product::<i64>() as usize];
+                match parameter.name {
+                    "candidate.0.weight" => {
+                        data[2] = 1.;
+                        data[1] = 0.1;
+                    }
+                    "score.0.weight" => data[0] = 1.,
+                    "score.2.weight" => data[0] = 5.,
+                    _ => {}
+                }
+                let value = tensor::Tensor::floats(&data, &parameter.shape, -1, false).unwrap();
+                parameter.value.copy_from(&value).unwrap();
+            }
+            let candidate = s
+                .proposal(1, p.weights_json().unwrap())
+                .unwrap()
+                .runtime(-1)
+                .unwrap();
+            let job = Job {
+                seed: 1201,
+                seat: 0,
+                opponent: 0,
+                rng: 7,
+                slots: vec![0, 1],
+            };
+            let (world, forks, _) = candidate_trajectory(
+                &job,
+                &candidate,
+                &p,
+                &[],
+                &s.config,
+                &s.accepted.scope,
+                "collection_000001",
+            )
+            .unwrap();
+            let deployed = play(
+                &job,
+                &candidate,
+                None,
+                &[],
+                &s.config,
+                1,
+                0,
+                &s.accepted.scope,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!(world.cash(0)[0], deployed.report.get("cash").f64());
+            assert_eq!(world.cash(0)[1], deployed.report.get("opponent_cash").f64());
+            let collected = play_training(
+                &job,
+                &accepted,
+                &candidate,
+                &p,
+                &[],
+                &s.config,
+                1,
+                0,
+                &s.accepted.scope,
+                2,
+                4320,
+                8,
+            )
+            .unwrap();
+            assert!(collected.steps <= 1438 + 4320);
+            assert!(collected.branches <= 8);
+            let sequence = collected.sequence.as_ref().unwrap();
+            assert_eq!(sequence.get("local_target"), &Json::Bool(false));
+            assert_eq!(sequence.get("promotion_evidence"), &Json::Bool(false));
+            assert_eq!(
+                sequence.get("candidate_outcome").get("cash"),
+                deployed.report.get("cash")
+            );
+            assert!(collected
+                .pairs
+                .iter()
+                .any(|p| p.evidence.get("source").str() == "accepted_trajectory"));
+            let local = collected
+                .pairs
+                .iter()
+                .find(|p| {
+                    p.evidence.get("source").str() == "candidate_prefix"
+                        && p.evidence.get("stage").str() == "revision"
+                })
+                .expect("actual candidate follow-up coverage");
+            assert!(local.evidence.get("production_candidate_count").i64() > 0);
+            assert_eq!(local.evidence.get("reference_index").i64(), 0);
+            assert_eq!(local.evidence.get("reference_terminal_step").i64(), 719);
+            assert_eq!(local.evidence.get("alternative_terminal_step").i64(), 719);
+            let f = forks
+                .iter()
+                .find(|f| f.prefix == local.evidence.get("prefix_id").str())
+                .unwrap();
+            let alt = local.evidence.get("alternative_index").i64() as usize;
+            let (reference, _) =
+                rollout_edit(f, 0, &job, &accepted, &[], None, &s.accepted.scope).unwrap();
+            let (alternative, _) =
+                rollout_edit(f, alt, &job, &accepted, &[], None, &s.accepted.scope).unwrap();
+            assert_eq!(
+                local.evidence.get("reference_cash"),
+                &Json::Arr(reference.cash(0).map(n).to_vec())
+            );
+            assert_eq!(
+                local.evidence.get("alternative_cash"),
+                &Json::Arr(alternative.cash(0).map(n).to_vec())
+            );
+            assert_eq!(
+                local.improvement_target().unwrap() as f64,
+                score(alternative.cash(0)) - score(reference.cash(0))
+            );
+            assert!(sequence
+                .get("same_prefix_segments")
+                .arr()
+                .iter()
+                .any(|s| !s.get("later_segment_events").arr().is_empty()));
+            assert_eq!(collected.comparisons.len(), collected.pairs.len());
+            let limited = play_training(
+                &job,
+                &accepted,
+                &candidate,
+                &p,
+                &[],
+                &s.config,
+                1,
+                0,
+                &s.accepted.scope,
+                1,
+                719,
+                1,
+            )
+            .unwrap();
+            assert!(limited
+                .pairs
+                .iter()
+                .all(|p| p.evidence.get("source").str() != "candidate_prefix"));
+            assert!(limited.steps <= 1438 + 719);
+            assert!(limited.branches <= 1);
+        }
+        #[test]
+        fn old_diagnostics_remain_read_only_and_contract_changes_invalidate_labels() {
+            tensor::worker_threads();
+            let mut s = state();
+            let p = Policy::event_plans(-1, 7, 0.0003).unwrap();
+            let mut j = s.checkpoint(&p).unwrap();
+            j.set_path("schema", Json::Str(NORMALIZED_SCHEMA.into()));
+            j.set_path("collection_contract", Json::Null);
+            j.set_path(
+                "comparison_bank",
+                Json::Str("diagnostic-only legacy data".into()),
+            );
+            let saved = j.clone();
+            let mut q = Policy::event_plans(-1, 0, 0.0003).unwrap();
+            assert!(State::restore(&j, &mut q).is_err());
+            assert!(diagnostic_state(&j, &mut q).is_ok());
+            assert_eq!(j, saved);
+            let mut old = pair("revision", 1);
+            old.evidence
+                .set_path("continuation_contract", Json::Str(BATCH_CONTRACT.into()));
+            s.bank.admit(&[old]);
+            assert!(State::restore(&s.checkpoint(&p).unwrap(), &mut q).is_err());
+            s.target_batch_lifetime = true;
+            let proposal = s.proposal(1, p.weights_json().unwrap()).unwrap();
+            assert!(proposal.batch_lifetime);
+            assert!(!s.accepted.batch_lifetime);
+            s.promote(proposal).unwrap();
+            assert!(s.scope_confirmed && s.accepted.batch_lifetime);
+            assert!(s.bank.history.is_empty());
+            let back = State::restore(&s.checkpoint(&p).unwrap(), &mut q).unwrap();
+            assert!(back.target_batch_lifetime && back.scope_confirmed);
         }
         #[test]
         fn budget_never_starts_a_branch_that_cannot_finish() {
@@ -2555,6 +3903,7 @@ mod app {
                 ]),
                 pairs: vec![],
                 comparisons: vec![],
+                sequence: None,
                 steps: 0,
                 branches: 0,
             }
