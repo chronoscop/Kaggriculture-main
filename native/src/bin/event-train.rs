@@ -14,8 +14,9 @@ mod app {
         },
         pipeline::{
             event_policy::{
-                Version, BATCH_CONTRACT, COLLECTION_CONTRACT, CONTRACT, MENU_BATCH_CONTRACT,
-                MENU_CONTRACT, NORMALIZED_SCHEMA, PREFIX_SCHEMA, SCHEMA,
+                Version, BATCH_CONTRACT, COLLECTION_CONTRACT, CONDITIONAL_CONTRACT, CONTRACT,
+                MENU_BATCH_CONTRACT, MENU_CONTRACT, MENU_SCHEMA, NORMALIZED_SCHEMA, PREFIX_SCHEMA,
+                SCHEMA,
             },
             event_portfolio::{Deployed, Portfolio, Runtime, SLOTS},
             executor::Observation,
@@ -115,8 +116,8 @@ mod app {
             };
             let args: Vec<_> = std::env::args().skip(1).collect();
             if args.iter().any(|s| s == "--help") {
-                println!("event-train --out NEW_DIR [--init-from accepted_event.json | --base-checkpoint v3_best.json | --resume v9_latest.json] --iterations 100 --games-per-update 16 --workers 7 --device cuda|cpu --branch-points 2 --alternatives 2 --branch-steps-per-game 4320 --max-branches-per-game 8 --epochs 8 --batch-size 64 --learning-rate 0.0003 --eval-every 5 --eval-games 8 --confirm-games 16\nOne shared network, fixed accepted continuation until promotion. Default scope unchanged: four seasonal harvest arrangements and one same-batch revision each. Outcome-independent replay. Independent confirmation progresses at the next scheduled evaluations, preserving the exact frozen candidate. iterations are additional; --warm-start v9_latest.json preserves normalized proposal weights but resets Adam, labels and confirmation. --init-from preserves deployment (and accepted normalized weights after v8 confirmation). --followup-scope single|batch: batch requires prior v8 independent acceptance; resume cannot change scope. Two base trajectories per training condition; local and same-prefix segment arms share accepted continuation; full candidate sequence outcomes never label individual choices.");
-                println!("v9 complete menus: 2–4 deterministic executable choices, all terminal arms compared atomically. Replay/batches use complete sets. Legacy init-from preserves accepted actions and starts a fresh menu learner. --alternatives is unused for complete menus; branch budgets still apply. Scope expansion is disabled. observations.jsonl reports the latest learner against fixed opponents/seeds; independent promotion never uses this panel.");
+                println!("event-train --out NEW_DIR [--init-from accepted_event.json | --base-checkpoint v3_best.json | --resume v10_latest.json] --iterations 100 --games-per-update 16 --workers 7 --device cuda|cpu --branch-points 2 --alternatives 2 --branch-steps-per-game 4320 --max-branches-per-game 8 --epochs 8 --batch-size 64 --learning-rate 0.0003 --eval-every 5 --eval-games 8 --confirm-games 16\nOne shared network, fixed accepted continuation until promotion. Four seasonal arrangement entries; legacy choices keep their single revision, new conditional choices retain ownership of that batch until conversion/expiry. Outcome-independent replay. Independent confirmation progresses at the next scheduled evaluations, preserving the exact frozen candidate. iterations are additional; --warm-start v10_latest.json preserves normalized proposal weights but resets Adam, labels and confirmation. --init-from preserves deployment (and accepted normalized weights after v8 confirmation). --followup-scope single|batch: batch requires prior v8 independent acceptance; resume cannot change scope. Two base trajectories per training condition; local and same-prefix segment arms share accepted continuation; full candidate sequence outcomes never label individual choices.");
+                println!("v10 conditional menus: 2–4 deterministic executable choices, all terminal arms compared atomically. Replay/batches use complete sets. Legacy init-from preserves accepted actions and starts a fresh menu learner. --alternatives is unused for complete menus; branch budgets still apply. Unrelated scopes remain frozen. observations.jsonl reports the latest learner against fixed opponents/seeds; independent promotion never uses this panel.");
                 println!("Read-only diagnostic: --evaluate-checkpoint v8_latest.json --out NEW_DIR --eval-games 64 --eval-seed NEW_SEED --workers 7 --device cpu. Evaluates the latest learner, ignores pending candidates, performs no training or promotion; eval-games counts both seats per opponent (64 = 32 seeds). ");
                 println!("Mechanism diagnostic: --diagnose-revisions v8_latest.json --out NEW_DIR --eval-games 8 --eval-seed SEED --workers 7 --device cpu. Compares accepted, new arrangements only, new revisions only, and both; tests changed revisions individually under accepted continuation. Maximum 16 games per opponent (8 seeds). Writes traces and comparisons only; never trains or promotes.");
                 std::process::exit(0);
@@ -953,9 +954,33 @@ mod app {
                 continue;
             }
             let mut outcomes = vec![];
+            let mut executions = vec![];
             for j in 0..arms {
                 let (end, _) = rollout_edit(f, j, job, accepted, opponents, None, scope)?;
                 outcomes.push(end.cash(job.seat));
+                let c = &end.own.controller;
+                let links: Vec<_> = c
+                    .batches
+                    .iter()
+                    .filter(|b| b.stage.conditional)
+                    .flat_map(|b| &b.stage.links)
+                    .map(|id| &c.progress[*id])
+                    .collect();
+                executions.push(Json::Obj(vec![
+                    ("conditional_sites".into(), n(links.len() as f64)),
+                    (
+                        "converted_sites".into(),
+                        n(links.iter().filter(|p| p.successor_started).count() as f64),
+                    ),
+                    (
+                        "yielded_sites".into(),
+                        n(links.iter().filter(|p| p.successor_yielded).count() as f64),
+                    ),
+                    (
+                        "expired_sites".into(),
+                        n(links.iter().filter(|p| p.failed && !p.superseded).count() as f64),
+                    ),
+                ]));
             }
             budget.branches += arms;
             budget.steps += arms * cost;
@@ -964,7 +989,9 @@ mod app {
                 (
                     "continuation_contract",
                     Json::Str(
-                        if accepted.menu_reference.is_some() {
+                        if accepted.conditional_plans {
+                            CONDITIONAL_CONTRACT
+                        } else if accepted.menu_reference.is_some() {
                             if accepted.batch_lifetime {
                                 MENU_BATCH_CONTRACT
                             } else {
@@ -979,6 +1006,29 @@ mod app {
                     ),
                 ),
                 ("candidate_set_id", Json::Str(f.prefix.clone())),
+                ("legal_candidate_count", n(arms as f64)),
+                (
+                    "production_candidate_count",
+                    n(f.choices
+                        .iter()
+                        .filter(|p| !p.keep && p.next.is_some())
+                        .count() as f64),
+                ),
+                (
+                    "conditional_candidate_count",
+                    n(f.choices
+                        .iter()
+                        .filter(|p| p.conditional && p.next.is_some())
+                        .count() as f64),
+                ),
+                (
+                    "delayed_candidate_count",
+                    n(f.choices
+                        .iter()
+                        .filter(|p| p.conditional && p.cycles == 2 && p.next.is_some())
+                        .count() as f64),
+                ),
+                ("all_conditional_execution", Json::Arr(executions)),
                 (
                     "candidate_encoding",
                     Json::Str(route_rl_native::pipeline::plan_menu::ENCODING.into()),
@@ -1002,7 +1052,9 @@ mod app {
                 (
                     "scope_contract",
                     Json::Str(
-                        if candidate.batch_lifetime {
+                        if candidate.conditional_plans {
+                            CONDITIONAL_CONTRACT
+                        } else if candidate.batch_lifetime {
                             MENU_BATCH_CONTRACT
                         } else {
                             MENU_CONTRACT
@@ -1043,6 +1095,10 @@ mod app {
             ("complete_sets".into(), Json::Arr(sets)),
             ("accepted_events".into(), n(af.len() as f64)),
             ("candidate_events".into(), n(cf.len() as f64)),
+            (
+                "candidate_revision_events".into(),
+                n(cf.iter().filter(|f| f.followup).count() as f64),
+            ),
             (
                 "collection_contract".into(),
                 Json::Str(COLLECTION_CONTRACT.into()),
@@ -1716,7 +1772,11 @@ mod app {
                     || p.evidence.get("collection_contract").str() != COLLECTION_CONTRACT
                     || !matches!(
                         p.evidence.get("continuation_contract").str(),
-                        CONTRACT | BATCH_CONTRACT | MENU_CONTRACT | MENU_BATCH_CONTRACT
+                        CONTRACT
+                            | BATCH_CONTRACT
+                            | MENU_CONTRACT
+                            | MENU_BATCH_CONTRACT
+                            | CONDITIONAL_CONTRACT
                     )
                     || p.evidence.get("source_snapshot").str().is_empty()
                     || p.evidence.get("learner_input_encoding").str()
@@ -1769,12 +1829,17 @@ mod app {
     /// Unique measured states, evaluated AFTER the update with the full legal
     /// candidate list. A new untested argmax is UNKNOWN, never counted a success.
     fn candidate_coverage(gs: &[Game]) -> Json {
+        let mut seen = std::collections::BTreeSet::new();
         let local: Vec<_> = gs
             .iter()
             .flat_map(|g| &g.pairs)
             .filter(|p| {
                 p.evidence.get("source").str() == "candidate_prefix"
                     && p.evidence.get("stage").str() == "revision"
+            })
+            .filter(|p| {
+                let id = p.evidence.get("candidate_set_id").str();
+                id.is_empty() || seen.insert(id.to_string())
             })
             .collect();
         let sizes: Vec<_> = local
@@ -1812,6 +1877,9 @@ mod app {
                 n(sequences
                     .iter()
                     .filter(|s| {
+                        if matches!(s.get("complete_sets"), Json::Arr(_)) {
+                            return s.get("candidate_revision_events").i64() == 0;
+                        }
                         !s.get("candidate_events")
                             .arr()
                             .iter()
@@ -2007,6 +2075,7 @@ mod app {
         fn proposal(&self, iteration: u64, weights: Json) -> Result<Version, String> {
             let mut candidate = self.accepted.propose(iteration, weights)?;
             candidate.batch_lifetime = self.target_batch_lifetime;
+            candidate.conditional_plans = self.menu_learning;
             if self.menu_learning && candidate.menu_anchor.is_none() {
                 candidate.menu_anchor = Some(Box::new(self.accepted.clone()));
             }
@@ -2077,7 +2146,7 @@ mod app {
                 || j.get("policy_contract").str() != CONTRACT
                 || j.get("objective").str() != plan_compare::MATCH_SCORE_OBJECTIVE
             {
-                return Err("--resume requires full event-policy-iteration-v9 checkpoint; use --init-from to preserve accepted deployment and invalidate old labels/Adam".into());
+                return Err("--resume requires full event-policy-iteration-v10 checkpoint; use --init-from to preserve accepted deployment and invalidate old labels/Adam".into());
             }
             if matches!(j.get("menu_learning"), Json::Bool(true))
                 && j.get("candidate_encoding").str()
@@ -2406,6 +2475,7 @@ mod app {
                 | "event-policy-iteration-v6"
                 | NORMALIZED_SCHEMA
                 | PREFIX_SCHEMA
+                | MENU_SCHEMA
                 | SCHEMA
         ) || j.get("policy_contract").str() != CONTRACT
         {
@@ -2514,6 +2584,195 @@ mod app {
             forks,
         ))
     }
+    /// Bounded read-only intervention study; never updates weights or deployment.
+    fn diagnose_menu(o: &Options, path: &str, s: &State, p: &Policy) -> Result<(), String> {
+        if o.eval_games > 8 {
+            return Err("menu mechanism audit capped at four paired seeds".into());
+        }
+        std::fs::create_dir_all(&o.out).map_err(|e| e.to_string())?;
+        let candidate = s.proposal(s.iteration, p.weights_json()?)?;
+        let jobs = Arc::new(eval_jobs(o.eval_seed, o.eval_games, &[1]));
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let mut threads = vec![];
+        write(
+            &o.out.join("manifest.json"),
+            &Json::Obj(vec![
+                ("source".into(), Json::Str(path.into())),
+                ("seed_start".into(), n(o.eval_seed as f64)),
+                ("games_per_variant".into(), n(o.eval_games as f64)),
+                ("diagnostic_only".into(), Json::Bool(true)),
+                ("opponent".into(), Json::Str("frozen accepted".into())),
+            ]),
+        )?;
+        for _ in 0..o
+            .workers
+            .min(jobs.len())
+            .min(route_rl_native::resources::available_workers())
+        {
+            let jobs = jobs.clone();
+            let ix = cursor.clone();
+            let version = s.accepted.clone();
+            let cand = candidate.clone();
+            let config = s.config.clone();
+            threads.push(std::thread::spawn(move || -> Result<Vec<Json>, String> {
+                tensor::worker_threads();
+                let accepted = version.runtime(-1)?;
+                let candidate = cand.runtime(-1)?;
+                let opponents = vec![version.runtime(-1)?];
+                let mut learner = Policy::event_plans(-1, 0, 0.0003)?;
+                learner.load_weights(cand.weights.as_ref().unwrap())?;
+                let mut out = vec![];
+                loop {
+                    let at = ix.fetch_add(1, Ordering::Relaxed);
+                    if at >= jobs.len() {
+                        break;
+                    }
+                    let job = &jobs[at];
+                    let mut variants = vec![];
+                    let mut singles = vec![];
+                    let mut menus = vec![];
+                    for mode in 0..4 {
+                        let mut world = World::new(job.seed, &config);
+                        let mut forks = vec![];
+                        let mut decisions = vec![];
+                        while world.game.step < 719 {
+                            let obs = Observation::from_state(&world.game, job.seat);
+                            let action = if let Some(mut d) = world.own.prepare(&obs, &candidate)? {
+                                if d.slot.is_some_and(|v| version.scope.contains(&v)) {
+                                    let proposed = d.selected;
+                                    let reference = if accepted.menu_reference.is_some() {
+                                        accepted.select(d.slot, &d.row)?
+                                    } else {
+                                        0
+                                    };
+                                    let selected = if mode == 3
+                                        || (mode == 1 && !d.followup)
+                                        || (mode == 2 && d.followup)
+                                    {
+                                        proposed
+                                    } else {
+                                        reference
+                                    };
+                                    if mode == 0 && proposed != reference {
+                                        d.selected = reference;
+                                        forks.push(snapshot(
+                                            &world,
+                                            &d,
+                                            &learner,
+                                            format!("{}:{}:{}", job.seed, job.seat, obs.step),
+                                        )?);
+                                    }
+                                    if mode == 0 {
+                                        let event = world.own.last_event.as_ref().unwrap();
+                                        let raw = route_rl_native::pipeline::plan_events::choices(
+                                            &world.own.controller,
+                                            &obs,
+                                            event,
+                                        );
+                                        menus.push(Json::Obj(vec![
+                                            ("step".into(), n(obs.step as f64)),
+                                            ("followup".into(), Json::Bool(d.followup)),
+                                            (
+                                                "raw_cycles2".into(),
+                                                n(raw
+                                                    .iter()
+                                                    .filter(|c| !c.keep && c.cycles == 2)
+                                                    .count()
+                                                    as f64),
+                                            ),
+                                            (
+                                                "menu_cycles2".into(),
+                                                n(d.choices
+                                                    .iter()
+                                                    .filter(|c| !c.keep && c.cycles == 2)
+                                                    .count()
+                                                    as f64),
+                                            ),
+                                        ]));
+                                    }
+                                    decisions.push(Json::Obj(vec![
+                                        ("step".into(), n(obs.step as f64)),
+                                        ("followup".into(), Json::Bool(d.followup)),
+                                        ("reference".into(), d.choices[reference].json()),
+                                        ("selected".into(), d.choices[selected].json()),
+                                        ("proposal_index".into(), n(proposed as f64)),
+                                        ("selected_index".into(), n(selected as f64)),
+                                    ]));
+                                    d.selected = selected;
+                                }
+                                world.own.execute_choice(
+                                    &obs,
+                                    d.choices.swap_remove(d.selected),
+                                    &candidate,
+                                )?
+                            } else {
+                                world.own.continue_action(&obs, &candidate)?
+                            };
+                            world.advance(job, action, &opponents)?;
+                        }
+                        world
+                            .own
+                            .controller
+                            .observe(&Observation::from_state(&world.game, job.seat));
+                        let base = world.cash(job.seat);
+                        let mut report = world.result(job);
+                        report.set_path("mode", n(mode as f64));
+                        report.set_path("decisions", Json::Arr(decisions));
+                        variants.push(report);
+                        for f in forks {
+                            let (end, _) = rollout_edit(
+                                &f,
+                                f.proposed,
+                                job,
+                                &accepted,
+                                &opponents,
+                                None,
+                                &version.scope,
+                            )?;
+                            singles.push(Json::Obj(vec![
+                                ("step".into(), n(f.row.step as f64)),
+                                ("followup".into(), Json::Bool(f.followup)),
+                                ("choice".into(), f.choices[f.proposed].json()),
+                                ("reference_cash".into(), Json::Arr(base.map(n).to_vec())),
+                                (
+                                    "changed_cash".into(),
+                                    Json::Arr(end.cash(job.seat).map(n).to_vec()),
+                                ),
+                                (
+                                    "score_gain".into(),
+                                    n(score(end.cash(job.seat)) - score(base)),
+                                ),
+                            ]));
+                        }
+                    }
+                    out.push(Json::Obj(vec![
+                        ("seed".into(), n(job.seed as f64)),
+                        ("seat".into(), n(job.seat as f64)),
+                        ("variants".into(), Json::Arr(variants)),
+                        ("single_edits".into(), Json::Arr(singles)),
+                        ("menus".into(), Json::Arr(menus)),
+                    ]));
+                }
+                Ok(out)
+            }));
+        }
+        let mut error = None;
+        for t in threads {
+            match t.join() {
+                Ok(Ok(rs)) => {
+                    for r in rs {
+                        append(&o.out.join("mechanism.jsonl"), &r)?;
+                    }
+                }
+                Ok(Err(e)) => error = Some(e),
+                Err(_) => error = Some("diagnostic worker panicked".into()),
+            }
+        }
+        if let Some(e) = error {
+            return Err(e);
+        }
+        Ok(())
+    }
     fn diagnose_revisions(o: &Options, path: &str) -> Result<(), String> {
         if o.out.exists()
             && std::fs::read_dir(&o.out)
@@ -2530,7 +2789,7 @@ mod app {
         let mut policy = Policy::event_plans(-1, 0, o.lr)?;
         let s = State::restore(&source, &mut policy)?;
         if s.menu_learning {
-            return Err("legacy intervention diagnostic does not support complete menus; use evaluate-checkpoint".into());
+            return diagnose_menu(o, path, &s, &policy);
         }
         let js = Arc::new(eval_jobs(
             o.eval_seed,
@@ -2840,6 +3099,12 @@ mod app {
         if let Some(path) = o.init.as_ref().or(o.warm_start.as_ref()) {
             let j = read(path)?;
             imported = Some(import_reference(&j)?);
+            if imported
+                .as_ref()
+                .is_some_and(|(v, _)| v.menu_anchor.is_some() && !v.conditional_plans)
+            {
+                return Err("v9 accepted menu weights retain their old contract; initialize this experiment from a legacy accepted checkpoint, or use the original binary to deploy v9".into());
+            }
             expansion_authorized = j.get("schema").str() == SCHEMA
                 && matches!(j.get("scope_confirmed"), Json::Bool(true));
             imported_eval_cursor = uint(&j, "next_eval_seed")?;
@@ -2848,7 +3113,7 @@ mod app {
                     || !matches!(j.get("menu_learning"), Json::Bool(true))
                 {
                     return Err(
-                        "warm-start requires v9 menu weights; use init-from for older deployments"
+                        "warm-start requires v10 conditional menu weights; use init-from for older deployments"
                             .into(),
                     );
                 }
@@ -3038,7 +3303,7 @@ mod app {
                 ("deployed_vs_rule".into(), s.monitor.clone()),
             ]),
         )?;
-        println!("event-policy-iteration-v9 accepted_revision={} fixed_continuation=true shared_network=true scope={:?} budget_per_game={}steps/{}branches",s.accepted.revision,s.accepted.scope,o.branch_steps,o.max_branches);
+        println!("event-policy-iteration-v10 accepted_revision={} fixed_continuation=true shared_network=true scope={:?} budget_per_game={}steps/{}branches",s.accepted.revision,s.accepted.scope,o.branch_steps,o.max_branches);
         for _ in 0..o.iterations {
             let started = Instant::now();
             let iteration = s.iteration + 1;
@@ -3288,6 +3553,7 @@ mod app {
                     lead: 24,
                     floor: 0.,
                     keep: i == 0,
+                    conditional: false,
                     features: vec![i as f32; 32],
                 })
                 .collect();
@@ -3356,6 +3622,17 @@ mod app {
             assert!(g.steps <= 1438 + 4320 && g.branches <= 8);
             for pair in &g.pairs {
                 route_rl_native::learning::event_sets::validate(pair).unwrap();
+                let e = &pair.evidence;
+                assert_eq!(
+                    e.get("legal_candidate_count").i64() as usize,
+                    e.get("candidate_plans").arr().len()
+                );
+                assert_eq!(
+                    e.get("all_conditional_execution").arr().len(),
+                    e.get("candidate_plans").arr().len()
+                );
+                assert_eq!(e.get("scope_contract").str(), CONDITIONAL_CONTRACT);
+                assert!(e.get("production_candidate_count").i64() > 0);
             }
             let metrics = route_rl_native::learning::event_sets::metrics(&p, &g.pairs).unwrap();
             assert_eq!(metrics.get("all").get("unsupported_argmax").i64(), 0);

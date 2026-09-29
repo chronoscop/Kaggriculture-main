@@ -2,7 +2,9 @@
 //! immutable; one shared network replaces the declared event scope as a whole.
 use super::event_portfolio::{Portfolio, Runtime, SLOTS};
 use kagg_engine::json::Json;
-pub const SCHEMA: &str = "event-policy-iteration-v9";
+pub const SCHEMA: &str = "event-policy-iteration-v10";
+pub const MENU_SCHEMA: &str = "event-policy-iteration-v9";
+pub const CONDITIONAL_CONTRACT: &str = "event-conditional-batch-menu-v1";
 pub const PREFIX_SCHEMA: &str = "event-policy-iteration-v8";
 pub const MENU_CONTRACT: &str = "event-complete-menu-single-v1";
 pub const MENU_BATCH_CONTRACT: &str = "event-complete-menu-batch-v1";
@@ -11,7 +13,7 @@ pub const EVIDENCE_SCHEMA: &str = "event-policy-iteration-v6";
 pub const LEGACY_SCHEMA: &str = "event-policy-iteration-v5";
 pub const CONTRACT: &str = "event-shared-policy-season-scope-v5";
 pub const BATCH_CONTRACT: &str = "event-shared-policy-batch-lineage-v8";
-pub const COLLECTION_CONTRACT: &str = "complete-executable-menu-v1";
+pub const COLLECTION_CONTRACT: &str = "complete-conditional-menu-v2";
 #[derive(Clone, Debug, PartialEq)]
 pub struct Version {
     pub revision: u64,
@@ -20,6 +22,7 @@ pub struct Version {
     pub scope: Vec<usize>,
     pub weights: Option<Json>,
     pub batch_lifetime: bool,
+    pub conditional_plans: bool,
     pub menu_anchor: Option<Box<Version>>,
 }
 impl Version {
@@ -37,6 +40,7 @@ impl Version {
             scope,
             weights: None,
             batch_lifetime: false,
+            conditional_plans: false,
             menu_anchor: None,
         })
     }
@@ -55,6 +59,7 @@ impl Version {
             || next.foundation != self.foundation
             || next.scope != self.scope
             || next.weights.is_none()
+            || (self.conditional_plans && !next.conditional_plans)
             || (self.batch_lifetime && !next.batch_lifetime)
             || (self.menu_anchor.is_some() && self.menu_anchor != next.menu_anchor)
             || (self.menu_anchor.is_none()
@@ -71,6 +76,7 @@ impl Version {
         let mut runtime =
             Runtime::unified(&self.foundation, &self.scope, self.weights.as_ref(), device)?;
         runtime.batch_lifetime = self.batch_lifetime;
+        runtime.conditional_plans = self.conditional_plans;
         runtime.menu_reference = self
             .menu_anchor
             .as_ref()
@@ -79,7 +85,9 @@ impl Version {
         Ok(runtime)
     }
     pub fn contract(&self) -> &'static str {
-        if self.menu_anchor.is_some() {
+        if self.conditional_plans {
+            CONDITIONAL_CONTRACT
+        } else if self.menu_anchor.is_some() {
             if self.batch_lifetime {
                 MENU_BATCH_CONTRACT
             } else {
@@ -94,6 +102,7 @@ impl Version {
     pub fn json(&self) -> Json {
         Json::Obj(vec![
             ("contract".into(), Json::Str(self.contract().into())),
+            ("batch_lifetime".into(), Json::Bool(self.batch_lifetime)),
             ("revision".into(), Json::Str(self.revision.to_string())),
             ("iteration".into(), Json::Str(self.iteration.to_string())),
             ("foundation".into(), self.foundation.json()),
@@ -114,7 +123,7 @@ impl Version {
     pub fn parse(j: &Json) -> Result<Self, String> {
         if !matches!(
             j.get("contract").str(),
-            CONTRACT | BATCH_CONTRACT | MENU_CONTRACT | MENU_BATCH_CONTRACT
+            CONTRACT | BATCH_CONTRACT | MENU_CONTRACT | MENU_BATCH_CONTRACT | CONDITIONAL_CONTRACT
         ) {
             return Err("wrong stable event contract".into());
         }
@@ -127,7 +136,10 @@ impl Version {
         validate_scope(&scope)?;
         let foundation = Portfolio::parse(j.get("foundation"))?;
         Self::initial(foundation.clone(), scope.clone())?;
-        let menu_contract = matches!(j.get("contract").str(), MENU_CONTRACT | MENU_BATCH_CONTRACT);
+        let menu_contract = matches!(
+            j.get("contract").str(),
+            MENU_CONTRACT | MENU_BATCH_CONTRACT | CONDITIONAL_CONTRACT
+        );
         let menu_anchor = if menu_contract {
             let a = j.get("menu_anchor");
             if !matches!(a.get("contract").str(), CONTRACT | BATCH_CONTRACT) {
@@ -146,6 +158,7 @@ impl Version {
         };
         let v = Self {
             menu_anchor,
+            conditional_plans: j.get("contract").str() == CONDITIONAL_CONTRACT,
             revision: j
                 .get("revision")
                 .str()
@@ -161,7 +174,8 @@ impl Version {
             batch_lifetime: matches!(
                 j.get("contract").str(),
                 BATCH_CONTRACT | MENU_BATCH_CONTRACT
-            ),
+            ) || (j.get("contract").str() == CONDITIONAL_CONTRACT
+                && matches!(j.get("batch_lifetime"), Json::Bool(true))),
             weights: match j.get("weights") {
                 Json::Null => None,
                 w => Some(w.clone()),
@@ -201,11 +215,16 @@ mod tests {
     };
     #[test]
     fn complete_menu_zero_head_preserves_legacy_actions_and_frozen_anchor() {
+        zero_head(false);
+        zero_head(true);
+    }
+    fn zero_head(conditional: bool) {
         tensor::worker_threads();
         let base = Version::initial(Portfolio::empty(), vec![0, 1, 2, 3]).unwrap();
         let p = Policy::event_plans(-1, 17, 0.0003).unwrap();
         let mut menu = base.propose(1, p.weights_json().unwrap()).unwrap();
         menu.menu_anchor = Some(Box::new(base.clone()));
+        menu.conditional_plans = conditional;
         base.validate_successor(&menu).unwrap();
         assert_eq!(Version::parse(&menu.json()).unwrap(), menu);
         let old = base.runtime(-1).unwrap();

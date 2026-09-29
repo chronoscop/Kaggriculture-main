@@ -259,7 +259,9 @@ impl Tracker {
                 .iter()
                 .filter(|n| ids.contains(&n.id))
                 .collect();
-            let material = needs.iter().all(|n| n.stocked);
+            let material = needs
+                .iter()
+                .all(|n| n.stocked && (!n.conditional || n.feed_stocked));
             let affordable = ledger.can_fund(&ids, o.farm.money, o.step);
             let blocked =
                 needs.iter().any(|n| o.step > n.service_due) || ledger.work_due > ledger.free_work;
@@ -280,6 +282,7 @@ impl Tracker {
                 } else if affordable && !a {
                     Some(EventKind::Funding)
                 } else if (blocked && !bl)
+                    || (needs.iter().any(|n| n.conditional) && blocked != bl)
                     || (price - anchor).abs() as f64 > (anchor.abs() as f64 * 0.15).max(5.)
                 {
                     Some(EventKind::Review)
@@ -418,12 +421,15 @@ pub struct Choice {
     pub lead: i64,
     pub floor: f64,
     pub keep: bool,
+    /// Preserve current production until observed funding, stock and work permit conversion.
+    pub conditional: bool,
     pub features: Vec<f32>,
 }
 impl Choice {
     pub fn json(&self) -> Json {
         Json::Obj(vec![
             ("keep".into(), Json::Bool(self.keep)),
+            ("conditional".into(), Json::Bool(self.conditional)),
             (
                 "sites".into(),
                 Json::Arr(
@@ -447,13 +453,14 @@ impl Choice {
     }
     pub fn apply(&self, c: &mut Controller, o: &Observation) -> Result<(), String> {
         if !self.keep {
-            c.revise_batch(
+            c.revise_batch_mode(
                 o,
                 &self.sites,
                 self.next.clone(),
                 self.cycles,
                 self.lead,
                 self.floor,
+                self.conditional,
             )?;
         }
         Ok(())
@@ -518,6 +525,9 @@ fn features(c: &Controller, o: &Observation, e: &Event, p: &Choice, s: &Schedule
     f
 }
 pub fn choices(c: &Controller, o: &Observation, e: &Event) -> Vec<Choice> {
+    choices_mode(c, o, e, false)
+}
+pub fn choices_mode(c: &Controller, o: &Observation, e: &Event, conditional: bool) -> Vec<Choice> {
     let ledger = Schedule::build(c, o);
     let mut out = vec![Choice {
         sites: vec![],
@@ -526,6 +536,7 @@ pub fn choices(c: &Controller, o: &Observation, e: &Event) -> Vec<Choice> {
         lead: 0,
         floor: 0.,
         keep: true,
+        conditional: false,
         features: vec![],
     }];
     for kind in kinds() {
@@ -551,6 +562,7 @@ pub fn choices(c: &Controller, o: &Observation, e: &Event) -> Vec<Choice> {
                     lead,
                     floor: c.agent.config.cash_reserve + extra_reserve,
                     keep: false,
+                    conditional,
                     features: vec![],
                 };
                 let extra = p
@@ -571,7 +583,7 @@ pub fn choices(c: &Controller, o: &Observation, e: &Event) -> Vec<Choice> {
                     .filter(|n| p.sites.contains(&n.site) && n.ready - n.lead <= o.step)
                     .map(|n| n.work)
                     .sum::<f64>();
-                if ledger.work_due - released + extra <= ledger.free_work {
+                if conditional || ledger.work_due - released + extra <= ledger.free_work {
                     out.push(p);
                 }
             }
@@ -585,6 +597,7 @@ pub fn choices(c: &Controller, o: &Observation, e: &Event) -> Vec<Choice> {
             lead: 0,
             floor: 0.,
             keep: false,
+            conditional,
             features: vec![],
         });
     }

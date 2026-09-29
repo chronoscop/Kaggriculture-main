@@ -174,6 +174,7 @@ impl Portfolio {
     }
 }
 pub struct Runtime {
+    pub conditional_plans: bool,
     pub menu_reference: Option<Box<Runtime>>,
     pub batch_lifetime: bool,
     pub foundation: legacy::Runtime,
@@ -201,12 +202,19 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(|(scope, _)| scope.contains(&slot))
             {
-                let index = if followup {
-                    anchor.select_followup(slot, &row)?
+                let index =
+                    if self.conditional_plans && e.batch.is_some_and(|b| c.conditional_batch(b)) {
+                        0
+                    } else if followup {
+                        anchor.select_followup(slot, &row)?
+                    } else {
+                        anchor.select(Some(slot), &row)?
+                    };
+                let choices = if self.conditional_plans {
+                    super::plan_menu::build_conditional(c, o, e, &raw, index)?
                 } else {
-                    anchor.select(Some(slot), &row)?
+                    super::plan_menu::build(c, o, e, &raw, index)?
                 };
-                let choices = super::plan_menu::build(c, o, e, &raw, index)?;
                 row.features = choices.iter().map(|v| v.features.clone()).collect();
                 super::plan_menu::annotate_context(&mut row, o);
                 return Ok((choices, row));
@@ -255,6 +263,7 @@ impl Runtime {
     pub fn load(p: &Portfolio, device: i32) -> Result<Self, String> {
         let followup_portfolio = p.followups();
         Ok(Self {
+            conditional_plans: false,
             menu_reference: None,
             batch_lifetime: false,
             foundation: legacy::Runtime::load(&p.foundation, device)?,
@@ -375,7 +384,9 @@ impl Deployed {
         // A later real event for the same batch is handled before ordinary
         // scopes, so collection and deployment consume the identical event.
         for (&(slot, batch), token) in &self.followups {
-            if !p.has_followup(slot) {
+            if !p.has_followup(slot)
+                || (!p.conditional_plans && self.controller.conditional_batch(batch))
+            {
                 continue;
             }
             let Some(event) =
@@ -445,17 +456,24 @@ impl Deployed {
             self.tracker.refresh_after_edit(&self.controller, o);
         }
         if let Some(slot) = self.last_slot.take() {
-            if self.last_followup && p.batch_lifetime && p.has_followup(slot) {
+            let conditional = choice.conditional
+                || self
+                    .last_event
+                    .as_ref()
+                    .and_then(|e| e.batch)
+                    .is_some_and(|b| self.controller.conditional_batch(b));
+            let lifetime = p.batch_lifetime || conditional;
+            if self.last_followup && lifetime && p.has_followup(slot) {
                 // A partial edit splits ownership: retain the untouched suffix
                 // and its replacement, never acquiring an unrelated batch.
                 if let Some(batch) = self.last_event.as_ref().and_then(|e| e.batch) {
-                    self.arm_owned_followup(slot, batch, o.step, p.batch_lifetime);
+                    self.arm_owned_followup(slot, batch, o.step, lifetime);
                 }
                 if !choice.keep
                     && choice.next.is_some()
                     && self.controller.batches.len() > previous_batches
                 {
-                    self.arm_owned_followup(slot, previous_batches, o.step, p.batch_lifetime);
+                    self.arm_owned_followup(slot, previous_batches, o.step, lifetime);
                 }
             } else if !self.last_followup
                 && p.has_followup(slot)
@@ -463,7 +481,7 @@ impl Deployed {
                 && !choice.keep
                 && self.controller.batches.len() > previous_batches
             {
-                self.arm_owned_followup(slot, previous_batches, o.step, p.batch_lifetime);
+                self.arm_owned_followup(slot, previous_batches, o.step, lifetime);
             }
         }
         self.continue_action(o, p)
@@ -679,6 +697,68 @@ mod tests {
         };
         assert_eq!(runtime.select(Some(2), &row).unwrap(), 0);
         assert!(runtime.override_followup(SLOTS, &follower).is_err());
+    }
+    #[test]
+    fn conditional_batch_revisits_real_edges_but_frozen_legacy_preserves_it() {
+        use super::super::{event_policy::Version, executor::Production};
+        tensor::worker_threads();
+        let base = Version::initial(Portfolio::empty(), vec![0, 1, 2, 3]).unwrap();
+        let learner = Policy::event_plans(-1, 17, 0.0003).unwrap();
+        let mut v = base.propose(1, learner.weights_json().unwrap()).unwrap();
+        v.conditional_plans = true;
+        v.menu_anchor = Some(Box::new(base.clone()));
+        let runtime = v.runtime(-1).unwrap();
+        let legacy = base.runtime(-1).unwrap();
+        let (mut state, mut c) = super::super::plan_resources::tests::fixture(73);
+        state.farms[0].money = 0.;
+        let obs = Observation::from_state(&state, 0);
+        let batch = c
+            .revise_batch_mode(
+                &obs,
+                &[(2, 4), (3, 4)],
+                Some(Production::Animal("SHEEP".into())),
+                1,
+                24,
+                180.,
+                true,
+            )
+            .unwrap();
+        let mut a = Deployed::new(Config::default());
+        a.controller = c;
+        a.tracker.observe(&a.controller, &obs);
+        a.arm_owned_followup(0, batch, 73, true);
+        state.step = 74;
+        state.farms[0].money = 2000.;
+        let obs = Observation::from_state(&state, 0);
+        let mut frozen = a.clone();
+        assert!(frozen
+            .prepare(&obs, &legacy)
+            .unwrap()
+            .is_none_or(|d| !d.followup));
+        assert!(frozen.followups.contains_key(&(0, batch)));
+        let decision = a.prepare(&obs, &runtime).unwrap().expect("funding edge");
+        assert!(decision.followup && decision.choices[0].keep);
+        a.execute_choice(&obs, decision.choices[0].clone(), &runtime)
+            .unwrap();
+        assert!(
+            a.followups.contains_key(&(0, batch)),
+            "Keep must preserve conditional ownership"
+        );
+        assert!(a
+            .prepare(&obs, &runtime)
+            .unwrap()
+            .is_none_or(|d| !d.followup));
+        a.controller.agent.executor.routes.clear();
+        state.step = 75;
+        state.private[0].shed.add("SHEEP", 2);
+        state.private[0].shed.add("WHEAT", 4);
+        let next = Observation::from_state(&state, 0);
+        let d = a
+            .prepare(&next, &runtime)
+            .unwrap()
+            .expect("confirmed material edge");
+        assert!(d.followup);
+        assert_eq!(a.last_event.as_ref().unwrap().batch, Some(batch));
     }
     #[test]
     fn batch_responsibility_rearms_keep_and_tracks_partial_suffixes() {

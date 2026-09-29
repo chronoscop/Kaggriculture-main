@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Stage {
+    pub conditional: bool,
     pub links: Vec<usize>,
     pub lead_steps: i64,
     pub cash_floor: f64,
@@ -25,6 +26,7 @@ impl BatchPlan {
     pub fn json(&self, c: &Controller) -> Json {
         Json::Obj(vec![
             ("id".into(), Json::Num(self.id as f64)),
+            ("conditional".into(), Json::Bool(self.stage.conditional)),
             ("revision".into(), Json::Num(self.revision as f64)),
             ("lead_steps".into(), Json::Num(self.stage.lead_steps as f64)),
             ("cash_floor".into(), Json::Num(self.stage.cash_floor)),
@@ -45,6 +47,9 @@ impl BatchPlan {
 }
 #[derive(Clone, Debug)]
 pub struct Need {
+    pub conditional: bool,
+    pub feed_stocked: bool,
+    pub cash_floor: f64,
     pub id: usize,
     pub site: Pos,
     pub production: Production,
@@ -66,6 +71,8 @@ pub struct Schedule {
     pub work_due: f64,
     pub free_work: f64,
     pub feed_keep: i64,
+    pub conditional_feed: i64,
+    pub feed_cash: f64,
     pub outstanding_units: i64,
 }
 pub fn production_cost(p: &Production) -> f64 {
@@ -271,6 +278,9 @@ impl Schedule {
                 5.
             };
             out.needs.push(Need {
+                conditional: meta.is_some_and(|b| b.stage.conditional),
+                feed_stocked: true,
+                cash_floor: floor,
                 id,
                 site: p.link.site,
                 production: p.link.next.clone(),
@@ -285,7 +295,35 @@ impl Schedule {
         }
         out.needs
             .sort_by_key(|n| (n.ready - n.lead, n.deadline, n.id));
+        // Feed for a pending conditional animal has its own reservation. Existing
+        // animals and route pickups own their stock first; no future harvest is stock.
+        let conditional_feed = out
+            .needs
+            .iter()
+            .filter(|n| {
+                n.conditional
+                    && matches!(n.production, Production::Animal(_))
+                    && o.step >= n.ready - n.lead
+                    && o.step <= n.deadline
+            })
+            .count() as i64
+            * 2;
+        if conditional_feed > 0 {
+            out.conditional_feed = conditional_feed;
+            out.feed_keep += conditional_feed;
+            let missing =
+                (out.feed_keep + shed_claims.get("WHEAT") - o.private.shed.get("WHEAT")).max(0);
+            out.feed_cash =
+                -super::trading::quote("WHEAT", o.market.inventory.get("WHEAT") - 10, -missing).0;
+            out.cash_floor = floor + out.feed_cash;
+        }
+        let mut free_feed =
+            (o.private.shed.get("WHEAT") - shed_claims.get("WHEAT") - animals * 2).max(0);
         for n in &mut out.needs {
+            if n.conditional && matches!(n.production, Production::Animal(_)) {
+                n.feed_stocked = free_feed >= 2;
+                free_feed = (free_feed - 2).max(0);
+            }
             let pool = if matches!(n.production, Production::Crop(_)) {
                 &mut seed
             } else {
@@ -318,6 +356,9 @@ impl Schedule {
         for n in &self.needs {
             let target = ids.contains(&n.id);
             found |= target;
+            if target && n.conditional && money < self.cash_floor {
+                affordable = false;
+            }
             if n.stocked {
                 continue;
             }
@@ -350,6 +391,32 @@ impl Schedule {
             }
         }
         let mut buys: BTreeMap<(String, String), i64> = BTreeMap::new();
+        let mut feed_order = vec![];
+        if self.conditional_feed > 0 && already.len() < 6 {
+            let bought = already
+                .iter()
+                .filter(|a| a.len() > 2 && a[0] == "BUY_PRODUCT" && a[1] == "WHEAT")
+                .map(|a| a[2].parse::<i64>().unwrap_or(0))
+                .sum::<i64>();
+            let target = (self.feed_keep - o.private.shed.get("WHEAT") - bought)
+                .max(0)
+                .min(room)
+                .min((o.market.inventory.get("WHEAT") - 10).max(0));
+            let available = (o.farm.money
+                - (self.cash_floor - self.feed_cash)
+                - super::plan_chain::order_cost(o, already))
+            .max(0.)
+            .min(self.feed_cash);
+            for q in (1..=target).rev() {
+                let cost =
+                    -super::trading::quote("WHEAT", o.market.inventory.get("WHEAT") - 10, -q).0;
+                if cost <= available {
+                    feed_order.push(vec!["BUY_PRODUCT".into(), "WHEAT".into(), q.to_string()]);
+                    room -= q;
+                    break;
+                }
+            }
+        }
         for need in &self.needs {
             if need.stocked || o.step < need.ready - need.lead || o.step > need.deadline {
                 continue;
@@ -368,7 +435,7 @@ impl Schedule {
             }
             let op = if animal { "BUY_ANIMAL" } else { "BUY_SEED" };
             let key = (op.into(), need.production.name().into());
-            if !buys.contains_key(&key) && buys.len() + already.len() >= 6 {
+            if !buys.contains_key(&key) && buys.len() + already.len() + feed_order.len() >= 6 {
                 continue;
             }
             *buys.entry(key).or_default() += 1;
@@ -377,9 +444,11 @@ impl Schedule {
                 room -= 1;
             }
         }
-        buys.into_iter()
-            .map(|((op, k), n)| vec![op, k, n.to_string()])
-            .collect()
+        feed_order.extend(
+            buys.into_iter()
+                .map(|((op, k), n)| vec![op, k, n.to_string()]),
+        );
+        feed_order
     }
     pub fn json(&self) -> Json {
         Json::Obj(vec![
@@ -831,5 +900,221 @@ mod audit_tests {
         c.observe(&Observation::from_state(&state, 0));
         assert!(c.progress[0].successor_yielded, "{}", c.report().dump());
         assert!(c.progress[0].first_harvests >= 2);
+    }
+}
+
+#[cfg(test)]
+mod conditional_tests {
+    use super::*;
+    use kagg_engine::{engine, state::Cell};
+    fn conditional(c: &mut Controller, o: &Observation, cycles: usize) {
+        c.revise_batch_mode(
+            o,
+            &[(2, 4), (3, 4)],
+            Some(Production::Animal("SHEEP".into())),
+            cycles,
+            24,
+            180.,
+            true,
+        )
+        .unwrap();
+    }
+    #[test]
+    fn conditional_waits_for_confirmed_feed_and_cash_without_erasing_crop() {
+        let (mut state, mut c) = tests::fixture(96);
+        conditional(&mut c, &Observation::from_state(&state, 0), 1);
+        state.private[0].shed.add("SHEEP", 2);
+        state.private[0]
+            .shed
+            .add("WHEAT", -state.private[0].shed.get("WHEAT"));
+        c.observe(&Observation::from_state(&state, 0));
+        assert!(c.progress.iter().all(|p| !p.armed && !p.failed));
+        assert!(c
+            .agent
+            .executor
+            .projects
+            .values()
+            .all(|p| p.production.name() == "WHEAT"));
+        state.private[0].shed.add("WHEAT", 4);
+        state.farms[0].money = 0.;
+        c.observe(&Observation::from_state(&state, 0));
+        assert!(c.progress.iter().all(|p| !p.armed && !p.failed));
+        state.farms[0].money = 2000.;
+        c.observe(&Observation::from_state(&state, 0));
+        assert_eq!(c.progress.iter().filter(|p| p.armed).count(), 2);
+    }
+    #[test]
+    fn conditional_menu_preserves_delayed_two_site_animal_with_no_current_cash() {
+        let (mut state, c) = tests::fixture(72);
+        state.farms[0].money = 0.;
+        let o = Observation::from_state(&state, 0);
+        let e = super::super::plan_events::Event::capture(
+            "test".into(),
+            super::super::plan_events::EventKind::Harvest,
+            vec![(2, 4), (3, 4)],
+            None,
+            &c,
+            &o,
+        );
+        let raw = super::super::plan_events::choices(&c, &o, &e);
+        let menu = super::super::plan_menu::build_conditional(&c, &o, &e, &raw, 0).unwrap();
+        assert!(menu.iter().any(|p| p.conditional
+            && p.cycles == 2
+            && p.sites.len() == 2
+            && matches!(p.next, Some(Production::Animal(_)))));
+        assert!(menu.iter().all(|p| {
+            let mut fork = c.clone();
+            p.apply(&mut fork, &o).is_ok()
+        }));
+    }
+    #[test]
+    fn conditional_can_wait_for_work_but_cannot_arm_without_it() {
+        use super::super::executor::{unit, Route, Scheduled};
+        let (mut state, mut c) = tests::fixture(96);
+        let mut route = Route::default();
+        for _ in 0..48 {
+            route.steps.push_back(Scheduled {
+                at: 100,
+                position: (4, 4),
+                action: unit("WAIT", "", 0),
+            });
+        }
+        c.agent.executor.assign(0, route);
+        let o = Observation::from_state(&state, 0);
+        assert!(c
+            .revise_batch(
+                &o,
+                &[(2, 4), (3, 4)],
+                Some(Production::Animal("SHEEP".into())),
+                1,
+                24,
+                180.
+            )
+            .is_err());
+        conditional(&mut c, &o, 1);
+        state.private[0].shed.add("SHEEP", 2);
+        state.private[0].shed.add("WHEAT", 4);
+        c.observe(&Observation::from_state(&state, 0));
+        assert!(c.progress.iter().all(|p| !p.armed && !p.failed));
+        c.agent.executor.routes.clear();
+        c.observe(&Observation::from_state(&state, 0));
+        assert_eq!(c.progress.iter().filter(|p| p.armed).count(), 2);
+    }
+    #[test]
+    fn conditional_shortage_keeps_real_renewal_and_cancel_available() {
+        let (mut state, mut c) = tests::fixture(96);
+        state.farms[0].money = 1.;
+        state.private[0].seeds.add("WHEAT", 2);
+        // Reserve a deliberately unavailable operating floor; no future sale can fund it.
+        c.revise_batch_mode(
+            &Observation::from_state(&state, 0),
+            &[(2, 4), (3, 4)],
+            Some(Production::Animal("SHEEP".into())),
+            1,
+            24,
+            100000.,
+            true,
+        )
+        .unwrap();
+        let o = Observation::from_state(&state, 0);
+        let e = super::super::plan_events::Event::capture(
+            "shortage".into(),
+            super::super::plan_events::EventKind::Review,
+            vec![(2, 4), (3, 4)],
+            Some(0),
+            &c,
+            &o,
+        );
+        let raw = super::super::plan_events::choices(&c, &o, &e);
+        let menu = super::super::plan_menu::build_conditional(&c, &o, &e, &raw, 0).unwrap();
+        assert!(menu.iter().any(|p| !p.keep && p.next.is_none()));
+        let mut renewed = false;
+        while state.step < 210 {
+            let o = Observation::from_state(&state, 0);
+            c.observe(&o);
+            assert!(c.progress.iter().all(|p| !p.armed && !p.failed));
+            renewed |= c.progress.iter().any(|p|
+                matches!(super::tile(&o.farm,p.link.site),Cell::Plant{crop,planted_day,..} if crop=="WHEAT" && *planted_day>0));
+            let a = if super::super::plan_prototype::Agent::planning_due(&o) {
+                c.execute_choice(
+                    &o,
+                    super::super::plan_chain::Choice {
+                        base: None,
+                        links: vec![],
+                        features: vec![],
+                    },
+                )
+            } else {
+                c.continue_action(&o)
+            };
+            engine::step(&mut state, &[a, Default::default()]);
+        }
+        assert!(renewed, "waiting must keep actual crop renewal");
+        assert!(c.progress.iter().all(|p| p.first_harvests > 0));
+    }
+    #[test]
+    fn conditional_real_engine_renews_then_converts_two_sheep() {
+        let (mut state, mut c) = tests::fixture(96);
+        state.farms[0].money = 10000.;
+        conditional(&mut c, &Observation::from_state(&state, 0), 2);
+        let mut renewed = false;
+        while state.step < 510 {
+            let o = Observation::from_state(&state, 0);
+            c.observe(&o);
+            for p in &c.progress {
+                assert!(
+                    !p.successor_started || p.first_harvests >= 2,
+                    "{}",
+                    p.json().dump()
+                );
+                if matches!(super::tile(&o.farm,p.link.site),Cell::Plant{crop,planted_day,..} if crop=="WHEAT" && *planted_day>0)
+                {
+                    renewed = true;
+                }
+            }
+            let a = if super::super::plan_prototype::Agent::planning_due(&o) {
+                c.execute_choice(
+                    &o,
+                    super::super::plan_chain::Choice {
+                        base: None,
+                        links: vec![],
+                        features: vec![],
+                    },
+                )
+            } else {
+                c.continue_action(&o)
+            };
+            engine::step(&mut state, &[a, Default::default()]);
+        }
+        c.observe(&Observation::from_state(&state, 0));
+        assert!(renewed);
+        assert_eq!(
+            c.progress.iter().filter(|p| p.successor_yielded).count(),
+            2,
+            "{}",
+            c.report().dump()
+        );
+    }
+    #[test]
+    fn feed_orders_share_actual_cash_and_wait_for_confirmation() {
+        let (mut state, mut c) = tests::fixture(96);
+        conditional(&mut c, &Observation::from_state(&state, 0), 1);
+        state.private[0]
+            .shed
+            .add("WHEAT", -state.private[0].shed.get("WHEAT"));
+        let o = Observation::from_state(&state, 0);
+        let ledger = Schedule::build(&c, &o);
+        let orders = ledger.orders(&o, &[]);
+        assert!(
+            orders
+                .iter()
+                .any(|a| a[0] == "BUY_PRODUCT" && a[1] == "WHEAT"),
+            "{:?}",
+            orders
+        );
+        assert!(super::super::plan_chain::order_cost(&o, &orders) <= o.farm.money - 180.);
+        assert!(ledger.needs.iter().all(|n| !n.feed_stocked));
+        c.observe(&o);
+        assert!(c.progress.iter().all(|p| !p.armed));
     }
 }

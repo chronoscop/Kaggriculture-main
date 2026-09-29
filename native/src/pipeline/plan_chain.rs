@@ -231,6 +231,23 @@ impl Controller {
         lead: i64,
         floor: f64,
     ) -> Result<usize, String> {
+        self.revise_batch_mode(o, sites, next, cycles, lead, floor, false)
+    }
+    pub fn conditional_batch(&self, id: usize) -> bool {
+        self.batches
+            .get(id)
+            .is_some_and(|b| !b.cancelled && b.stage.conditional)
+    }
+    pub fn revise_batch_mode(
+        &mut self,
+        o: &Observation,
+        sites: &[Pos],
+        next: Option<Production>,
+        cycles: usize,
+        lead: i64,
+        floor: f64,
+        conditional: bool,
+    ) -> Result<usize, String> {
         if sites.is_empty() || sites.len() > 4 || sites.iter().any(|p| !self.editable(o, *p)) {
             return Err("batch is no longer editable".into());
         }
@@ -272,7 +289,8 @@ impl Controller {
                 .filter(|n| sites.contains(&n.site) && n.ready - n.lead <= o.step)
                 .map(|n| n.work)
                 .sum::<f64>();
-            if ledger.work_due - removed_work + replacement_work > ledger.free_work {
+            if !conditional && ledger.work_due - removed_work + replacement_work > ledger.free_work
+            {
                 return Err("batch exceeds available service windows".into());
             }
         }
@@ -345,6 +363,7 @@ impl Controller {
             revision: 0,
             sites: sites.to_vec(),
             stage: super::plan_resources::Stage {
+                conditional,
                 links: ids,
                 lead_steps: lead,
                 cash_floor: floor,
@@ -510,8 +529,10 @@ impl Controller {
             };
             let approved = if let Some(s) = &schedule {
                 if let Some(n) = s.needs.iter().find(|n| n.id == id) {
-                    let ready =
-                        n.stocked && o.step <= n.deadline && n.work + admitted_work <= s.free_work;
+                    let ready = n.stocked
+                        && (!n.conditional || (n.feed_stocked && o.farm.money >= n.cash_floor))
+                        && o.step <= n.deadline
+                        && n.work + admitted_work <= s.free_work;
                     if ready {
                         admitted_work += n.work;
                     }

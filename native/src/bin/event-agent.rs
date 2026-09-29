@@ -11,8 +11,8 @@ fn load_deployment(
     String,
 > {
     use route_rl_native::pipeline::event_policy::{
-        BATCH_CONTRACT, CONTRACT, EVIDENCE_SCHEMA, LEGACY_SCHEMA, MENU_BATCH_CONTRACT,
-        MENU_CONTRACT, NORMALIZED_SCHEMA, PREFIX_SCHEMA, SCHEMA,
+        BATCH_CONTRACT, CONDITIONAL_CONTRACT, CONTRACT, EVIDENCE_SCHEMA, LEGACY_SCHEMA,
+        MENU_BATCH_CONTRACT, MENU_CONTRACT, MENU_SCHEMA, NORMALIZED_SCHEMA, PREFIX_SCHEMA, SCHEMA,
     };
     use route_rl_native::pipeline::{
         event_portfolio::{Portfolio, Runtime},
@@ -20,29 +20,40 @@ fn load_deployment(
     };
     if matches!(
         checkpoint.get("schema").str(),
-        SCHEMA | PREFIX_SCHEMA | NORMALIZED_SCHEMA | EVIDENCE_SCHEMA | LEGACY_SCHEMA
+        SCHEMA | MENU_SCHEMA | PREFIX_SCHEMA | NORMALIZED_SCHEMA | EVIDENCE_SCHEMA | LEGACY_SCHEMA
     ) {
         let contract = CONTRACT;
         if checkpoint.get("policy_contract").str() != contract
             || !matches!(
                 checkpoint.get("deployment").get("contract").str(),
-                CONTRACT | BATCH_CONTRACT | MENU_CONTRACT | MENU_BATCH_CONTRACT
+                CONTRACT
+                    | BATCH_CONTRACT
+                    | MENU_CONTRACT
+                    | MENU_BATCH_CONTRACT
+                    | CONDITIONAL_CONTRACT
             )
         {
             return Err("wrong shared event execution contract".into());
         }
-        if !matches!(checkpoint.get("schema").str(), SCHEMA | PREFIX_SCHEMA)
-            && checkpoint.get("deployment").get("contract").str() != CONTRACT
+        if !matches!(
+            checkpoint.get("schema").str(),
+            SCHEMA | MENU_SCHEMA | PREFIX_SCHEMA
+        ) && checkpoint.get("deployment").get("contract").str() != CONTRACT
         {
             return Err("legacy wrapper cannot reinterpret batch responsibility".into());
         }
-        if checkpoint.get("schema").str() != SCHEMA
+        if !matches!(checkpoint.get("schema").str(), SCHEMA | MENU_SCHEMA)
             && matches!(
                 checkpoint.get("deployment").get("contract").str(),
                 MENU_CONTRACT | MENU_BATCH_CONTRACT
             )
         {
             return Err("legacy wrapper cannot reinterpret menu policy".into());
+        }
+        if checkpoint.get("deployment").get("contract").str() == CONDITIONAL_CONTRACT
+            && checkpoint.get("schema").str() != SCHEMA
+        {
+            return Err("conditional policy requires v10 wrapper".into());
         }
         let config = Config::parse(checkpoint.get("config"))?;
         let accepted =

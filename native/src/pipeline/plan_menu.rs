@@ -11,7 +11,7 @@ use kagg_engine::{
     rules,
     state::{ANIMAL_NAMES, CROP_NAMES},
 };
-pub const ENCODING: &str = "event-menu-resource-deltas-v1";
+pub const ENCODING: &str = "event-menu-conditional-resources-v2";
 pub const MAX_CHOICES: usize = 4;
 fn kind_index(p: &Production) -> usize {
     CROP_NAMES
@@ -228,4 +228,117 @@ pub fn annotate_context(row: &mut crate::learning::policy::Sample, o: &Observati
 }
 pub fn signature(c: &Controller, o: &Observation) -> Json {
     Json::Arr(obligations(c, o).into_iter().map(Json::Str).collect())
+}
+
+/// Four measured choices, preserving temporal alternatives before economic ranking.
+/// Old menu construction remains available for accepted v9 deployments.
+pub fn build_conditional(
+    c: &Controller,
+    o: &Observation,
+    e: &Event,
+    raw: &[Choice],
+    anchor: usize,
+) -> Result<Vec<Choice>, String> {
+    let before = Schedule::build(c, o);
+    let mut selected = vec![project(c, o, e, &raw[anchor], &before)?.choice];
+    if anchor != 0 {
+        selected.push(project(c, o, e, &raw[0], &before)?.choice);
+    }
+    let mut pool: Vec<_> = super::plan_events::choices_mode(c, o, e, true)
+        .iter()
+        .filter(|p| !p.keep)
+        .filter_map(|p| project(c, o, e, p, &before).ok())
+        .collect();
+    // Public shops contribute demand. Rotate species using visible season time;
+    // this is coverage, not an outcome label or a hidden-seed feature.
+    let desired = ANIMAL_NAMES[(o.day() as usize) % ANIMAL_NAMES.len()];
+    pool.sort_by(|a, b| {
+        let preference = |p: &Projection| {
+            let name = p.choice.next.as_ref().map(Production::name).unwrap_or("");
+            let product = rules::animal(name).map(|a| a.product).unwrap_or(name);
+            let shops = o
+                .shops
+                .iter()
+                .filter(|s| kagg_engine::engine::shop_products(s).contains(&product))
+                .count();
+            (
+                shops,
+                usize::from(name == desired),
+                usize::from(p.choice.sites.len() == e.sites.len().min(2)),
+            )
+        };
+        preference(b)
+            .cmp(&preference(a))
+            .then_with(|| b.rank.total_cmp(&a.rank))
+            .then_with(|| a.choice.json().dump().cmp(&b.choice.json().dump()))
+    });
+    // Under genuine funding/work shortages cancellation must remain available.
+    // It releases only the future promise, never planted crops or purchased stock.
+    if e.batch.is_some() && (before.free_cash <= 0. || before.work_due > before.free_work) {
+        if let Some(i) = pool.iter().position(|q| q.family == 3) {
+            let q = pool.remove(i).choice;
+            if !selected.iter().any(|p| p.json() == q.json()) {
+                selected.push(q);
+            }
+        }
+    }
+    // Compare now versus one renewal of the SAME production and quantity.
+    // Delayed candidates survive even when current work/cash is insufficient.
+    if let Some(i) = pool
+        .iter()
+        .position(|q| q.family == 1 && q.choice.cycles == 2)
+    {
+        let delayed = pool.remove(i).choice;
+        let immediate = pool.iter().position(|q| {
+            q.choice.next == delayed.next && q.choice.sites == delayed.sites && q.choice.cycles == 1
+        });
+        if selected.len() < MAX_CHOICES {
+            selected.push(delayed);
+        }
+        if selected.len() < MAX_CHOICES {
+            if let Some(i) = immediate {
+                selected.push(pool.remove(i).choice);
+            }
+        }
+    }
+    // At an owned pending batch anchor=Keep. Expose a smaller/cancelled suffix
+    // or a crop alternative as well, without creating an unrelated territory.
+    while selected.len() < MAX_CHOICES && !pool.is_empty() {
+        let i = pool
+            .iter()
+            .position(|q| {
+                e.batch.is_some()
+                    && e.sites.len() > 1
+                    && q.family == 1
+                    && q.choice.sites.len() == 1
+                    && q.choice.cycles == 1
+            })
+            .or_else(|| pool.iter().position(|q| q.family == 3 && e.batch.is_some()))
+            .or_else(|| {
+                pool.iter()
+                    .position(|q| q.family == 0 && q.choice.cycles == 2)
+            })
+            .unwrap_or(0);
+        let q = pool.remove(i).choice;
+        if !selected.iter().any(|p| p.json() == q.json()) {
+            selected.push(q);
+        }
+    }
+    for p in &mut selected {
+        p.features[17] = f32::from(p.conditional);
+        let item = p.next.as_ref().map(|k| match k {
+            Production::Animal(a) => rules::animal(a).unwrap().product,
+            _ => k.name(),
+        });
+        p.features[27] = item
+            .map(|item| {
+                o.shops
+                    .iter()
+                    .filter(|s| kagg_engine::engine::shop_products(s).contains(&item))
+                    .count() as f32
+                    / 8.
+            })
+            .unwrap_or(0.);
+    }
+    Ok(selected)
 }

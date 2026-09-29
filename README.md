@@ -1,6 +1,6 @@
 # Kaggriculture：Rust 混合生产半 RL
 
-> **当前实验：[完整可执行方案集合学习](docs/event_policy_complete_sets.md)（event-policy-iteration-v9）**，入口 `event-train` / `event-agent`。采集、集合损失与部署使用同一小菜单，沿候选和底座轨迹补完整终局对照；保留比赛得分目标与独立验收。旧检查点只导入已验收底座，命令及边界见文档。
+> **当前实验：[条件生产段学习](docs/event_policy_conditional.md)（event-policy-iteration-v10）**，入口 `event-train` / `event-agent`。先续种回款，现金、饲料和工时满足后转产，真实条件变化后修订同一批次；完整终局对照、胜负目标和独立验收保留。运行 `bash tools/run_conditional_trial.sh` 做20轮实验。
 > [v3固定窗口版](docs/plan_improvement.md)保留用于基准与检查点读取，下方v8命令为历史实验。
 
 > 旧版：[可学习市场决策](docs/mixed_v8_market.md)（v8-market-3）。模型学习商品优先顺序、按实际预算选择交易数量，并结合对手成熟时间、种养变化响应市场与资金事件；独立策略/价值网络。支持规则交易对照和两个检查点直接对战。
