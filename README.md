@@ -1,5 +1,7 @@
 # Kaggriculture：Rust 混合生产半 RL
 
+> **项目收尾：[全部尝试、失败教训与最终模型说明](docs/project_retrospective.md)。** 最后一次针对 contextual 前 10 轮的[离线审计](docs/contextual_learning_final_audit.md)未证明可靠的条件化经营收益。下方命令和阶段性建议保留供复现，不代表当前建议继续夜训；`runs/` 中的模型和日志不随 Git 提交自动备份。
+
 > **当前实验：[资源与市场条件驱动的生产提案](docs/event_policy_contextual.md)（event-policy-iteration-v12）**。保留已验收底座与收获衔接，完整比较续种、换作物、小批转养和延后；只按终局胜负学习和验收。夜间命令：`bash tools/run_contextual_overnight.sh runs/event_policy_contextual_overnight 10`。这是待验证的训练实验，尚未证明长训收益。此前证据见[执行审计](docs/conditional_execution_audit.md)。
 > [v3固定窗口版](docs/plan_improvement.md)保留用于基准与检查点读取，下方v8命令为历史实验。
 
