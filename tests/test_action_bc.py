@@ -9,8 +9,33 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
 
-from route_rl.action_bc import PROJECT_ROOT, audit_cache, inspect_index, source_identity, train, validation_episode
+from route_rl.action_bc import CONTRACT, audit_cache, inspect_index, source_identity, train, validation_episode
 from route_rl.replay_download import discover, download, teacher_seats, validate_replay
+from route_rl.replay_rules import replay_seed
+from route_rl.paths import PROJECT_ROOT
+
+
+class Game:
+    """Test fixture backed by the installed official rules, never the reference checkout."""
+    def __init__(self, seed):
+        from kaggle_environments import make
+        self.environment = make("kaggriculture", configuration={"seed": seed}, debug=False)
+
+    @property
+    def privates(self):
+        return [state.observation.private for state in self.environment.state]
+
+    @property
+    def done(self):
+        return self.environment.done
+
+    def observation(self, seat):
+        observation = deepcopy(dict(self.environment.state[seat].observation))
+        observation.setdefault("step", observation["day"] * 24 + observation["hour"])
+        return observation
+
+    def advance(self, actions):
+        self.environment.step(actions)
 
 
 def episode(identity, submissions):
@@ -64,6 +89,23 @@ class ReplayContracts(unittest.TestCase):
                     replay["module_version"] = "1.32.6"
                 with self.assertRaises(ValueError):
                     validate_replay(replay)
+
+    def test_verified_public_version_uses_actual_day_hour_and_recorded_runtime_seed(self):
+        replay = replay_fixture()
+        replay["module_version"] = "1.33.0"
+        replay["configuration"]["seed"] = None
+        replay["info"] = {"seed": 1206603275}
+        for turn, states in enumerate(replay["steps"]):
+            observation = states[1]["observation"]
+            observation.pop("step")
+            observation.update(day=turn // 24, hour=turn % 24)
+        validate_replay(replay)
+        self.assertEqual(replay_seed(replay), 1206603275)
+        self.assertEqual(replay["module_version"], "1.33.0")
+        self.assertNotIn("step", replay["steps"][1][1]["observation"])
+        replay["steps"][1][1]["observation"]["hour"] = 0
+        with self.assertRaisesRegex(ValueError, "alignment mismatch"):
+            validate_replay(replay)
 
     def test_download_retains_selected_losing_seat_and_resumes_without_duplicate_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -128,8 +170,43 @@ class ReplayContracts(unittest.TestCase):
                 inspect_index(index)
 
 
-class ReleasedImplementationChecks(unittest.TestCase):
-    """Run with the solution dependencies; these are CPU invariants, not match evidence."""
+class FullActionImplementationChecks(unittest.TestCase):
+    """Run with project BC dependencies; these are CPU invariants, not match evidence."""
+
+    def test_explicit_step_and_day_hour_prepare_identical_arrays_without_rewriting_version(self):
+        import numpy as np
+        from route_rl.replay_prepare import prepare_trajectory
+        from route_rl.replay_prepare import prepare_trajectory
+
+        game = Game(0)
+        steps = [[{"observation": game.observation(seat), "action": None, "status": "ACTIVE"}
+                  for seat in (0, 1)]]
+        for turn in range(719):
+            actions = [{"farmer": ["PASS"]}, {"farmer": ["EAST" if turn == 0 else "PASS"]}]
+            game.advance(actions)
+            steps.append([{"observation": game.observation(seat), "action": actions[seat],
+                           "status": "DONE" if game.done else "ACTIVE"} for seat in (0, 1)])
+        replay = {"module_version": "1.32.7", "steps": steps}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / "old.json.gz"
+            old.write_bytes(gzip.compress(json.dumps(replay).encode()))
+            row = {"episode_id": 1, "seat": 1, "submission_id": 12,
+                   "replay_path": old.name, "replay_sha256": hashlib.sha256(old.read_bytes()).hexdigest()}
+            expected = prepare_trajectory((row, str(old), directory))
+            replay["module_version"] = "1.33.0"
+            for states in replay["steps"]:
+                states[1]["observation"].pop("step")
+            new = root / "new.json.gz"
+            new.write_bytes(gzip.compress(json.dumps(replay).encode()))
+            cache = root / "adapted"
+            cache.mkdir()
+            adapted = prepare_trajectory(({ "episode_id": 1, "seat": 1, "submission_id": 12},
+                                          str(new), str(cache)))
+            self.assertEqual(adapted["replay_module_version"], "1.33.0")
+            with np.load(root / f"{expected['key']}.npz") as a, np.load(cache / f"{adapted['key']}.npz") as b:
+                np.testing.assert_array_equal(a["features"], b["features"])
+                np.testing.assert_array_equal(a["labels"], b["labels"])
 
     def test_cache_audit_checks_both_seat_splits_and_action_id_bounds(self):
         import numpy as np
@@ -161,38 +238,36 @@ class ReleasedImplementationChecks(unittest.TestCase):
     def test_resume_rejects_changed_initial_settings_or_lower_epoch_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            solution = PROJECT_ROOT / "kaggriculture-solution"
-            source = source_identity(solution)
+            source = source_identity()
             cache = root / "cache"
             cache.mkdir()
-            (cache / "pipeline.json").write_text(json.dumps({"contract": "public-full-action-bc-v1", "source": source}))
+            (cache / "pipeline.json").write_text(json.dumps({"contract": CONTRACT, "source": source}))
             initial = root / "initial.pkl"
             initial.write_bytes(b"initial")
             args = NS(cache=cache, initial=initial, out=root / "run", epochs=2, batch_size=2, compute_dtype="float32")
             with patch("route_rl.action_bc.audit_cache", return_value={"decoded_bytes": 0}), \
-                    patch("route_rl.action_bc.run_script") as launch:
-                train(solution, args)
+                    patch("route_rl.action_bc.run_training") as launch:
+                train(args)
                 args.epochs = 3
-                train(solution, args)
+                train(args)
                 self.assertEqual(launch.call_count, 2)
                 args.epochs = 1
                 with self.assertRaisesRegex(ValueError, "cannot decrease"):
-                    train(solution, args)
+                    train(args)
                 args.epochs = 3
                 args.batch_size = 4
                 with self.assertRaisesRegex(ValueError, "resume source/data/settings mismatch"):
-                    train(solution, args)
+                    train(args)
                 args.batch_size = 2
                 initial.write_bytes(b"different initial")
                 with self.assertRaisesRegex(ValueError, "resume source/data/settings mismatch"):
-                    train(solution, args)
+                    train(args)
                 self.assertEqual(launch.call_count, 2)
 
     def test_resolver_filters_failed_work_and_labels_actual_sell_quantity(self):
-        from kaggriculture.actions.legality import action_legality
-        from kaggriculture.actions.sell_quantity import ABSOLUTE_START
-        from kaggriculture.data.prepare_replays import label_actions
-        from kaggriculture.search.reference_engine import Game
+        from route_rl.full_action.legality import action_legality
+        from route_rl.full_action.sell_quantity import ABSOLUTE_START
+        from route_rl.full_action.labels import label_actions
 
         game = Game(0)
         game.privates[0]["shed"]["WHEAT"] = 3
@@ -208,9 +283,8 @@ class ReleasedImplementationChecks(unittest.TestCase):
 
     def test_full_trajectory_pairs_first_observation_with_next_recorded_action(self):
         import numpy as np
-        from kaggriculture.actions.catalog import UNIT_ACTION_TO_ID
-        from kaggriculture.data.prepare_replays import prepare
-        from kaggriculture.search.reference_engine import Game
+        from route_rl.full_action.catalog import UNIT_ACTION_TO_ID
+        from route_rl.replay_prepare import prepare_trajectory
 
         game = Game(0)
         steps = [[{"observation": game.observation(seat), "action": None, "status": "ACTIVE"}
@@ -226,9 +300,9 @@ class ReleasedImplementationChecks(unittest.TestCase):
             root = Path(directory)
             source = root / "replay.json.gz"
             source.write_bytes(gzip.compress(json.dumps(replay).encode()))
-            row = {"episode_id": 1, "target_seat": 0, "target_submission_id": 12,
+            row = {"episode_id": 1, "seat": 0, "submission_id": 12,
                    "replay_path": source.name, "replay_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
-            receipt = prepare((row, directory, directory))
+            receipt = prepare_trajectory((row, str(source), directory))
             with np.load(root / f"{receipt['key']}.npz") as arrays:
                 self.assertEqual(arrays["features"].shape, (719, 264, 124))
                 self.assertEqual(arrays["labels"][0, 0], UNIT_ACTION_TO_ID[("EAST",)])
@@ -240,14 +314,13 @@ class ReleasedImplementationChecks(unittest.TestCase):
         import jax.numpy as jnp
         import numpy as np
         import optax
-        from kaggriculture.agents.neural import prepare_fixed_batch
-        from kaggriculture.model.policy import JaxModelConfig, initialize_params, add_zero_value_head
-        from kaggriculture.observations.features import encode_observation
-        from kaggriculture.search.reference_engine import Game
-        from kaggriculture.training.bc_objective import make_steps
-        from kaggriculture.training.checkpointing import policy_hash
-        from kaggriculture.training.global_update import GlobalUpdate
-        from kaggriculture.training.sharding import put_replicated
+        from route_rl.full_action.inference import prepare_fixed_batch
+        from route_rl.full_action.model import JaxModelConfig, initialize_params, add_zero_value_head
+        from route_rl.full_action.features import encode_observation
+        from route_rl.full_action.bc_objective import make_steps
+        from route_rl.full_action.checkpoints import policy_hash
+        from route_rl.full_action.global_update import GlobalUpdate
+        from route_rl.full_action.sharding import put_replicated
 
         model = JaxModelConfig(d_model=32, layers=1, heads=2, ffn_dim=64, rope_dim=16,
                                attention_backend="manual", rope_correction_backend="dense", absolute_sell=True)

@@ -15,7 +15,7 @@ from pathlib import Path
 import tempfile
 import time
 
-ENGINE_VERSION = "1.32.7"
+from .replay_rules import COMPATIBLE_REPLAY_VERSIONS, compatibility_receipt, replay_seed
 
 
 def write_json(path: Path, value) -> None:
@@ -34,8 +34,9 @@ def read_replay(path: Path) -> dict:
 
 
 def validate_replay(replay: dict) -> None:
-    if replay.get("module_version") != ENGINE_VERSION:
-        raise ValueError(f"requires engine {ENGINE_VERSION}; found {replay.get('module_version')}")
+    if replay.get("module_version") not in COMPATIBLE_REPLAY_VERSIONS:
+        raise ValueError(f"unverified replay version {replay.get('module_version')}; "
+                         f"supported versions: {COMPATIBLE_REPLAY_VERSIONS}")
     if replay.get("name", "kaggriculture") != "kaggriculture":
         raise ValueError("replay is not Kaggriculture")
     steps = replay.get("steps", [])
@@ -46,14 +47,22 @@ def validate_replay(replay: dict) -> None:
             raise ValueError(f"turn {turn}: expected two seats")
         for seat, state in enumerate(states):
             observation = state.get("observation", {})
-            if observation.get("player") != seat or observation.get("step") != turn:
+            step = observation.get("step")
+            if step is None and "day" in observation and "hour" in observation:
+                step = int(observation["day"]) * 24 + int(observation["hour"])
+            if observation.get("player") != seat or step != turn:
                 raise ValueError(f"turn {turn}, seat {seat}: observation alignment mismatch")
+            if ("day" in observation and int(observation["day"]) != turn // 24) or (
+                "hour" in observation and int(observation["hour"]) != turn % 24
+            ):
+                raise ValueError(f"turn {turn}, seat {seat}: day/hour alignment mismatch")
             if not all(key in observation for key in ("farms", "private", "market", "town")):
                 raise ValueError(f"turn {turn}, seat {seat}: incomplete observation")
             if turn and not isinstance(state.get("action"), dict):
                 raise ValueError(f"turn {turn}, seat {seat}: missing action[t+1] labels")
     if any(state.get("status") != "DONE" for state in steps[-1]):
         raise ValueError("both seats must finish normally; error/timeout games are excluded")
+    replay_seed(replay)
 
 
 def metadata_rejection(episode, submission: int) -> str | None:
@@ -215,7 +224,7 @@ def download(api, teachers_file: Path, output: Path, limit: int, delay: float) -
             for seat in seats:
                 row = {"path": str(destination.relative_to(output)), "episode_id": int(episode.id),
                        "seat": seat, "submission_id": submission, "replay_sha256": checksum,
-                       "seed": replay.get("configuration", {}).get("seed")}
+                       "seed": replay_seed(replay), "replay_module_version": replay["module_version"]}
                 identity = episode.id, seat
                 if identity in rows:
                     if rows[identity] != row:
@@ -232,7 +241,7 @@ def download(api, teachers_file: Path, output: Path, limit: int, delay: float) -
                           "metadata_filtered_games": dict(metadata_filtered)}), flush=True)
     if not rows:
         raise ValueError("no compatible full replays downloaded; see skipped.jsonl and teacher IDs")
-    write_json(output / "download_receipt.json", {"schema": "public-bc-download-v1", "engine": ENGINE_VERSION,
+    write_json(output / "download_receipt.json", {"schema": "public-bc-download-v2", **compatibility_receipt(),
                "teacher_seats": len(rows), "unique_games": len({key[0] for key in rows}),
                "limit_per_teacher": limit, "selection": "outcome-independent episode hash, seed 51",
                "index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest()})
@@ -246,7 +255,9 @@ def main() -> None:
     find.add_argument("--top-teams", type=int, default=20)
     find.add_argument("--out", type=Path, required=True)
     fetch = commands.add_parser("download", help="download full replays and write BC teacher-seat JSONL")
-    fetch.add_argument("--teachers", type=Path, required=True)
+    selection = fetch.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--teachers", type=Path, help="saved public teacher snapshot")
+    selection.add_argument("--submission", type=int, action="append", help="explicit teacher submission ID; repeatable")
     fetch.add_argument("--out", type=Path, required=True)
     fetch.add_argument("--limit-per-teacher", type=int, default=100)
     fetch.add_argument("--delay", type=float, default=1.0)
@@ -260,7 +271,15 @@ def main() -> None:
         if args.command == "discover":
             discover(api, args.competition, args.top_teams, args.out)
         else:
-            download(api, args.teachers, args.out, args.limit_per_teacher, args.delay)
+            teachers = args.teachers
+            if args.submission:
+                snapshot = {"schema": "public-bc-explicit-teachers-v1", "competition": "kaggriculture",
+                            "teachers": [{"submission_id": submission} for submission in args.submission]}
+                teachers = args.out / "requested-teachers.json"
+                if teachers.exists() and json.loads(teachers.read_text()) != snapshot:
+                    raise ValueError("explicit teacher IDs changed; use a new output directory")
+                write_json(teachers, snapshot)
+            download(api, teachers, args.out, args.limit_per_teacher, args.delay)
     except (ValueError, RuntimeError, OSError) as error:
         parser.exit(1, f"{error}\n")
 

@@ -1,12 +1,12 @@
-# 完整动作 BC：公开高手回放起步
+# 本项目完整动作 BC pipeline
 
-本次按 `kaggriculture-solution` 的主线接入独立动作学习分支。教师采集、准备、训练和独立评估由本仓库入口编排；实体编码、官方动作执行过滤、Transformer、BC 损失和模型格式直接复用 clone 中的实现，不把高手微动作强行转换成 event 菜单标签。
+实现与配置都在本仓库：`src/route_rl/action_bc.py`、`replay_download.py`、`replay_prepare.py` 和 `src/route_rl/full_action/`。`kaggriculture-solution/` 只作为阅读参考，保持 git ignore；安装、下载、预处理、初始化、训练和评估均不导入或运行其中的文件，也不需要它存在。
 
-参考源码：`https://github.com/msdsm/kaggriculture-solution`，接入时 commit 为 `84057a0fda4238ccdebc46f9bf5496c6c4b2e00d`。运行收据会记录实际源码内容哈希。保留这个 checkout；它目前是独立 clone，不随父仓库自动提交或备份。没有复制对方模型权重或训练数据。
+借鉴其公开回放起步顺序、实体 Transformer、动作词表、有效动作标签与 BC 损失，将当前 BC 必需组件整合为 `route_rl.full_action`，由本项目维护。来源及具体适配见 [来源记录](action_bc_sources.md)。本次没有导入参考的 PPO、启发式教师、搜索器、CUDA 自定义 kernel 或模型权重。完整动作 BC 是本项目独立候选分支，原生 event pipeline 保留。
 
 ## 他们实际采用的顺序
 
-来自 [训练谱系](../kaggriculture-solution/docs/training-lineage.md)：
+来自 [训练谱系](https://github.com/msdsm/kaggriculture-solution/blob/84057a0fda4238ccdebc46f9bf5496c6c4b2e00d/docs/training-lineage.md)：
 
 | 阶段 | 教师来源 | 轨迹数 | BC 遍数 |
 | --- | --- | ---: | ---: |
@@ -46,7 +46,7 @@ DECEM 的连续生产、条件续种／转产、共享材料工作路线及现�
 
 ## 先下载数据
 
-clone 的 [数据说明](../kaggriculture-solution/docs/data.md) 明确要求用户提供已下载回放；不含历史数据或下载器。不能声称知道他们未公开的历史下载脚本。我们补的是官方 Kaggle 客户端下载入口。
+clone 的 [数据说明](https://github.com/msdsm/kaggriculture-solution/blob/84057a0fda4238ccdebc46f9bf5496c6c4b2e00d/docs/data.md) 明确要求用户提供已下载回放；不含历史数据或下载器。不能声称知道他们未公开的历史下载脚本。我们补的是官方 Kaggle 客户端下载入口。
 
 官方依据：[认证](https://github.com/Kaggle/kaggle-cli/blob/main/docs/README.md#authentication)、[模拟竞赛下载教程](https://github.com/Kaggle/kaggle-cli/blob/main/docs/simulation_competitions.md)。`competitions download kaggriculture` 下载比赛文件，不是高手的比赛回放。
 
@@ -98,38 +98,58 @@ kaggle competitions episodes SUBMISSION_ID
 kaggle competitions replay EPISODE_ID -p data/manual_replays
 ```
 
-自动下载入口从官方 `episode.agents` 的 `submission_id` 和 `index` 确认教师座位；既不猜赢家，也不假设教师永远是座位 0。只接收引擎 1.32.7、720 个状态、双方正常结束、包含双方完整观察及动作的回放。异常／超时和不兼容版本会跳过，原因写入 `skipped.jsonl`，不会静默改写版本。API 无权限时明确停止；限流或暂时服务错误有限重试。
+自动下载入口从官方 `episode.agents` 的 `submission_id` 和 `index` 确认教师座位；既不猜赢家，也不假设教师永远是座位 0。只接收已核对规则的版本 1.32.7／1.33.0、720 个状态、双方正常结束、包含双方完整观察及动作的回放。异常／超时和未核对版本会跳过，原因写入 `skipped.jsonl`，不会静默改写版本。API 无权限时明确停止；限流或暂时服务错误有限重试。
 
 输出 `public/teacher-seats.jsonl` 一行一个教师座位，记录 replay 校验值。重复运行去重；同一对局两个教师会共享回放文件，但保留两个座位。历史旧版本若大量被过滤，需要选择兼容的提交或另外实现经验证的版本适配，不能只改 `module_version`。
 
+### 按 submission ID 直接批量下载
+
+`submissionId` 是一份策略提交，`episodeId` 是它参加的一场比赛。同一提交对应许多对局，下载器自动列举这些对局，不需要手工复制每个 episode ID：
+
+```bash
+PYTHONPATH=src .venv-bc-tools/bin/python -m route_rl.replay_download download \
+  --submission 56722220 --limit-per-teacher 100 \
+  --out data/action_bc/submission-56722220
+```
+
+可重复 `--submission` 下载多位教师；同一输出目录重复执行会复用已下载回放。输入教师清单和直接输入 ID 二选一；已有前 20 名清单可以继续用之前的 `--teachers` 命令。
+
+首次真实下载暴露并修复了三个问题：
+
+- API 对局为 `COMPLETED`，但选手状态省略后成为 SDK 的 `UNSPECIFIED`。现在允许下载这种候选，再由回放最终状态确认双方正常完成；显式超时、失败或等待仍排除。日志增加列出局数和元数据过滤原因。
+- 当前真实回放标记 `1.33.0`。从官方 PyPI wheel 提取比较后，`1.32.7` 与 `1.33.0` 的所有六个 Kaggriculture 文件完全一致，包括规则 `.py` 和配置 `.json`。规则 SHA256 为 `bc8a54879ef02c7ea64b8b333d6a976f0ea65c4949149d01f463f23bccee653e`，配置 SHA256 为 `a82c89c1a2315b93f39775d8e025471a01b738647c9772658368ee6b1b6f4867`。只接受这两个已核对版本，保留原始 `module_version`；预处理时还检查安装的 1.32.7 规则文件哈希。
+- 真实座位 1 的观察没有 `step`，但有实际 `day/hour`，与对方编码器已有的时间读取方式一致。检查用 `day*24+hour`，不修改原始观察。公开 replay 的实际 seed 位于 `info.seed`，也纳入训练／验证隔离检查。
+
+兼容逻辑位于 `src/route_rl/replay_rules.py`，数据契约为 `public-full-action-bc-v3`。旧 v1/v2 缓存和 run 不静默续用，需要新准备目录；已下载的原始回放可以直接复用。新的 policy 带 `route-rl-full-action-policy-v1` 契约，不能直接续用旧包装器的 checkpoint 或原生 event checkpoint。
+
 ## 准备与训练 BC
 
-另建训练环境，复用公开版本的依赖和实现：
+使用 Python 3.12 或更高版本另建训练环境，安装本项目的 BC 依赖：
 
 ```bash
 python -m venv .venv-bc
-.venv-bc/bin/python -m pip install -e './kaggriculture-solution[data]'
+.venv-bc/bin/python -m pip install -e '.[bc]'
 PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc doctor
 
 PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc prepare \
   --index data/action_bc/public/teacher-seats.jsonl \
-  --out data/action_bc/prepared --workers 4
+  --out data/action_bc/prepared_own --workers 4
 
 PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc init \
-  --model bootstrap --out models/action_bc_initial.pkl
+  --model bootstrap --out models/action_bc_own_initial.pkl
 
 PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc train \
-  --initial models/action_bc_initial.pkl \
-  --cache data/action_bc/prepared/cache \
-  --out runs/action_bc_public_trial \
+  --initial models/action_bc_own_initial.pkl \
+  --cache data/action_bc/prepared_own/cache \
+  --out runs/action_bc_own_public_trial \
   --epochs 2 --batch-size 16 --compute-dtype float32
 ```
 
-CUDA 训练需要对应的 JAX CUDA 依赖和驱动；公开安装选项是 `pip install -e './kaggriculture-solution[gpu,data]'`。`doctor` 检查依赖版本；BC 的 batch/精度应按设备调整。公开实现每进程只允许一个本地 JAX device，多进程调度仍使用对方 launcher 的显式设置，不由本入口自动启动。
+CUDA 训练需要对应的驱动，安装命令为 `pip install -e '.[bc-gpu]'`；多 GPU 主机先用 `CUDA_VISIBLE_DEVICES=0` 选择一张卡。`doctor` 输出本项目源码指纹与依赖版本，不读取参考目录。当前 BC 入口支持单进程、单设备；分布式启动尚未接入。
 
-`bootstrap` 使用六层、宽度 256 的公开初始模型预设；使用最终的 124 维特征与动作格式，保证后续可传给公开 critic/PPO 代码，不重新制造一套不兼容模型。`smoke` 只有一层、宽度 32，仅用于实现检查。`10m` 是十二层；后续可使用对方 Net2Net 工具扩深，不属于这次默认行为。
+模型配置属于本项目包内的 `src/route_rl/full_action/configs/`。`bootstrap` 为六层、宽度 256；`10m` 为十二层；`smoke` 为一层、宽度 32，只用于实现检查。采用手写 JAX attention 数值路径；保留同一特征、参数形状及动作语义，未接入对方的实验 kernel 或 Net2Net 工具。三种训练预设均使用从 features 恢复元数据的分组路径，支持 feature-only BC 缓存。
 
-数据准备直接调用对方 `index_replays.py`、`prepare_replays.py`：
+本项目的 `replay_prepare.py` 负责版本核对、教师清单、缓存与规则哈希检查，使用项目内的 `full_action/features.py`、`inventory_tracker.py`、`labels.py` 和 `legality.py`：
 
 - `observation[t] → action[t+1]`，每条完整教师轨迹 719 行。
 - 每行 `features[264,124]`：实体与公开信息估计；`labels[30]`：最多 20 个己方单位和 10 个市场槽。
@@ -140,9 +160,9 @@ CUDA 训练需要对应的 JAX CUDA 依赖和驱动；公开安装选项是 `pip
 
 训练前再次检查张量形状、有限特征、动作 ID 范围、去重与 split，计算每个数组的校验值。源码、输入、缓存或训练参数变化时，要求新目录；正常续训只允许增加累计 epoch。新初始文件不能冒充旧 run 的原始初始化。需要重新扩大下载数据时，也使用新的准备目录和训练目录；可将已训练 `.pkl` 作为新 BC 阶段的 `--initial`。
 
-公开 trainer 将所有轨迹展开到主机 RAM。每条特征张量约 **47 MB**，2,000 条约 **94 GB**，还不包括训练开销。磁盘 `.npz` 的压缩大小不能作为内存需求；本入口输出解压字节数并检查明显的 RAM 不足。先按硬件选教师子集，后续如需大规模数据，应实现流式读取再扩张，而不是直接照搬 4,459 条全部内存加载。
+当前项目 BC trainer 将所有轨迹展开到主机 RAM。每条特征张量约 **47 MB**，2,000 条约 **94 GB**，还不包括训练开销。磁盘 `.npz` 的压缩大小不能作为内存需求；本入口输出解压字节数并检查明显的 RAM 不足。先按硬件选教师子集，后续如需大规模数据，应实现流式读取再扩张，而不是直接照搬 4,459 条全部内存加载。
 
-实际采用的公开 BC 损失为：
+本项目采用的 BC 损失与公开最后阶段配置一致：
 
 ```text
 CE_unit + CE_market
@@ -150,9 +170,9 @@ CE_unit + CE_market
 + 0.05 × [KL(initial || current)_unit + KL(initial || current)_market]
 ```
 
-学习率 `1e-4`、Adam epsilon `1e-5`、梯度裁剪 5，冻结本轮初始策略作为 KL 参考，不训练 value head。以上来自公开最后阶段 `bc.json`，不能说第一轮历史 BC 的全部超参数就是这套。我们先用公开实现跑 2 个 epoch 检查，再根据留出和独立评估决定预算；若按历史第一轮的遍数运行，可在同一 run 命令中设 `--epochs 30`。30 是历史遍数，不是本项目已验证的最佳值。
+学习率 `1e-4`、Adam epsilon `1e-5`、梯度裁剪 5，冻结本轮初始策略作为 KL 参考，不训练 value head。以上来自公开最后阶段 `bc.json`，不能说第一轮历史 BC 的全部超参数就是这套。本项目命令先给出 2 个 epoch 的起步预算，再根据留出和独立评估决定预算；若按历史第一轮的遍数运行，可在同一 run 命令中设 `--epochs 30`。30 是历史遍数，不是本项目已验证的最佳值。
 
-输出：`metrics.jsonl`、`latest_bc_state.pkl`、每个 epoch 的 policy、`final_student_jax.pkl`、对方 `receipt.json` 和本仓库 `integration.json`。BC 用动作交叉熵监督，不拿现金作为辅助标签或奖励。
+输出：`metrics.jsonl`、`latest_bc_state.pkl`、每个 epoch 的 policy、`final_student_jax.pkl`、本项目 `receipt.json` 和本仓库 `integration.json`。BC 用动作交叉熵监督，不拿现金作为辅助标签或奖励。
 
 ## BC 完成后才评估，再接 PPO
 
@@ -160,28 +180,26 @@ CE_unit + CE_market
 
 ```bash
 PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc evaluate \
-  --run runs/action_bc_public_trial \
+  --run runs/action_bc_own_public_trial \
   --opponent agents/farm2945_resilient_response/main.py \
   --seed 1600000000 --games 16 \
   --out runs/action_bc_public_eval/farm2945.json
 ```
 
-评估直接使用公开 `GreedyJaxPolicy` 的动作解码器和 pinned 官方环境，双方独立进程。它评估 BC 动作策略，没有 Final A 的启发式后处理或最后一天搜索；不能把分数归功于已克隆的 Final A 全套行为。模型格式和状态记忆与 BC/PPO 共用，但共同动作协调能力仍需验证。
+评估使用本项目 `full_action/inference.py` 的 `GreedyPolicy` 和 pinned 官方环境，双方独立进程。特征编码与库存 tracker 复用于训练和推理，单位动作及绝对 SELL 数量沿用同一词表。评估完整 BC 策略，包含 719 次动作及第 720 个终局状态；未接入 Final A 的启发式后处理或季末搜索。多单位与市场协调能否学会仍需整局验证。
 
 已知的示范 seed 与评估 seed 重叠会被拒绝。部分公开 replay 没有原始 seed，报告明确列出无法核查的局数；不能因此声称所有 seed 已完全证明独立。BC 留出始终按 episode 隔离。新策略部署仍应采用训练外的配对初筛与另批独立确认，不因 loss 下降直接覆盖已接受策略；本入口不执行晋级。
 
-后续接口已经保持为对方的模型格式。待 BC 实测之后，才使用这些命令：
+后续 PPO 也应在本仓库实现，不能调用参考目录的脚本。计划顺序为：固定 BC actor 与主干、单独拟合 critic → 采集本项目策略的双座位自博弈及真实采样概率 → PPO 更新与能力保持 → 训练外配对初筛与另批独立确认。当前只实现 BC 和候选评估，以上 PPO 环节尚未接入。
+
+后续统一使用当前全动作的观察、词表、tracker 与 checkpoint 契约。终局胜／平／负得分 `1/0.5/0` 作为任务目标；现金与 margin 是诊断。不能把 BC loss 下降、连通性测试通过或借用了相同模型结构说成经营能力已提升。
+
+## 迁移检查
+
+回归测试直接使用本项目模块与已安装的官方规则，不要求参考目录。检查教师座位、`observation[t] → action[t+1]`、实际成交数量、整局 split、续训输入一致性，以及 BC 只更新 actor/主干、保留 value 参数、忽略 padding。项目包的模型配置随安装一起分发。
 
 ```bash
-python kaggriculture-solution/scripts/warmup_critic.py \
-  --config kaggriculture-solution/configs/critic.json \
-  --policy runs/action_bc_public_trial/final_student_jax.pkl \
-  --output runs/action_critic
-
-python kaggriculture-solution/scripts/train_ppo.py \
-  --config kaggriculture-solution/configs/ppo.json \
-  --bc-checkpoint runs/action_critic/policy_with_critic.pkl \
-  --output-dir runs/action_ppo --max-env-steps 100000000
+PYTHONPATH=src .venv-bc/bin/python -m unittest discover -s tests -p test_action_bc.py -v
 ```
 
-这些是后续接入点，不是本次启动命令或已完成的 PPO 实验。还需编译对方 PPO 使用的 Rust Python 扩展，并核对训练／验证 seed、采样与执行契约及晋级过程。公开 PPO 用终局胜／平／负 `+1/0/−1`，与本项目评估 `1/0.5/0` 在终局排序上是正仿射变换；现金与 margin 保留为诊断，不能用作奖励或晋级否决。
+这些检查只证明数据和执行通路一致；正式 BC 训练和独立胜率实验由用户按上述命令运行。

@@ -1,0 +1,104 @@
+{
+  "repository": "https://github.com/msdsm/kaggriculture-solution",
+  "revision": "84057a0fda4238ccdebc46f9bf5496c6c4b2e00d",
+  "adapted_sources": [
+    {
+      "source": "python/kaggriculture/actions/catalog.py",
+      "source_sha256": "43b8bc8bb84116a5fde18d618db5ba7df433d39438829187a4be6da1812e9073"
+    },
+    {
+      "source": "python/kaggriculture/actions/quantities.py",
+      "source_sha256": "31a366836045a6e8bfa769a81dcddf7096831e31c7554f4b63e7d73ce8f2a1ff"
+    },
+    {
+      "source": "python/kaggriculture/actions/sell_quantity.py",
+      "source_sha256": "40ff700a7bab9c8cd2791c90effab41a69f491fb665b5f11b682d05b2d976d06"
+    },
+    {
+      "source": "python/kaggriculture/actions/legality.py",
+      "source_sha256": "fe1ea93eb0cb8a819242b9b87e740893d82cdffc0d9f03e56dbbed8077b37936"
+    },
+    {
+      "source": "python/kaggriculture/observations/features.py",
+      "source_sha256": "34012998d7c136ff502901effef135cb0d1b885e9be0b7f0c66f78f70f2f161a"
+    },
+    {
+      "source": "python/kaggriculture/observations/inventory_tracker.py",
+      "source_sha256": "1406030298b2bab507dcd7a183a2d0ad7ea1ff1bca66704000beb871440496f8"
+    },
+    {
+      "source": "python/kaggriculture/observations/tracker_constants.py",
+      "source_sha256": "bbed560e1e062bc82e1df9678ef9d64cc3e95377acdaf1d5d79512dcf7431e3a"
+    },
+    {
+      "source": "python/kaggriculture/training/global_update.py",
+      "source_sha256": "0e9d959908d20e6bdea0d85943886612cf03eff2ca609d3e89638b7a15602871"
+    },
+    {
+      "source": "python/kaggriculture/training/metrics.py",
+      "source_sha256": "5ebb174ca233ad4268ae5b8486e58ab60f873bbbf0cb7d4907ee4089cb90a53d"
+    },
+    {
+      "source": "python/kaggriculture/data/dataset.py",
+      "source_sha256": "a3b52a1ee4c67257f81618c761b1474a5649356dbc7f5a14a985943fe9108910"
+    },
+    {
+      "source": "python/kaggriculture/training/sharding.py",
+      "source_sha256": "399a105f57e05ec7093b0d94e405735ae51f160dc5fb9f951ec84a877077d71c"
+    },
+    {
+      "source": "python/kaggriculture/data/prepare_replays.py",
+      "source_sha256": "8feb258d72e7160780c9436c914fb0b3955f3cae2c0e2ba2acec50b906e716e2"
+    },
+    {
+      "source": "python/kaggriculture/training/objectives.py",
+      "source_sha256": "b91a231819a06a194f0fb15f5745fc102592e53389acefee6f2527641fd6a11a"
+    },
+    {
+      "source": "python/kaggriculture/training/bc_objective.py",
+      "source_sha256": "7cedf5eab7ff4d11620e00234e9cf3d3db9bf2eeecc6d03c3fbb7d840cff2b94"
+    },
+    {
+      "source": "python/kaggriculture/training/bc.py",
+      "source_sha256": "ba2cf8d6f988e3d8ff2df30941e6c7ee7a8c6042315d50bacea94477cd047108"
+    },
+    {
+      "source": "python/kaggriculture/model/policy.py",
+      "source_sha256": "80cc1f6bf68cfc8a5704a58270a94ee3184dbd04ba14e7fa608e025ab81e088f"
+    },
+    {
+      "source": "python/kaggriculture/agents/neural.py",
+      "source_sha256": "e9ddeeb46c4e7d7e700da299d7e5dcb2234f7a2c61e1898b3cf502d8ce6c783a"
+    },
+    {
+      "source": "python/kaggriculture/training/checkpointing.py",
+      "source_sha256": "6a4cb004794a5873edbeca03571dd631ec058ede946237fe0356baccf85ef94e"
+    },
+    {
+      "source": "scripts/evaluate.py",
+      "source_sha256": "332a5ae3e2b7a0de2b31541d1c6e0297b6324c99e4df5547f303c264fd2be916"
+    },
+    {
+      "source": "scripts/_agent_worker.py",
+      "source_sha256": "86d81600419d1837ec1f6a3b45ed3fe1a6d44ef185caa9ee8dc5cebfba476a67"
+    },
+    {
+      "source": "configs/model/bootstrap.json",
+      "source_sha256": "9dcb035ee01a7f8d7fcb896ff47e90a7bd3cf573b1177ce08a89c921046bfad5"
+    },
+    {
+      "source": "configs/model/10m.json",
+      "source_sha256": "7c858be01d0f00eff3bec99bed22c372de2f814b30ec78b70bb4450f70a9e8dc"
+    },
+    {
+      "source": "configs/model/smoke.json",
+      "source_sha256": "db33249aae0f3ae53b5db7c643bec447acfa6c86c6936c5adb57138eee99ae25"
+    },
+    {
+      "source": "configs/bc.json",
+      "source_sha256": "db351d2e7557e1fdbbded62dcfc24a2a480bf6730154ba32a2ead8f89a222ddf"
+    }
+  ],
+  "runtime_package": "route_rl.full_action",
+  "runtime_reference_checkout_required": false
+}

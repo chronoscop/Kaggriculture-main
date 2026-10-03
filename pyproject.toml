@@ -10,6 +10,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+bc = ["numpy==2.5.3", "jax==0.11.1", "optax==0.2.8", "kaggle-environments==1.32.7"]
+bc-gpu = ["numpy==2.5.3", "jax[cuda12]==0.11.1", "optax==0.2.8", "kaggle-environments==1.32.7"]
+replays = ["kaggle==2.2.4"]
+
 [project.scripts]
 route-rl-evaluate = "route_rl.evaluate:main"
 route-rl-replays = "route_rl.replay_download:main"
@@ -17,3 +22,6 @@ route-rl-action-bc = "route_rl.action_bc:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"route_rl.full_action" = ["configs/*.json"]

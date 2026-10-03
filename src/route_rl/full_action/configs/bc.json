@@ -1,0 +1,11 @@
+{
+  "batch_per_gpu": 320,
+  "epochs": 2,
+  "unit_entropy": 0.1,
+  "market_entropy": 0.1,
+  "teacher_kl": 0.05,
+  "learning_rate": 0.0001,
+  "compute_dtype": "bfloat16",
+  "seed": 51,
+  "save_epoch_policies": true
+}

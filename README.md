@@ -1,6 +1,6 @@
 # Kaggriculture：Rust 混合生产半 RL
 
-> **新增完整动作 BC 分支：[公开回放下载 → BC → 后续 PPO 接口](docs/action_bc_pipeline.md)。** 按成功方案的公开回放起步顺序接入，保留现有 event 策略与 checkpoints。下载入口 `python -m route_rl.replay_download`，BC 入口 `python -m route_rl.action_bc`（源码运行加 `PYTHONPATH=src`）；尚未下载真实数据或证明策略提升。
+> **新增完整动作 BC 分支：[公开回放下载 → BC → 后续 PPO 接口](docs/action_bc_pipeline.md)。** 借鉴成功方案的公开回放起步顺序，实现在本仓库 `src/route_rl/full_action/`，安装使用 `pip install -e '.[bc]'`；`kaggriculture-solution/` 仅供参考，无运行依赖。保留现有 event 策略与 checkpoints。下载入口 `python -m route_rl.replay_download` 支持按 submission ID 批量下载，BC 入口 `python -m route_rl.action_bc`（源码运行加 `PYTHONPATH=src`）。已用真实公开回放验证下载与预处理；尚未启动正式训练或证明策略提升。
 
 > **项目收尾：[全部尝试、失败教训与最终模型说明](docs/project_retrospective.md)。** 最后一次针对 contextual 前 10 轮的[离线审计](docs/contextual_learning_final_audit.md)未证明可靠的条件化经营收益。下方命令和阶段性建议保留供复现，不代表当前建议继续夜训；`runs/` 中的模型和日志不随 Git 提交自动备份。
 

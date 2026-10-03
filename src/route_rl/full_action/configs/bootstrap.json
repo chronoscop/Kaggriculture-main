@@ -1,0 +1,14 @@
+{
+  "d_model": 256,
+  "layers": 6,
+  "heads": 8,
+  "ffn_dim": 1024,
+  "dropout": 0.0,
+  "rope_dim": 16,
+  "rope_base": 100.0,
+  "attention_backend": "manual",
+  "rope_correction_backend": "partitioned",
+  "legal_mask": false,
+  "absolute_sell": true,
+  "sequential_patch": false
+}

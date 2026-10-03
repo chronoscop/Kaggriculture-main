@@ -1,4 +1,4 @@
-"""Repository entry points for the supplied solution's full-action BC branch."""
+"""Project-owned full-action replay BC, with explicit data and checkpoint contracts."""
 from __future__ import annotations
 
 import argparse
@@ -8,12 +8,13 @@ from importlib import metadata
 import json
 from pathlib import Path
 import subprocess
-import sys
 
-from .paths import PROJECT_ROOT
 from .replay_download import load_index, read_replay, write_json
+from .replay_rules import compatibility_receipt, replay_seed
 
-CONTRACT = "public-full-action-bc-v1"
+CONTRACT = "public-full-action-bc-v3"
+PACKAGE_ROOT = Path(__file__).resolve().parent
+CONFIG_ROOT = PACKAGE_ROOT / "full_action/configs"
 
 
 def sha256(path: Path) -> str:
@@ -24,19 +25,32 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def source_identity(solution: Path) -> dict:
-    if not (solution / "scripts/train_bc.py").is_file():
-        raise ValueError(f"missing solution checkout: {solution}")
-    files = [solution / "pyproject.toml"]
-    for directory, suffix in (("python", "*.py"), ("scripts", "*.py"), ("configs", "*.json")):
-        files.extend((solution / directory).rglob(suffix))
-    hashes = {str(path.relative_to(solution)): sha256(path) for path in sorted(files)}
-    return {"repository": "https://github.com/msdsm/kaggriculture-solution",
+def source_identity() -> dict:
+    files = [PACKAGE_ROOT / name for name in ("action_bc.py", "replay_prepare.py", "replay_rules.py", "replay_download.py")]
+    files.extend((PACKAGE_ROOT / "full_action").rglob("*.py"))
+    files.extend(CONFIG_ROOT.glob("*.json"))
+    hashes = {str(path.relative_to(PACKAGE_ROOT)): sha256(path) for path in sorted(files)}
+    return {"implementation": "route_rl.full_action", "reference_checkout_required": False,
             "files_sha256": hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()}
 
 
-def run_script(solution: Path, name: str, *arguments) -> None:
-    subprocess.run([sys.executable, str(solution / "scripts" / name), *map(str, arguments)], check=True)
+def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None:
+    from .full_action.trainer import run_training as run
+
+    run(initial.resolve(), cache.resolve(), output.resolve(), config)
+
+
+def initialize(model_name: str, output: Path, seed: int) -> None:
+    import jax
+    import jax.numpy as jnp
+    from .full_action.model import JaxModelConfig, initialize_params, add_zero_value_head, parameter_count
+    from .full_action.checkpoints import save_params_payload
+
+    model = JaxModelConfig(**json.loads((CONFIG_ROOT / f"{model_name}.json").read_text()))
+    params = add_zero_value_head(initialize_params(jax.random.PRNGKey(seed), model), model)
+    params["value"]["linear_cost"] = jnp.zeros(2, jnp.float32)
+    save_params_payload(output, params, model.to_dict(), 0)
+    print(json.dumps({"parameters": parameter_count(params), "output": str(output), "contract": CONTRACT}))
 
 
 def validation_episode(episode: int) -> bool:
@@ -62,7 +76,7 @@ def inspect_index(index: Path) -> dict:
                 raise ValueError(f"different replay files claim episode {episode}")
         else:
             replay = read_replay(path)
-            seed = replay.get("configuration", {}).get("seed")
+            seed = replay_seed(replay)
             games[episode] = digest, seed
             if seed is not None:
                 seed = int(seed)
@@ -83,20 +97,19 @@ def inspect_index(index: Path) -> dict:
             "replays_sha256": hashlib.sha256(json.dumps(games, sort_keys=True).encode()).hexdigest()}
 
 
-def prepare(solution: Path, index: Path, output: Path, workers: int) -> None:
+def prepare(index: Path, output: Path, workers: int) -> None:
+    from .replay_prepare import prepare_index
+
     inventory = inspect_index(index)
-    identity = {"contract": CONTRACT, "source": source_identity(solution), "input": inventory}
+    identity = {"contract": CONTRACT, "source": source_identity(), "input": inventory,
+                "replay_compatibility": compatibility_receipt()}
     receipt = output / "preparation.json"
     if output.exists() and any(output.iterdir()):
         if not receipt.exists() or json.loads(receipt.read_text()) != identity:
             raise ValueError("preparation input or source changed; use a new output directory")
     write_json(receipt, identity)
-    manifests, cache = output / "manifests", output / "cache"
-    run_script(solution, "index_replays.py", index.resolve(), "--output", manifests.resolve())
-    arguments = []
-    for path in sorted(manifests.glob("*/manifest.json")):
-        arguments.extend(["--manifest", str(path.resolve())])
-    run_script(solution, "prepare_replays.py", *arguments, "--cache", cache.resolve(), "--workers", workers)
+    cache = output / "cache"
+    prepare_index(index, output, workers)
     write_json(cache / "pipeline.json", identity)
     print(json.dumps({"cache": str(cache), **inventory}), flush=True)
 
@@ -140,12 +153,12 @@ def audit_cache(cache: Path) -> dict:
             "samples": dict(splits), "valid_labels": dict(valid_labels), "decoded_bytes": decoded_bytes}
 
 
-def train(solution: Path, args) -> None:
+def train(args) -> None:
     preparation = json.loads((args.cache / "pipeline.json").read_text())
-    source = source_identity(solution)
+    source = source_identity()
     if preparation["source"] != source or preparation["contract"] != CONTRACT:
         raise ValueError("cache encoding source changed; rebuild in a new preparation directory")
-    config = json.loads((solution / "configs/bc.json").read_text())
+    config = json.loads((CONFIG_ROOT / "bc.json").read_text())
     config.update(epochs=args.epochs, batch_per_gpu=args.batch_size, compute_dtype=args.compute_dtype)
     cache = audit_cache(args.cache)
     print(json.dumps({"event": "cache_audit", **cache}), flush=True)
@@ -154,7 +167,7 @@ def train(solution: Path, args) -> None:
         available = next((int(line.split()[1]) * 1024 for line in memory_info.read_text().splitlines()
                           if line.startswith("MemAvailable:")), None)
         if available is not None and cache["decoded_bytes"] > available * 0.8:
-            raise ValueError(f"released trainer loads all tensors into host RAM ({cache['decoded_bytes'] / 2**30:.1f} GiB); "
+            raise ValueError(f"BC trainer loads all tensors into host RAM ({cache['decoded_bytes'] / 2**30:.1f} GiB); "
                              "use a smaller teacher subset or a host with more RAM")
     identity = {"contract": CONTRACT, "source": source, "initial_sha256": sha256(args.initial),
                 "cache": cache, "settings": {key: value for key, value in config.items() if key != "epochs"},
@@ -168,13 +181,12 @@ def train(solution: Path, args) -> None:
             raise ValueError("BC epochs are cumulative; a resumed run cannot decrease its epoch target")
     write_json(receipt, identity)
     write_json(args.out / "bc_config.json", config)
-    run_script(solution, "train_bc.py", "--config", (args.out / "bc_config.json").resolve(),
-               "--initial", args.initial.resolve(), "--cache", args.cache.resolve(), "--output", args.out.resolve())
+    run_training(args.initial, args.cache, args.out, config)
 
 
-def evaluate(solution: Path, args) -> None:
+def evaluate(args) -> None:
     identity = json.loads((args.run / "integration.json").read_text())
-    if identity["source"] != source_identity(solution):
+    if identity["contract"] != CONTRACT or identity["source"] != source_identity():
         raise ValueError("source changed since BC; restore the source before evaluating")
     evaluation_seeds = set(range(args.seed, args.seed + args.games // 2))
     known = set(identity["preparation"]["input"]["known_game_seeds"])
@@ -184,19 +196,11 @@ def evaluate(solution: Path, args) -> None:
         raise ValueError("evaluation output already exists; use a new output file")
     policy = args.policy or args.run / "final_student_jax.pkl"
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    import tempfile
+    from .full_action.evaluation import evaluate_games
 
-    with tempfile.TemporaryDirectory() as directory:
-        entry = Path(directory) / "main.py"
-        entry.write_text("import sys\n" + f"sys.path.insert(0, {str(solution / 'python')!r})\n"
-                         "from kaggriculture.agents.neural import load_policy\n"
-                         + f"_policy = load_policy({str(policy.resolve())!r})\n"
-                         "def agent(observation, configuration=None):\n    return _policy(observation)\n")
-        raw = args.out.with_suffix(".games.json")
-        run_script(solution, "evaluate.py", entry, args.opponent.resolve(), "--games", args.games,
-                   "--seed", args.seed, "--output", raw.resolve())
-    records = json.loads(raw.read_text())
-    if len(records) != args.games or any(row["statuses"] != ["DONE", "DONE"] for row in records):
+    raw = args.out.with_suffix(".games.json")
+    records = evaluate_games(policy, args.opponent, args.seed, args.games, raw)
+    if len(records) != args.games or any(row["statuses"] != ["DONE", "DONE"] or row["turns"] != 720 for row in records):
         raise ValueError("evaluation contains failed/incomplete games; inspect the raw game report")
     scores = []
     for row in records:
@@ -206,24 +210,23 @@ def evaluate(solution: Path, args) -> None:
                          "opponent_sha256": sha256(args.opponent), "games": records,
                          "score_rate": sum(scores) / len(scores), "deployment": "candidate_only",
                          "demonstration_games_without_seed": identity["preparation"]["input"]["games_without_seed"],
-                         "inference": "released GreedyJaxPolicy; no Final A search/postprocessing"})
+                         "inference": "route_rl.full_action.inference.GreedyPolicy"})
     print(json.dumps({"games": len(scores), "score_rate": sum(scores) / len(scores), "report": str(args.out)}))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--solution", type=Path, default=PROJECT_ROOT / "kaggriculture-solution")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="check source and dependency availability without training")
     prep = commands.add_parser("prepare", help="index and encode full public teacher trajectories")
     prep.add_argument("--index", type=Path, required=True)
     prep.add_argument("--out", type=Path, required=True)
     prep.add_argument("--workers", type=int, default=4)
-    init = commands.add_parser("init", help="initialize a PPO-compatible full-action model")
+    init = commands.add_parser("init", help="initialize this project's full-action model")
     init.add_argument("--model", choices=("bootstrap", "10m", "smoke"), default="bootstrap")
     init.add_argument("--out", type=Path, required=True)
     init.add_argument("--seed", type=int, default=0)
-    learn = commands.add_parser("train", help="run released BC objective; no deployment or PPO")
+    learn = commands.add_parser("train", help="train the full-action BC candidate")
     learn.add_argument("--initial", type=Path, required=True)
     learn.add_argument("--cache", type=Path, required=True)
     learn.add_argument("--out", type=Path, required=True)
@@ -241,7 +244,6 @@ def main() -> None:
     match.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     try:
-        solution = args.solution.resolve()
         if args.command == "doctor":
             packages = {}
             for package in ("numpy", "jax", "optax", "kaggle-environments", "kaggle"):
@@ -249,30 +251,29 @@ def main() -> None:
                     packages[package] = metadata.version(package)
                 except metadata.PackageNotFoundError:
                     packages[package] = None
-            print(json.dumps({"source": source_identity(solution), "dependencies": packages,
+            print(json.dumps({"source": source_identity(), "dependencies": packages,
                               "required_versions": {"numpy": "2.5.3", "jax": "0.11.1", "optax": "0.2.8",
                                                     "kaggle-environments": "1.32.7", "kaggle": "2.2.4"}}))
         elif args.command == "prepare":
             if args.workers < 1:
                 raise ValueError("workers must be positive")
-            prepare(solution, args.index, args.out, args.workers)
+            prepare(args.index, args.out, args.workers)
         elif args.command == "init":
             if args.out.exists():
                 raise ValueError("initial policy already exists; choose a new path")
             args.out.parent.mkdir(parents=True, exist_ok=True)
-            run_script(solution, "init_model.py", "--config", solution / f"configs/model/{args.model}.json",
-                       "--output", args.out.resolve(), "--seed", args.seed)
+            initialize(args.model, args.out, args.seed)
         elif args.command == "audit-cache":
             print(json.dumps(audit_cache(args.cache)))
         elif args.command == "train":
             if args.epochs < 1 or args.batch_size < 2 or args.batch_size % 2:
                 raise ValueError("epochs must be positive and batch-size even and >=2")
-            train(solution, args)
+            train(args)
         else:
             if args.games < 2 or args.games % 2:
                 raise ValueError("games must be even and >=2")
-            evaluate(solution, args)
-    except (ValueError, OSError, ImportError, subprocess.CalledProcessError) as error:
+            evaluate(args)
+    except (ValueError, RuntimeError, OSError, ImportError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"{error}\n")
 
 
