@@ -1,45 +1,49 @@
-# 原生混合生产 pipeline
+# Rust 经营策略实验
 
-> **当前实验：[完整可执行方案集合学习](../docs/event_policy_complete_sets.md)（event-policy-iteration-v9）**，入口 `event-train` / `event-agent`。采集、集合损失与部署使用同一小菜单，沿候选和底座轨迹补完整终局对照；保留比赛得分目标与独立验收。旧检查点只导入已验收底座，命令及边界见文档。
-> [v3固定窗口版](../docs/plan_improvement.md)保留用于基准与检查点读取，下方v8命令为历史实验。
+`native/` 保留早期 mixed/plan/event 的模拟、执行、训练和审计代码。当前主线 BC 使用 Python/JAX，安装和训练不依赖本目录。当前入口与实验结论见 [主 README](../README.md) 和 [历史实验](../docs/experiment_history.md)。旧 Rust PPO 与全动作 BC 是不同管线，不能交换检查点。
 
-> 旧版：[可学习市场决策](../docs/mixed_v8_market.md)（v8-market-3）。模型控制交易顺序和数量，新增对手潜在供给信息与事件触发，支持规则交易对照；320 维观测、19 类动作，旧 v7 / v8-market-1 / v8-market-2 检查点不兼容。
+## 仅构建执行器
 
-旧入口为 `mixed-production-v8`。旧 baseline 移植组件、组件测速命令及 v4 训练入口已删除。
-
-## 构建
+需要 Rust 工具链，使用仓库内 `third_party/kaggriculture-simulation/src-rust/kagg-engine` 路径依赖：
 
 ```bash
-cargo build --manifest-path native/Cargo.toml --release --features train --offline -j 4
-cargo test --manifest-path native/Cargo.toml --release --features train --offline -j 4
+cargo build --manifest-path native/Cargo.toml --release
+cargo test --manifest-path native/Cargo.toml --release --lib
 ```
 
-CUDA 测试需有 GPU：
+默认不启用 `train`，不需要 LibTorch。首次构建允许 Cargo 下载依赖；只有本地缓存齐全时才添加 `--offline`。无需使用旧文档中的临时工具链或缓存路径。
+
+## 启用历史训练与审计
+
+额外需要 C++17 编译器、归档工具 `ar` 和匹配的 LibTorch：
 
 ```bash
-ROUTE_RL_TEST_CUDA=1 cargo test --manifest-path native/Cargo.toml --release --features train --offline -j 4
+export LIBTORCH=/absolute/path/to/libtorch
+export LIBTORCH_CXX11_ABI=1
+cargo build --manifest-path native/Cargo.toml --release --features train
+cargo test --manifest-path native/Cargo.toml --release --features train
 ```
 
-不启用 `train` 时可只编译、测试 CPU 执行器，不依赖 LibTorch。
-启用 `train` 时，Rust 通过小型 C++17 C ABI 调用匹配的 LibTorch；不启动 Python 解释器。
-本机默认 `LIBTORCH=/usr/local/lib/python3.12/dist-packages/torch`，包含 `include/` 和 `lib/`。
-可配置 `LIBTORCH`、`CXX`、`LIBTORCH_CXX11_ABI`（默认 1），ABI 必须与库一致。
-GPU 支持来自 CUDA 版 LibTorch，不再依赖此前市场测速的 NVRTC 内核。
+将 `LIBTORCH` 替换为实际目录，其中应包含 `include/ATen/ATen.h` 和 `lib/`。也可指向兼容 PyTorch 安装的 `torch/` 目录。`LIBTORCH_CXX11_ABI` 必须与该库一致，可为0或1；编译器可通过 `CXX` 指定。Rust 通过 C++ C ABI 调用张量库，训练时不启动 Python 解释器。
 
-当前会话 Rust 工具链：
-`/tmp/route-rl-rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/`。
-若 cargo 不在 PATH，把该目录加入 PATH。离线 Cargo 缓存位于 `/tmp/route-rl-cargo`。
+有兼容 CUDA LibTorch 和 GPU 时，可额外运行：
+
+```bash
+ROUTE_RL_TEST_CUDA=1 cargo test --manifest-path native/Cargo.toml --release --features train
+```
 
 ## 入口
 
-- `mixed-train --help`：独立训练、历史对手池、晋级验证、恢复与评估。
-- `mixed-agent --checkpoint FILE`：逐行接收公开观测、输出动作；供外部对战评估。
-- `mixed-agent --checkpoint heuristic`：同一规划器的轻量规则选择器。
+| 程序 | 用途 |
+| --- | --- |
+| `mixed-train` / `mixed-agent` | 旧投资、路线与市场策略 |
+| `plan-prototype` | 确定性经营原型与参数搜索 |
+| `plan-train` / `plan-agent` | 经营计划比较和已验收组合 |
+| `event-train` / `event-agent` | 事件菜单学习、配对验收及已验收部署 |
+| `event-learning-audit` / `event-menu-audit` | 离线学习和实际菜单检查 |
 
-完整命令见[主 README](../README.md)，实现与限制见 [mixed_v7.md](../docs/mixed_v7.md)。
-生产训练不读取 `agents/`、farm2945 路线数据、原策略 Python 或旧运行轨迹。
-原版 farm2945 仅通过仓库外部评估客户端加载。
+编译后的程序位于 `native/target/release/`。先用对应 `--help` 检查当前参数，再根据检查点契约与历史记录定位匹配版本。历史文档中的旧 PPO 参数、`iterations` 语义和续训命令不能假定适用于当前入口。
 
-## 经营计划实验原型
+agent 提供持久 JSONL 观察/动作接口；这不是直接可上传 Kaggle 的提交包。`latest` 包含学习状态，不代表新的学习权重已经获得部署资格；event/plan 使用检查点中的已验收部署，具体以对应实现为准。
 
-新增 `plan-prototype`：批量经营、商品价值路线评分及完整赛季参数搜索。已完成小规模配对实验；属于CPU参数搜索阶段，尚未接入新的神经网络PPO训练。结果、限制及可运行命令见 [原型实验](../docs/plan_prototype_results.md)。
+源码及许可见 [Cargo.toml](Cargo.toml)、[LICENSE](LICENSE.txt)、[NOTICE](NOTICE.txt) 和模拟器目录。本地 farm2945 保留为外部评估参考，不是 DECEM 源码；历史事件训练不通过读取该参考源码生成训练标签。
