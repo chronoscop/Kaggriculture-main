@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Public teacher snapshot -> full replays -> explicit teacher-seat BC index.
+set -euo pipefail
+
+BC_PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$BC_PROJECT_ROOT"
+BC_DATA_ROOT="${1:-data/action_bc}"
+BC_TOP_TEAMS="${2:-20}"
+BC_GAMES_PER_TEACHER="${3:-5}"
+BC_PYTHON="$BC_PROJECT_ROOT/.venv-bc-tools/bin/python"
+BC_KAGGLE="$BC_PROJECT_ROOT/.venv-bc-tools/bin/kaggle"
+
+if [[ ! -x "$BC_PYTHON" ]]; then
+  python3 -m venv "$BC_PROJECT_ROOT/.venv-bc-tools"
+fi
+if ! "$BC_PYTHON" -c 'from importlib.metadata import version; assert version("kaggle") == "2.2.4"' >/dev/null 2>&1; then
+  "$BC_PYTHON" -m pip install 'kaggle==2.2.4'
+fi
+
+# The official client reuses an existing login. Otherwise it prints an OAuth URL.
+"$BC_KAGGLE" auth login --no-launch-browser
+export PYTHONPATH="$BC_PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+if [[ ! -f "$BC_DATA_ROOT/teachers.json" ]]; then
+  "$BC_PYTHON" -m route_rl.replay_download discover \
+    --top-teams "$BC_TOP_TEAMS" --out "$BC_DATA_ROOT/teachers.json"
+fi
+"$BC_PYTHON" -m route_rl.replay_download download \
+  --teachers "$BC_DATA_ROOT/teachers.json" \
+  --out "$BC_DATA_ROOT/public" --limit-per-teacher "$BC_GAMES_PER_TEACHER"

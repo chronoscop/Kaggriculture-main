@@ -5,13 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kaggriculture-route-rl"
 version = "0.5.0"
-description = "Independent Rust mixed-production RL; Python evaluation client only"
+description = "Rust planning experiments and a full-action replay BC training branch"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
 route-rl-evaluate = "route_rl.evaluate:main"
+route-rl-replays = "route_rl.replay_download:main"
+route-rl-action-bc = "route_rl.action_bc:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

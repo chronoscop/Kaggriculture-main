@@ -1,0 +1,289 @@
+"""Offline checks for teacher identity, replay alignment and BC execution contracts."""
+from copy import deepcopy
+import gzip
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace as NS
+import unittest
+from unittest.mock import patch
+
+from route_rl.action_bc import PROJECT_ROOT, audit_cache, inspect_index, source_identity, train, validation_episode
+from route_rl.replay_download import discover, download, teacher_seats, validate_replay
+
+
+def episode(identity, submissions):
+    return NS(id=identity, state=NS(name="COMPLETED"), agents=[
+        NS(submission_id=submission, index=seat, state=NS(name="EPISODE_AGENT_STATE_COMPLETE"))
+        for seat, submission in submissions])
+
+
+def replay_fixture():
+    return {"module_version": "1.32.7", "name": "kaggriculture", "configuration": {"seed": 42},
+            "steps": [[{"observation": {"step": turn, "player": seat, "farms": [], "private": {},
+                                         "market": {}, "town": {}},
+                        "action": None if turn == 0 else {"farmer": ["PASS"]},
+                        "status": "DONE" if turn == 719 else "ACTIVE"}
+                       for seat in (0, 1)] for turn in range(720)]}
+
+
+class ReplayContracts(unittest.TestCase):
+    def test_teacher_seat_comes_from_index_even_when_metadata_is_shuffled(self):
+        self.assertEqual(teacher_seats(episode(1, [(1, 12), (0, 99)]), 12), [1])
+        self.assertEqual(teacher_seats(episode(1, [(1, 12), (0, 12)]), 12), [1, 0])
+        bad = episode(1, [(1, 12), (0, 99)])
+        bad.agents[1].state.name = "EPISODE_AGENT_STATE_ERROR_TIMEOUT"
+        self.assertEqual(teacher_seats(bad, 12), [])
+
+    def test_completed_episode_with_unspecified_agent_states_is_checked_via_replay(self):
+        game = episode(117485467, [(0, 56711476), (1, 56722220)])
+        for agent in game.agents:
+            agent.state.name = "EPISODE_AGENT_STATE_UNSPECIFIED"
+        self.assertEqual(teacher_seats(game, 56722220), [1])
+        self.assertEqual(teacher_seats(game, 56711476), [0])
+        game.state.name = "CREATED"
+        self.assertEqual(teacher_seats(game, 56722220), [])
+        game.state.name = "COMPLETED"
+        game.agents[0].state.name = "EPISODE_AGENT_STATE_PENDING"
+        self.assertEqual(teacher_seats(game, 56722220), [])
+
+    def test_replay_must_have_exact_pre_action_alignment_and_normal_terminal_state(self):
+        good = replay_fixture()
+        validate_replay(good)
+        for mutation in ("shifted", "missing_action", "timeout", "version"):
+            with self.subTest(mutation=mutation):
+                replay = deepcopy(good)
+                if mutation == "shifted":
+                    replay["steps"][1][0]["observation"]["step"] = 0
+                elif mutation == "missing_action":
+                    replay["steps"][1][0]["action"] = None
+                elif mutation == "timeout":
+                    replay["steps"][-1][1]["status"] = "TIMEOUT"
+                else:
+                    replay["module_version"] = "1.32.6"
+                with self.assertRaises(ValueError):
+                    validate_replay(replay)
+
+    def test_download_retains_selected_losing_seat_and_resumes_without_duplicate_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            teachers = root / "selected.json"
+            teachers.write_text(json.dumps({"competition": "kaggriculture",
+                                          "teachers": [{"submission_id": 12}, {"submission_id": 99}]}))
+            game = episode(1, [(1, 12), (0, 99)])
+            for agent in game.agents:
+                agent.state.name = "EPISODE_AGENT_STATE_UNSPECIFIED"
+            game.agents[0].reward = -1
+            downloaded = []
+
+            def fetch(identity, path, quiet):
+                downloaded.append(identity)
+                (Path(path) / f"episode-{identity}-replay.json").write_text(json.dumps(replay_fixture()))
+
+            api = NS(competition_list_episodes=lambda _: [game], competition_episode_replay=fetch)
+            with patch("route_rl.replay_download.call_api", side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+                download(api, teachers, root / "data", 1, 0)
+                first = (root / "data/teacher-seats.jsonl").read_text()
+                download(api, teachers, root / "data", 1, 0)
+            rows = [json.loads(line) for line in first.splitlines()]
+            self.assertEqual(downloaded, [1])
+            self.assertEqual({(r["submission_id"], r["seat"]) for r in rows}, {(12, 1), (99, 0)})
+            self.assertEqual(first, (root / "data/teacher-seats.jsonl").read_text())
+
+    def test_discover_freezes_best_active_submission_for_each_distinct_team(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "teachers.json"
+            api = NS(competition_leaderboard_view=lambda *a, **kw: [NS(team_id=1, team_name="Teacher")],
+                     competition_team_submissions=lambda _: [NS(id=11, public_score="100"),
+                                                            NS(id=12, public_score="200")])
+            with patch("route_rl.replay_download.call_api", side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+                discover(api, "kaggriculture", 1, output)
+                self.assertEqual(json.loads(output.read_text())["teachers"][0]["submission_id"], 12)
+                with self.assertRaisesRegex(ValueError, "snapshot already exists"):
+                    discover(api, "kaggriculture", 1, output)
+
+    def test_inspection_holds_both_seats_out_and_rejects_conflicting_teachers(self):
+        self.assertFalse(validation_episode(1))
+        self.assertTrue(validation_episode(7))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for game in (1, 7):
+                replay = replay_fixture()
+                replay["configuration"]["seed"] = game
+                (root / f"{game}.json.gz").write_bytes(gzip.compress(json.dumps(replay).encode()))
+            rows = [{"path": f"{game}.json.gz", "episode_id": game, "seat": seat, "submission_id": 12}
+                    for game in (1, 7) for seat in (0, 1)]
+            index = root / "index.jsonl"
+            index.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            self.assertEqual(inspect_index(index)["splits"], {"train": 2, "validation": 2})
+            collision = replay_fixture()
+            collision["configuration"]["seed"] = 1
+            (root / "7.json.gz").write_bytes(gzip.compress(json.dumps(collision).encode()))
+            with self.assertRaisesRegex(ValueError, "crosses train/validation"):
+                inspect_index(index)
+            with index.open("a") as stream:
+                stream.write(json.dumps({**rows[0], "submission_id": 99}) + "\n")
+            with self.assertRaisesRegex(ValueError, "conflicting teacher"):
+                inspect_index(index)
+
+
+class ReleasedImplementationChecks(unittest.TestCase):
+    """Run with the solution dependencies; these are CPU invariants, not match evidence."""
+
+    def test_cache_audit_checks_both_seat_splits_and_action_id_bounds(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            features = np.zeros((719, 264, 124), np.float16)
+            labels = np.full((719, 30), -100, np.int16)
+            labels[:, 0] = 4
+            labels[:, 20:] = 0
+            rows = [{"key": str(game), "episode_id": game, "seat": 0, "split": split}
+                    for game, split in ((1, "train"), (7, "validation"))]
+            for row in rows:
+                np.savez_compressed(root / f"{row['key']}.npz", features=features, labels=labels)
+            index = root / "index.json"
+            index.write_text(json.dumps({"episodes": rows}))
+            self.assertEqual(audit_cache(root)["samples"], {"train": 719, "validation": 719})
+            labels[0, 0] = 500
+            np.savez_compressed(root / "1.npz", features=features, labels=labels)
+            with self.assertRaisesRegex(ValueError, "invalid unit action IDs"):
+                audit_cache(root)
+            labels[0, 0] = 4
+            np.savez_compressed(root / "1.npz", features=features, labels=labels)
+            rows[1]["split"] = "train"
+            index.write_text(json.dumps({"episodes": rows}))
+            with self.assertRaisesRegex(ValueError, "episode-hash split differs"):
+                audit_cache(root)
+
+    def test_resume_rejects_changed_initial_settings_or_lower_epoch_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            solution = PROJECT_ROOT / "kaggriculture-solution"
+            source = source_identity(solution)
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "pipeline.json").write_text(json.dumps({"contract": "public-full-action-bc-v1", "source": source}))
+            initial = root / "initial.pkl"
+            initial.write_bytes(b"initial")
+            args = NS(cache=cache, initial=initial, out=root / "run", epochs=2, batch_size=2, compute_dtype="float32")
+            with patch("route_rl.action_bc.audit_cache", return_value={"decoded_bytes": 0}), \
+                    patch("route_rl.action_bc.run_script") as launch:
+                train(solution, args)
+                args.epochs = 3
+                train(solution, args)
+                self.assertEqual(launch.call_count, 2)
+                args.epochs = 1
+                with self.assertRaisesRegex(ValueError, "cannot decrease"):
+                    train(solution, args)
+                args.epochs = 3
+                args.batch_size = 4
+                with self.assertRaisesRegex(ValueError, "resume source/data/settings mismatch"):
+                    train(solution, args)
+                args.batch_size = 2
+                initial.write_bytes(b"different initial")
+                with self.assertRaisesRegex(ValueError, "resume source/data/settings mismatch"):
+                    train(solution, args)
+                self.assertEqual(launch.call_count, 2)
+
+    def test_resolver_filters_failed_work_and_labels_actual_sell_quantity(self):
+        from kaggriculture.actions.legality import action_legality
+        from kaggriculture.actions.sell_quantity import ABSOLUTE_START
+        from kaggriculture.data.prepare_replays import label_actions
+        from kaggriculture.search.reference_engine import Game
+
+        game = Game(0)
+        game.privates[0]["shed"]["WHEAT"] = 3
+        observations = [game.observation(seat) for seat in (0, 1)]
+        actions = [{"farmer": ["WATER"], "market": [["SELL", "WHEAT", 100]]}, {"farmer": ["PASS"]}]
+        legal = action_legality(observations, actions, 0)
+        labels = label_actions(observations[0], actions[0], legal)
+        self.assertFalse(legal.unit_mask[0])
+        self.assertEqual(labels[0], -100)
+        self.assertEqual(legal.market_executed[0], 3)
+        self.assertEqual(labels[20], ABSOLUTE_START + 2)
+        self.assertTrue((labels[1:20] == -100).all())
+
+    def test_full_trajectory_pairs_first_observation_with_next_recorded_action(self):
+        import numpy as np
+        from kaggriculture.actions.catalog import UNIT_ACTION_TO_ID
+        from kaggriculture.data.prepare_replays import prepare
+        from kaggriculture.search.reference_engine import Game
+
+        game = Game(0)
+        steps = [[{"observation": game.observation(seat), "action": None, "status": "ACTIVE"}
+                  for seat in (0, 1)]]
+        for turn in range(719):
+            actions = [{"farmer": ["EAST" if turn == 0 else "PASS"]}, {"farmer": ["PASS"]}]
+            game.advance(actions)
+            steps.append([{"observation": game.observation(seat), "action": actions[seat],
+                           "status": "DONE" if game.done else "ACTIVE"} for seat in (0, 1)])
+        replay = {"module_version": "1.32.7", "steps": steps}
+        validate_replay(replay)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "replay.json.gz"
+            source.write_bytes(gzip.compress(json.dumps(replay).encode()))
+            row = {"episode_id": 1, "target_seat": 0, "target_submission_id": 12,
+                   "replay_path": source.name, "replay_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            receipt = prepare((row, directory, directory))
+            with np.load(root / f"{receipt['key']}.npz") as arrays:
+                self.assertEqual(arrays["features"].shape, (719, 264, 124))
+                self.assertEqual(arrays["labels"][0, 0], UNIT_ACTION_TO_ID[("EAST",)])
+                self.assertEqual(arrays["labels"][1, 0], UNIT_ACTION_TO_ID[("PASS",)])
+                self.assertEqual(arrays["labels"][-1, 0], UNIT_ACTION_TO_ID[("PASS",)])
+
+    def test_bc_updates_actor_preserves_value_and_ignores_padding(self):
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        import optax
+        from kaggriculture.agents.neural import prepare_fixed_batch
+        from kaggriculture.model.policy import JaxModelConfig, initialize_params, add_zero_value_head
+        from kaggriculture.observations.features import encode_observation
+        from kaggriculture.search.reference_engine import Game
+        from kaggriculture.training.bc_objective import make_steps
+        from kaggriculture.training.checkpointing import policy_hash
+        from kaggriculture.training.global_update import GlobalUpdate
+        from kaggriculture.training.sharding import put_replicated
+
+        model = JaxModelConfig(d_model=32, layers=1, heads=2, ffn_dim=64, rope_dim=16,
+                               attention_backend="manual", rope_correction_backend="dense", absolute_sell=True)
+        params = add_zero_value_head(initialize_params(jax.random.PRNGKey(0), model), model)
+        teacher_hash = policy_hash(params)
+        observation = Game(0).observation(0)
+        fixed = prepare_fixed_batch(encode_observation(observation), observation).arrays
+        batch = {key: np.repeat(value, 2, axis=0) for key, value in fixed.items()}
+        batch.update(unit_action=np.full((2, 20), -100, np.int32),
+                     market_action=np.zeros((2, 10), np.int32), sample_mask=np.array([1, 0], np.float32))
+        batch["unit_action"][0, 0] = 4
+        optimizer = optax.chain(optax.clip_by_global_norm(5), optax.adam(1e-4, eps=1e-5))
+        step, _ = make_steps(model, jnp.float32, optimizer, 0.1, 0.1, 0.05)
+        update = GlobalUpdate(step, jax.devices())
+        devices = jax.local_devices()
+        replicated = put_replicated(params, devices)
+        state = put_replicated(optimizer.init(params), devices)
+
+        def apply(values):
+            arrays = jax.tree.map(lambda value: jnp.asarray(value)[None], values)
+            result, _, metrics = update(replicated, state, replicated, arrays, True)
+            host = jax.tree.map(lambda value: np.asarray(value)[0], result)
+            return host, metrics
+
+        learned, metrics = apply(batch)
+        altered = deepcopy(batch)
+        altered["unit_action"][1] = 499
+        altered["market_action"][1] = 1902
+        after_padding_change, _ = apply(altered)
+        self.assertNotEqual(policy_hash(learned), teacher_hash)
+        self.assertEqual(policy_hash(params), teacher_hash)
+        self.assertEqual(policy_hash(learned["value"]), policy_hash(params["value"]))
+        self.assertEqual(policy_hash(learned), policy_hash(after_padding_change))
+        self.assertTrue(np.isfinite(np.asarray(metrics["loss"])).all())
+        self.assertEqual(float(np.asarray(metrics["sample_count"]).item()), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

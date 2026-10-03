@@ -1,4 +1,7 @@
 .venv/
+.venv-bc*/
+data/
+models/
 __pycache__/
 *.pyc
 *.pt
@@ -15,3 +18,4 @@ third_party/kaggriculture-simulation/selfplay/
 third_party/kaggriculture-simulation/gauntlets/
 replay/
 native/target/
+kaggriculture-solution/

@@ -1,1 +1,1 @@
-"""Independent native mixed-production RL; Python hosts reference evaluation only."""
+"""Native planning experiments, full-action replay BC, and independent evaluation."""
