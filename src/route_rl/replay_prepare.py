@@ -45,7 +45,7 @@ def prepare_trajectory(task: tuple[dict, str, str]) -> dict:
             tracker.update(steps[turn - 1][seat]["observation"], observation, steps[turn][seat].get("action", {}))
         actions = [state.get("action", {}) for state in steps[turn + 1]]
         encoded = encode_observation(observation, tracker.estimate())
-        if len(encoded.features) > 264 or any(1 + len(farm.get("hands", [])) > 20 for farm in observation["farms"]):
+        if len(encoded.features) > 264 or 1 + len(observation["farms"][seat].get("hands", [])) > 20:
             raise ValueError(f"episode {episode}, turn {turn}: units exceed the project model capacity")
         features[turn, :len(encoded.features)] = encoded.features
         labels[turn] = label_actions(observation, actions[seat] or {},

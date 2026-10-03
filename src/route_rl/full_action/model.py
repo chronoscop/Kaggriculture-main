@@ -32,13 +32,13 @@ class JaxModelConfig:
     layers: int = 6
     heads: int = 8
     ffn_dim: int = 1024
-    dropout: float = 0.1
+    dropout: float = 0.0
     rope_dim: int = 16
     rope_base: float = 100.0
     attention_backend: str = "manual"
-    rope_correction_backend: str = "dense"
+    rope_correction_backend: str = "partitioned"
     legal_mask: bool = False
-    absolute_sell: bool = False
+    absolute_sell: bool = True
     sequential_patch: bool = False
 
     def validate(self) -> None:
@@ -46,12 +46,6 @@ class JaxModelConfig:
             raise ValueError("project BC requires unmasked full actions and absolute SELL; patches are unsupported")
         if min(self.d_model, self.layers, self.heads, self.ffn_dim) <= 0:
             raise ValueError("model dimensions must be positive")
-        if self.sequential_patch and not self.absolute_sell:
-            raise ValueError("sequential patch shed sales require absolute quantities")
-        if self.sequential_patch and self.legal_mask:
-            raise ValueError("sequential patch uses its own support, not independent legal masks")
-        if self.absolute_sell and self.legal_mask:
-            raise ValueError("absolute SELL currently requires the unmasked policy")
         if self.d_model % self.heads:
             raise ValueError("d_model must be divisible by heads")
         head_dim = self.d_model // self.heads
@@ -495,4 +489,3 @@ def policy_forward(
             value += (w0 + w1 * time) * difference
         outputs["value"] = value
     return outputs
-

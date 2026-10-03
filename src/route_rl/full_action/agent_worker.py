@@ -24,6 +24,7 @@ def main() -> None:
             agent = module.agent
         else:
             raise ValueError("unknown evaluation worker kind")
+    print(json.dumps({"ready": True}), flush=True)
     for line in sys.stdin:
         try:
             request = json.loads(line)

@@ -1,6 +1,6 @@
 # Adapted from msdsm/kaggriculture-solution, commit 84057a0fda4238ccdebc46f9bf5496c6c4b2e00d.
 # Source: training/bc.py (project entry and supported execution scope adapted); see docs/action_bc_sources.md.
-"""Continue the initial actor on public and selected search-selfplay labels only."""
+"""Full-action replay BC candidate training with reproducible epoch boundaries."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import pickle
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -19,12 +20,11 @@ from .checkpoints import load_training_source as host_checkpoint
 from route_rl.full_action.metrics import aggregate, first_local_replica
 from route_rl.full_action.bc_objective import make_steps
 from route_rl.full_action.checkpoints import atomic_pickle, policy_hash, save_params_payload
+from route_rl.full_action.checkpoints import POLICY_CONTRACT
 from route_rl.full_action.global_update import GlobalUpdate
 from route_rl.full_action.model import JaxModelConfig
 from route_rl.full_action.sharding import put_replicated
 
-
-from types import SimpleNamespace
 
 def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None:
     args = SimpleNamespace(initial=initial, cache=cache, output=output, **config)
@@ -132,7 +132,9 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
             summary[name] = aggregate(metrics)
         host_params = first_local_replica(params)
         boundary = {
+            "contract": POLICY_CONTRACT,
             "params": host_params,
+            "policy_sha256": policy_hash(host_params),
             "optimizer_state": first_local_replica(state),
             "epoch": epoch,
             "initial_sha256": initial_sha,
@@ -176,4 +178,3 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
     multihost_utils.sync_global_devices("replay-bc-complete")
     if processes > 1:
         jax.distributed.shutdown()
-

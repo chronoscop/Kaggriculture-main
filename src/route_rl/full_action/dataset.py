@@ -26,11 +26,15 @@ class ReplayDataset:
     def __init__(self, cache: Path, split: str, processes: int, rank: int) -> None:
         index = json.loads((cache / "index.json").read_text())
         rows = [row for row in index["episodes"] if row["split"] == split]
+        if not rows:
+            raise ValueError(f"empty replay split: {split}")
         padded_size = ((len(rows) + processes - 1) // processes) * processes
         rows = [rows[index % len(rows)] for index in range(padded_size)][rank::processes]
-        archives = [np.load(cache / f"{row['key']}.npz") for row in rows]
-        self.features = [archive["features"] for archive in archives]
-        self.labels = [archive["labels"] for archive in archives]
+        self.features, self.labels = [], []
+        for row in rows:
+            with np.load(cache / f"{row['key']}.npz", allow_pickle=False) as archive:
+                self.features.append(archive["features"])
+                self.labels.append(archive["labels"])
         self.offsets = np.cumsum([0, *[len(values) for values in self.features]])
         self.size = int(self.offsets[-1])
         if not self.size:

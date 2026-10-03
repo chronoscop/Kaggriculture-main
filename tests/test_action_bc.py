@@ -309,6 +309,74 @@ class FullActionImplementationChecks(unittest.TestCase):
                 self.assertEqual(arrays["labels"][1, 0], UNIT_ACTION_TO_ID[("PASS",)])
                 self.assertEqual(arrays["labels"][-1, 0], UNIT_ACTION_TO_ID[("PASS",)])
 
+    def test_feature_only_training_forward_matches_inference_batch(self):
+        import jax
+        import numpy as np
+        from route_rl.full_action.inference import prepare_fixed_batch
+        from route_rl.full_action.features import encode_observation
+        from route_rl.full_action.model import JaxModelConfig, initialize_params, policy_forward
+
+        model = JaxModelConfig(d_model=32, layers=1, heads=2, ffn_dim=64)
+        params = initialize_params(jax.random.PRNGKey(0), model)
+        observation = Game(0).observation(0)
+        fixed = prepare_fixed_batch(encode_observation(observation), observation).arrays
+        full = policy_forward(params, fixed, model)
+        cached = policy_forward(params, {"features": fixed["features"]}, model)
+        np.testing.assert_array_equal(full["unit_action"], cached["unit_action"])
+        np.testing.assert_array_equal(full["market_action"], cached["market_action"])
+
+    def test_project_trainer_saves_resumes_and_loads_candidate_policy(self):
+        import numpy as np
+        from route_rl.action_bc import initialize
+        from route_rl.full_action.catalog import UNIT_ACTION_TO_ID
+        from route_rl.full_action.checkpoints import load_training_source, policy_hash
+        from route_rl.full_action.features import encode_observation
+        from route_rl.full_action.inference import load_policy, prepare_fixed_batch
+        from route_rl.full_action.trainer import run_training
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initial, cache, output = root / "initial.pkl", root / "cache", root / "run"
+            initialize("smoke", initial, 0)
+            before = load_training_source(initial)
+            cache.mkdir()
+            observation = Game(0).observation(0)
+            features = prepare_fixed_batch(encode_observation(observation), observation).arrays["features"]
+            labels = np.full((3, 30), -100, np.int16)
+            labels[:, 0] = UNIT_ACTION_TO_ID[("PASS",)]
+            labels[:, 20:] = 0
+            rows = [{"key": str(game), "episode_id": game, "seat": 0, "split": split}
+                    for game, split in ((1, "train"), (7, "validation"))]
+            for row in rows:
+                np.savez_compressed(cache / f"{row['key']}.npz", features=np.repeat(features, 3, axis=0), labels=labels)
+            (cache / "index.json").write_text(json.dumps({"episodes": rows}))
+            config = {"batch_per_gpu": 2, "epochs": 1, "unit_entropy": 0.1, "market_entropy": 0.1,
+                      "teacher_kl": 0.05, "compute_dtype": "float32", "learning_rate": 1e-4,
+                      "seed": 51, "save_epoch_policies": True}
+            run_training(initial, cache, output, config)
+            policy_path = output / "final_student_jax.pkl"
+            learned = load_training_source(policy_path)
+            self.assertNotEqual(policy_hash(before["params"]), policy_hash(learned["params"]))
+            self.assertEqual(policy_hash(before["params"]["value"]), policy_hash(learned["params"]["value"]))
+            self.assertEqual(policy_hash(before["params"]), policy_hash(load_training_source(initial)["params"]))
+            receipt = json.loads((output / "receipt.json").read_text())
+            self.assertFalse(receipt["value_training"])
+            self.assertEqual(receipt["teacher_policy_sha256"], policy_hash(before["params"]))
+            # Resuming a completed epoch must not silently perform another update.
+            run_training(initial, cache, output, config)
+            self.assertEqual(policy_hash(learned["params"]), policy_hash(load_training_source(policy_path)["params"]))
+            self.assertEqual(len((output / "metrics.jsonl").read_text().splitlines()), 1)
+            action = load_policy(policy_path)(observation)
+            self.assertEqual(set(action), {"farmer", "hands", "market"})
+            self.assertEqual(len(action["hands"]), len(observation["farms"][0]["hands"]))
+            self.assertLessEqual(len(action["market"]), 10)
+            # Reference/legacy payloads need an explicit conversion, never a silent resume.
+            import pickle
+            old = root / "old.pkl"
+            old.write_bytes(pickle.dumps({"model_config": learned["model_config"], "params": learned["params"]}))
+            with self.assertRaisesRegex(ValueError, "not a project full-action policy"):
+                load_training_source(old)
+
     def test_bc_updates_actor_preserves_value_and_ignores_padding(self):
         import jax
         import jax.numpy as jnp

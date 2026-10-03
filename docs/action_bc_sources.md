@@ -12,7 +12,7 @@
 | `model.py` | typed adapters、Transformer、同农场 2D RoPE、单位/市场头 | 保留基础 manual attention；移除 cuDNN、自定义 kernel 与搜索补丁路径 |
 | `bc_objective.py`、`trainer.py`、`dataset.py` | CE、熵、初始策略 KL、固定 teacher、epoch 续训 | 项目配置与输入契约；当前单进程单设备 |
 | `global_update.py`、`sharding.py`、`metrics.py` | JAX 梯度与指标汇总 | 只纳入 BC 所需的函数 |
-| `inference.py` | 固定形状输入、单位与市场解码 | 使用本项目 checkpoint；无启发式/季末搜索；两边单位上限与预处理一致 |
+| `inference.py` | 固定形状输入、单位与市场解码 | 使用本项目 checkpoint；保留最多 20 个己方单位及 40 个总单位的编码；超出的己方单位 PASS；无启发式/季末搜索 |
 | `checkpoints.py`、`evaluation.py`、`agent_worker.py` | 参数校验、原子保存、独立进程对局思路 | 本项目 policy 契约；交换座位；完整终局得分 |
 
 `replay_download.py` 使用官方 Kaggle API，参考 release 未提供历史下载器或历史回放。`action_bc.py` 管理本项目源码指纹、数据隔离、缓存审计、训练续跑与候选评估。

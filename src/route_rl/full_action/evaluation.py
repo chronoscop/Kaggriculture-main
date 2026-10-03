@@ -15,6 +15,15 @@ class AgentProcess:
             [sys.executable, "-u", "-m", "route_rl.full_action.agent_worker", kind, str(path.resolve())],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
         )
+        try:
+            if not select.select([self.process.stdout], [], [], 120)[0]:
+                raise TimeoutError("agent initialization did not finish")
+            line = self.process.stdout.readline()
+            if not line or json.loads(line) != {"ready": True}:
+                raise RuntimeError("agent initialization failed; see stderr")
+        except Exception:
+            self.close()
+            raise
 
     def __call__(self, observation, configuration):
         self.process.stdin.write(json.dumps({"observation": observation, "configuration": configuration}) + "\n")
@@ -38,6 +47,7 @@ class AgentProcess:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait()
+        self.process.stdout.close()
 
 
 def evaluate_games(policy: Path, opponent: Path, seed_start: int, games: int, output: Path) -> list[dict]:

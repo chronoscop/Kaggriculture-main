@@ -44,8 +44,6 @@ def prepare_fixed_batch(encoded: EncodedObservation, observation: dict[str, Any]
 
     actual_own_units = 1 + len(farms[player].get("hands", []))
     actual_opponent_units = 1 + len(farms[1 - player].get("hands", []))
-    if max(actual_own_units, actual_opponent_units) > MAX_OWN_UNITS:
-        raise ValueError("observation exceeds the full-action BC capacity of 20 units per farm")
     encoded_own_units = min(actual_own_units, MAX_OWN_UNITS)
     encoded_opponent_units = min(actual_opponent_units, MAX_TOTAL_UNITS - encoded_own_units)
 
@@ -144,6 +142,7 @@ class GreedyPolicy:
         fixed = prepare_fixed_batch(encode_observation(observation, self.tracker.estimate()), observation)
         outputs = jax.device_get(self.forward(jax.tree.map(jnp.asarray, fixed.arrays)))
         units = [decode_unit_action(outputs["unit_action"][0, index]) for index in range(fixed.encoded_own_units)]
+        units.extend([["PASS"] for _ in range(fixed.actual_own_units - fixed.encoded_own_units)])
         sellable = shed_after_unit_actions(observation, units)
         market = []
         for logits in outputs["market_action"][0]:
@@ -161,4 +160,3 @@ class GreedyPolicy:
 
 def load_policy(path: str | Path, *, warm: bool = True) -> GreedyPolicy:
     return GreedyPolicy(load_training_source(Path(path)), warm=warm)
-
