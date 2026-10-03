@@ -77,6 +77,9 @@ def inspect_index(index: Path) -> dict:
         else:
             replay = read_replay(path)
             seed = replay_seed(replay)
+            if seed == 0:
+                raise ValueError("seed=0 demonstrations are excluded from public BC; run "
+                                 "route_rl.replay_download filter-zero-seed on this download directory")
             games[episode] = digest, seed
             if seed is not None:
                 seed = int(seed)

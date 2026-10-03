@@ -10,7 +10,8 @@ import unittest
 from unittest.mock import patch
 
 from route_rl.action_bc import CONTRACT, audit_cache, inspect_index, source_identity, train, validation_episode
-from route_rl.replay_download import discover, download, teacher_seats, validate_replay
+from route_rl.replay_download import (SEED_ZERO_SKIP_REASON, discover, download,
+                                      filter_zero_seed_index, teacher_seats, validate_replay)
 from route_rl.replay_rules import replay_seed
 from route_rl.paths import PROJECT_ROOT
 
@@ -144,6 +145,114 @@ class ReplayContracts(unittest.TestCase):
                 self.assertEqual(json.loads(output.read_text())["teachers"][0]["submission_id"], 12)
                 with self.assertRaisesRegex(ValueError, "snapshot already exists"):
                     discover(api, "kaggriculture", 1, output)
+
+    def test_zero_seed_filter_updates_original_index_and_receipt_with_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = []
+            for game, seed, seats in ((1, 0, (0, 1)), (2, None, (0,)), (7, 77, (0, 1))):
+                replay = replay_fixture()
+                replay["configuration"]["seed"] = seed
+                (root / f"{game}.json.gz").write_bytes(gzip.compress(json.dumps(replay).encode()))
+                for seat in seats:
+                    row = {"episode_id": game, "seat": seat, "submission_id": 12,
+                           "path": f"{game}.json.gz", "seed": seed}
+                    if seed == 0:
+                        row.pop("seed")  # A legacy index resolves the actual replay seed.
+                    rows.append(row)
+            index = root / "teacher-seats.jsonl"
+            original = "".join(json.dumps(row) + "\n" for row in rows)
+            index.write_text(original)
+            (root / "download_receipt.json").write_text(json.dumps({"schema": "public-bc-download-v2",
+                                                                    "teacher_seats": 5, "unique_games": 3}))
+            result = filter_zero_seed_index(root)
+            self.assertEqual((result["removed_games"], result["removed_teacher_seats"]), (1, 2))
+            self.assertEqual((result["unique_games"], result["teacher_seats"]), (2, 3))
+            self.assertEqual(next(root.glob("teacher-seats.before-zero-seed-*.jsonl")).read_text(), original)
+            self.assertTrue((root / "1.json.gz").exists())
+            retained = [json.loads(line) for line in index.read_text().splitlines()]
+            self.assertEqual({row["episode_id"] for row in retained}, {2, 7})
+            receipt = json.loads((root / "download_receipt.json").read_text())
+            self.assertEqual(receipt["teacher_seats"], 3)
+            self.assertEqual(receipt["excluded_seed_values"], [0])
+            self.assertEqual(receipt["index_sha256"], hashlib.sha256(index.read_bytes()).hexdigest())
+            filtered = index.read_bytes()
+            self.assertEqual(filter_zero_seed_index(root)["removed_games"], 0)
+            self.assertEqual(index.read_bytes(), filtered)
+
+    def test_download_skips_runtime_seed_zero_and_fills_quota_without_redownloading_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            teachers = root / "selected.json"
+            teachers.write_text(json.dumps({"competition": "kaggriculture", "teachers": [{"submission_id": 12}]}))
+            games = sorted([episode(game, [(0, 12), (1, 99)]) for game in (1, 7)],
+                           key=lambda game: hashlib.sha256(f"51:12:{game.id}".encode()).digest())
+            zero, normal = games
+            fetched = []
+
+            def fetch(identity, path, quiet):
+                fetched.append(identity)
+                replay = replay_fixture()
+                if identity == zero.id:
+                    replay["configuration"]["seed"] = None
+                    replay["info"] = {"seed": 0}
+                (Path(path) / f"episode-{identity}-replay.json").write_text(json.dumps(replay))
+
+            api = NS(competition_list_episodes=lambda _: games, competition_episode_replay=fetch)
+            output = root / "data"
+            with patch("route_rl.replay_download.call_api", side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+                download(api, teachers, output, 1, 0)
+                first = (output / "teacher-seats.jsonl").read_bytes()
+                download(api, teachers, output, 1, 0)
+            self.assertEqual(fetched, [zero.id, normal.id])
+            self.assertEqual(json.loads(first)["episode_id"], normal.id)
+            self.assertFalse((output / "replays" / f"{zero.id}.json.gz").exists())
+            self.assertEqual((output / "teacher-seats.jsonl").read_bytes(), first)
+            skipped = [json.loads(line) for line in (output / "skipped.jsonl").read_text().splitlines()]
+            self.assertEqual(skipped, [{"episode_id": zero.id, "reason": SEED_ZERO_SKIP_REASON}])
+
+    def test_resumed_download_excludes_indexed_and_unindexed_cached_zero_seed_games(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            teachers = root / "selected.json"
+            teachers.write_text(json.dumps({"competition": "kaggriculture", "teachers": [{"submission_id": 12}]}))
+            games = sorted([episode(game, [(0, 12), (1, 99)]) for game in (1, 7, 8)],
+                           key=lambda game: hashlib.sha256(f"51:12:{game.id}".encode()).digest())
+            indexed_zero, cached_zero, normal = games
+            output = root / "data"
+            (output / "replays").mkdir(parents=True)
+            zero_replay = replay_fixture()
+            zero_replay["configuration"]["seed"] = 0
+            for game in (indexed_zero, cached_zero):
+                (output / "replays" / f"{game.id}.json.gz").write_bytes(gzip.compress(json.dumps(zero_replay).encode()))
+            old_row = {"episode_id": indexed_zero.id, "seat": 0, "submission_id": 12, "seed": 0,
+                       "path": f"replays/{indexed_zero.id}.json.gz"}
+            (output / "teacher-seats.jsonl").write_text(json.dumps(old_row) + "\n")
+            fetched = []
+
+            def fetch(identity, path, quiet):
+                fetched.append(identity)
+                (Path(path) / f"episode-{identity}-replay.json").write_text(json.dumps(replay_fixture()))
+
+            api = NS(competition_list_episodes=lambda _: games, competition_episode_replay=fetch)
+            with patch("route_rl.replay_download.call_api", side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+                download(api, teachers, output, 1, 0)
+            self.assertEqual(fetched, [normal.id])
+            self.assertEqual(json.loads((output / "teacher-seats.jsonl").read_text())["episode_id"], normal.id)
+            skipped = [json.loads(line) for line in (output / "skipped.jsonl").read_text().splitlines()]
+            self.assertEqual({row["episode_id"] for row in skipped}, {indexed_zero.id, cached_zero.id})
+            self.assertTrue(all(row["reason"] == SEED_ZERO_SKIP_REASON for row in skipped))
+
+    def test_prepare_inspection_rejects_zero_seed_if_an_old_index_is_reintroduced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            replay = replay_fixture()
+            replay["configuration"]["seed"] = 0
+            (root / "1.json.gz").write_bytes(gzip.compress(json.dumps(replay).encode()))
+            index = root / "teacher-seats.jsonl"
+            index.write_text(json.dumps({"episode_id": 1, "seat": 0, "submission_id": 12, "path": "1.json.gz"}) + "\n")
+            with self.assertRaisesRegex(ValueError, "seed=0 demonstrations are excluded"):
+                inspect_index(index)
 
     def test_inspection_holds_both_seats_out_and_rejects_conflicting_teachers(self):
         self.assertFalse(validation_episode(1))

@@ -81,7 +81,9 @@ PYTHONPATH=src .venv-bc-tools/bin/python -m route_rl.replay_download download \
   --out data/action_bc/public --limit-per-teacher 5
 ```
 
-5 局／教师用于先检查下载和准备链路，最多约 100 局；不是他们的完整训练数据规模。确认数据后，同目录重复命令，把数量提高到例如 100，已下载文件会复用。样本按固定 episode 哈希排序，保留正常完成的胜、平、负，不按终局现金挑选。下载额度按每个教师的独立局数计，不按座位轨迹计。
+5 局／教师用于先检查下载和准备链路，最多约 100 局；不是他们的完整训练数据规模。确认数据后，同目录重复命令，把数量提高到例如 100，已下载文件会复用。样本按固定 episode 哈希排序，保留正常完成的胜、平、负，不按终局现金挑选。按用户要求排除 `seed=0` 的开头自博弈对局：读取真实 `configuration.seed` 或 `info.seed` 后跳过，跳过的局不占下载额度，继续尝试其他对局。已确认的零种子 episode ID 保存在 `skipped.jsonl`，续下载不重复请求这些回放。缺失 seed 不当作 0。下载额度按每个教师的独立局数计，不按座位轨迹计。
+
+`bash tools/download_public_bc.sh data/action_bc 20 100` 会先原地清理旧索引里的零种子对局，再执行下载；直接使用 Python 下载入口也会清理，并自动过滤新遇到的零种子对局。原索引路径仍是 `data/action_bc/public/teacher-seats.jsonl`。清理会保留带校验值的原索引备份、原始 replay 文件，并更新已有下载 receipt 的计数和索引校验值。
 
 当前前 20 队并非他们当年的同一组教师。历史 34 个提交的完整 ID 清单不在公开 release 中。`discover` 将队伍名、公开分数和 submission ID 保存下来供检查，也可以手工创建这样的显式教师清单：
 
@@ -124,28 +126,44 @@ PYTHONPATH=src .venv-bc-tools/bin/python -m route_rl.replay_download download \
 
 ## 准备与训练 BC
 
-使用 Python 3.12 或更高版本另建训练环境，安装本项目的 BC 依赖：
+使用 Python 3.12 或更高版本。下面按当前机器的系统 `python` 执行，无需创建 `.venv-bc`。当前 A40 使用本项目的 GPU 依赖；CPU 验证环境可改用 `.[bc]`。等待公开回放下载完成后，再执行准备步骤。
+
+本项目 `full_action/configs/bc.json` 保留参考公开配置：每卡 batch 320、BF16、学习率 `1e-4`、Adam epsilon `1e-5`、梯度裁剪 5、两个熵系数均为 `0.10`、初始策略 KL 系数 `0.05`、随机种子 51，并保存每个 epoch 的策略。公开文件的 `epochs=2` 对应最后阶段。本项目从零起步的下列命令采用六层 bootstrap，并参照历史 BC1 的 **30 个 epoch**；其余设置沿用公开配置。历史 BC1 的完整早期超参数没有公开，不能称为逐项复现。
 
 ```bash
-python -m venv .venv-bc
-.venv-bc/bin/python -m pip install -e '.[bc]'
-PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc doctor
+python -m pip install -e '.[bc-gpu]'
+PYTHONPATH=src python -m route_rl.action_bc doctor
 
-PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc prepare \
+PYTHONPATH=src python -m route_rl.action_bc prepare \
   --index data/action_bc/public/teacher-seats.jsonl \
-  --out data/action_bc/prepared_own --workers 4
+  --out data/action_bc/prepared_own --workers 16
 
-PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc init \
+PYTHONPATH=src python -m route_rl.action_bc init \
   --model bootstrap --out models/action_bc_own_initial.pkl
 
-PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc train \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m route_rl.action_bc train \
   --initial models/action_bc_own_initial.pkl \
   --cache data/action_bc/prepared_own/cache \
   --out runs/action_bc_own_public_trial \
-  --epochs 2 --batch-size 16 --compute-dtype float32
+  --epochs 30 --batch-size 320 --compute-dtype bfloat16
 ```
 
-CUDA 训练需要对应的驱动，安装命令为 `pip install -e '.[bc-gpu]'`；多 GPU 主机先用 `CUDA_VISIBLE_DEVICES=0` 选择一张卡。`doctor` 输出本项目源码指纹与依赖版本，不读取参考目录。当前 BC 入口支持单进程、单设备；分布式启动尚未接入。
+如果安装在 Debian 自带的 `blinker 1.7.0` 上报 `uninstall-no-record-file`，先只对该包跳过旧安装的卸载，再重新执行依赖安装：
+
+```bash
+python -m pip install --ignore-installed --no-deps blinker==1.9.0
+python -m pip install -e '.[bc-gpu]'
+```
+
+当前机器的旧包位于 `/usr/lib/python3/dist-packages`，pip 包安装到 `/usr/local/lib/python3.12/dist-packages`，无需删除 Debian 文件。只对 `blinker` 使用 `--ignore-installed`，不要给整套 BC 依赖加这个选项。安装成功后先确认 JAX 能看到 GPU：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -c 'import jax; print(jax.devices())'
+```
+
+输出应包含 `CudaDevice`，然后继续执行准备、初始化与训练步骤。CUDA 训练需要对应的驱动，安装命令为 `pip install -e '.[bc-gpu]'`；多 GPU 主机先用 `CUDA_VISIBLE_DEVICES=0` 选择一张卡。`doctor` 输出本项目源码指纹与依赖版本，不读取参考目录。当前 BC 入口支持单进程、单设备；分布式启动尚未接入。
+
+`prepare --workers` 只控制读取/解压回放、编码与生成标签的 **CPU 进程数**，不表示 GPU 的训练并行度。参考预处理默认 16 个进程；当前机器可见 96 个 CPU，本命令采用 16。BC 训练将一个 320 样本的 batch 交给一张 A40 计算，不通过这 16 个预处理进程训练。
 
 模型配置属于本项目包内的 `src/route_rl/full_action/configs/`。`bootstrap` 为六层、宽度 256；`10m` 为十二层；`smoke` 为一层、宽度 32，只用于实现检查。采用手写 JAX attention 数值路径；保留同一特征、参数形状及动作语义，未接入对方的实验 kernel 或 Net2Net 工具。三种训练预设均使用从 features 恢复元数据的分组路径，支持 feature-only BC 缓存。
 
@@ -159,6 +177,19 @@ CUDA 训练需要对应的驱动，安装命令为 `pip install -e '.[bc-gpu]'`�
 - 如果不同 episode 的已知 seed 相同却落入不同 split，会拒绝准备，要求从清单排除冲突对局，避免已知验证 seed 进入训练。
 - 用教师此前实际动作推进公开库存估计，与推理时的 tracker 语义衔接。
 
+旧索引可以在原路径剔除全部零种子对局及双方教师座位，不需要换 `--index`：
+
+```bash
+PYTHONPATH=src python -m route_rl.replay_download filter-zero-seed \
+  --out data/action_bc/public
+
+PYTHONPATH=src python -m route_rl.action_bc prepare \
+  --index data/action_bc/public/teacher-seats.jsonl \
+  --out data/action_bc/prepared_own --workers 16
+```
+
+清理记录保存在 `seed-zero-filter.json`，包括备份文件名、剔除的 episode ID、清理前后校验值和数量。准备入口仍读取原始回放核验种子，拒绝未清理的零种子示范，并保持其他已知种子的训练／验证隔离检查。若非零种子仍跨 split，需要排除其冲突局，不能关闭隔离检查。若此前已有缓存，使用新的准备目录；若在入口检查阶段就退出且没有生成缓存，可继续用原输出路径。
+
 训练前再次检查张量形状、有限特征、动作 ID 范围、去重与 split，计算每个数组的校验值。源码、输入、缓存或训练参数变化时，要求新目录；正常续训只允许增加累计 epoch。新初始文件不能冒充旧 run 的原始初始化。需要重新扩大下载数据时，也使用新的准备目录和训练目录；可将已训练 `.pkl` 作为新 BC 阶段的 `--initial`。
 
 当前项目 BC trainer 将所有轨迹展开到主机 RAM。每条特征张量约 **47 MB**，2,000 条约 **94 GB**，还不包括训练开销。磁盘 `.npz` 的压缩大小不能作为内存需求；本入口输出解压字节数并检查明显的 RAM 不足。先按硬件选教师子集，后续如需大规模数据，应实现流式读取再扩张，而不是直接照搬 4,459 条全部内存加载。
@@ -171,16 +202,33 @@ CE_unit + CE_market
 + 0.05 × [KL(initial || current)_unit + KL(initial || current)_market]
 ```
 
-学习率 `1e-4`、Adam epsilon `1e-5`、梯度裁剪 5，冻结本轮初始策略作为 KL 参考，不训练 value head。以上来自公开最后阶段 `bc.json`，不能说第一轮历史 BC 的全部超参数就是这套。本项目命令先给出 2 个 epoch 的起步预算，再根据留出和独立评估决定预算；若按历史第一轮的遍数运行，可在同一 run 命令中设 `--epochs 30`。30 是历史遍数，不是本项目已验证的最佳值。
+学习率 `1e-4`、Adam epsilon `1e-5`、梯度裁剪 5，冻结本轮初始策略作为 KL 参考，不训练 value head。以上来自公开最后阶段 `bc.json`，不能说第一轮历史 BC 的全部超参数就是这套。起步命令参照历史第一轮设 `--epochs 30`；若仅按公开最后阶段文件运行，设 `--epochs 2`。30 是历史遍数，不是本项目已验证的最佳值。使用过 batch 16 的 run 不能改成 320 后原目录续训；改变 batch 等训练设置时使用新 run 目录，保留旧产物。
 
 输出：`metrics.jsonl`、`latest_bc_state.pkl`、每个 epoch 的 policy、`final_student_jax.pkl`、本项目 `receipt.json` 和本仓库 `integration.json`。BC 用动作交叉熵监督，不拿现金作为辅助标签或奖励。
 
-## BC 完成后才评估，再接 PPO
+## 训练期间验证与整局评估
+
+参考 BC 源码和本项目 trainer 都会在**每个 epoch** 完成训练 pass 后跑完整留出集，输出 unit/market CE、准确率、熵和 teacher KL，写入 `metrics.jsonl`；验证 pass 不更新参数。启用的 `save_epoch_policies=true` 会原子保存 `epoch-1-policy.pkl`、`epoch-2-policy.pkl` 等文件。每 100 个 batch 的训练 loss 日志不是整局评估。
+
+参考公开 BC 循环没有自动插入对手对局；它的整局评估是独立入口。历史上每次手动评估的频率未公开。本项目已经支持 `evaluate --policy` 指定某个 epoch 的策略，**无需等全部 30 个 epoch 训练完**。以下命令在 `epoch-1-policy.pkl` 出现后另开终端执行；评估使用 CPU，不占用正在训练的单张 A40：
+
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH=src python -m route_rl.action_bc evaluate \
+  --run runs/action_bc_own_public_trial \
+  --policy runs/action_bc_own_public_trial/epoch-1-policy.pkl \
+  --opponent agents/farm2945_resilient_response/main.py \
+  --seed 1600000000 --games 16 \
+  --out runs/action_bc_public_eval/epoch-1-farm2945.json
+```
+
+后续 epoch 使用对应策略文件与不同的输出路径。固定种子的阶段性比较不能当成多批独立确认；若据此选模型，后续另取未用于选择的种子做独立确认。上述命令手动触发完整对局；当前自动进行的是每个 epoch 的留出验证，尚未实现自动逐 epoch 整局评估调度。
 
 留出集看 unit/market CE 和确定性动作一致率；无操作槽占比高，整体 accuracy 不能代替经营能力。进一步用未见种子交换座位完整运行，观察生产兑现、续种、路线和周转，最终比较终局 match score。
 
+全部训练完成后，也可不指定 `--policy`，默认评估 `final_student_jax.pkl`：
+
 ```bash
-PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc evaluate \
+PYTHONPATH=src python -m route_rl.action_bc evaluate \
   --run runs/action_bc_own_public_trial \
   --opponent agents/farm2945_resilient_response/main.py \
   --seed 1600000000 --games 16 \
@@ -200,7 +248,7 @@ PYTHONPATH=src .venv-bc/bin/python -m route_rl.action_bc evaluate \
 回归测试直接使用本项目模块与已安装的官方规则，不要求参考目录。检查教师座位、`observation[t] → action[t+1]`、实际成交数量、整局 split、续训输入一致性，以及 BC 只更新 actor/主干、保留 value 参数、忽略 padding。项目包的模型配置随安装一起分发。
 
 ```bash
-PYTHONPATH=src .venv-bc/bin/python -m unittest discover -s tests -p test_action_bc.py -v
+PYTHONPATH=src python -m unittest discover -s tests -p test_action_bc.py -v
 ```
 
 这些检查只证明数据和执行通路一致；正式 BC 训练和独立胜率实验由用户按上述命令运行。

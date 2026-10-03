@@ -17,6 +17,8 @@ import time
 
 from .replay_rules import COMPATIBLE_REPLAY_VERSIONS, compatibility_receipt, replay_seed
 
+SEED_ZERO_SKIP_REASON = "excluded_seed_zero"
+
 
 def write_json(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,6 +169,69 @@ def load_index(path: Path) -> dict:
     return rows
 
 
+def filter_zero_seed_index(output: Path) -> dict:
+    """Remove complete zero-seed episodes in place; retain a recoverable backup."""
+    index = output / "teacher-seats.jsonl"
+    if not index.exists():
+        return {"index": str(index), "removed_games": 0, "removed_teacher_seats": 0,
+                "teacher_seats": 0, "unique_games": 0}
+    original = index.read_bytes()
+    rows = load_index(index)
+    seeds = {}
+    for row in rows.values():
+        episode = int(row["episode_id"])
+        if "seed" in row:
+            seed = None if row["seed"] is None else int(row["seed"])
+        elif episode in seeds:
+            seed = seeds[episode]
+        else:
+            seed = replay_seed(read_replay(output / row["path"]))
+        if episode in seeds and seeds[episode] != seed:
+            raise ValueError(f"different seats record different seeds for episode {episode}")
+        seeds[episode] = seed
+    excluded = {episode for episode, seed in seeds.items() if seed == 0}
+    retained = {key: row for key, row in rows.items() if key[0] not in excluded}
+    result = {"index": str(index), "removed_games": len(excluded),
+              "removed_teacher_seats": len(rows) - len(retained),
+              "teacher_seats": len(retained), "unique_games": len({key[0] for key in retained})}
+    if excluded:
+        checksum = hashlib.sha256(original).hexdigest()
+        backup = index.with_name(f"{index.stem}.before-zero-seed-{checksum[:12]}{index.suffix}")
+        if backup.exists() and backup.read_bytes() != original:
+            raise ValueError("zero-seed index backup differs; preserve it and choose a new download directory")
+        if index.read_bytes() != original:
+            raise ValueError("teacher index changed during filtering; stop concurrent downloads and rerun")
+        if not backup.exists():
+            backup.write_bytes(original)
+        temporary = index.with_suffix(index.suffix + ".tmp")
+        temporary.write_text("".join(json.dumps(row) + "\n" for row in retained.values()))
+        temporary.replace(index)
+        with (output / "skipped.jsonl").open("a") as stream:
+            for episode in sorted(excluded):
+                stream.write(json.dumps({"episode_id": episode, "seed": 0,
+                                         "reason": SEED_ZERO_SKIP_REASON}) + "\n")
+        write_json(output / "seed-zero-filter.json",
+                   {"schema": "public-bc-seed-zero-filter-v1", **result,
+                    "source_index_sha256": checksum, "index_sha256": hashlib.sha256(index.read_bytes()).hexdigest(),
+                    "backup": backup.name, "excluded_episode_ids": sorted(excluded)})
+    download_receipt = output / "download_receipt.json"
+    if download_receipt.exists():
+        receipt = json.loads(download_receipt.read_text())
+        receipt.update(schema="public-bc-download-v3", excluded_seed_values=[0],
+                       teacher_seats=len(retained), unique_games=len({key[0] for key in retained}),
+                       index_sha256=hashlib.sha256(index.read_bytes()).hexdigest())
+        write_json(download_receipt, receipt)
+    return result
+
+
+def zero_seed_episode_ids(output: Path) -> set[int]:
+    path = output / "skipped.jsonl"
+    if not path.exists():
+        return set()
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return {int(row["episode_id"]) for row in rows if row.get("reason") == SEED_ZERO_SKIP_REASON}
+
+
 def download(api, teachers_file: Path, output: Path, limit: int, delay: float) -> None:
     snapshot = json.loads(teachers_file.read_text())
     if snapshot.get("competition") != "kaggriculture":
@@ -183,7 +248,11 @@ def download(api, teachers_file: Path, output: Path, limit: int, delay: float) -
     replays = output / "replays"
     replays.mkdir(exist_ok=True)
     index_path = output / "teacher-seats.jsonl"
+    filtered = filter_zero_seed_index(output)
+    if filtered["removed_games"]:
+        print(json.dumps({"event": "filtered_seed_zero", **filtered}), flush=True)
     rows = load_index(index_path)
+    excluded_zero_seed = zero_seed_episode_ids(output)
     for submission in ids:
         episodes = call_api(api.competition_list_episodes, submission)
         # Stable outcome-independent sampling, retaining losses and draws too.
@@ -201,25 +270,36 @@ def download(api, teachers_file: Path, output: Path, limit: int, delay: float) -
             if rejection is not None:
                 metadata_filtered[rejection] += 1
                 continue
+            if int(episode.id) in excluded_zero_seed:
+                skipped += 1
+                continue
             seats = teacher_seats(episode, submission)
             destination = replays / f"{episode.id}.json.gz"
+            fetched = False
             try:
                 if destination.exists():
                     replay = read_replay(destination)
                 else:
                     with tempfile.TemporaryDirectory(dir=replays) as temporary:
                         call_api(api.competition_episode_replay, episode.id, path=temporary, quiet=True)
+                        fetched = True
                         replay = read_replay(Path(temporary) / f"episode-{episode.id}-replay.json")
+                if replay_seed(replay) == 0:
+                    excluded_zero_seed.add(int(episode.id))
+                    raise ValueError(SEED_ZERO_SKIP_REASON)
+                if fetched:
                     compressed = gzip.compress(json.dumps(replay, separators=(",", ":")).encode(), mtime=0)
                     temporary_path = destination.with_suffix(".tmp")
                     temporary_path.write_bytes(compressed)
                     temporary_path.replace(destination)
-                    time.sleep(delay)
             except ValueError as error:
                 skipped += 1
                 with (output / "skipped.jsonl").open("a") as stream:
                     stream.write(json.dumps({"episode_id": episode.id, "reason": str(error)}) + "\n")
                 continue
+            finally:
+                if fetched:
+                    time.sleep(delay)
             checksum = hashlib.sha256(destination.read_bytes()).hexdigest()
             for seat in seats:
                 row = {"path": str(destination.relative_to(output)), "episode_id": int(episode.id),
@@ -241,9 +321,10 @@ def download(api, teachers_file: Path, output: Path, limit: int, delay: float) -
                           "metadata_filtered_games": dict(metadata_filtered)}), flush=True)
     if not rows:
         raise ValueError("no compatible full replays downloaded; see skipped.jsonl and teacher IDs")
-    write_json(output / "download_receipt.json", {"schema": "public-bc-download-v2", **compatibility_receipt(),
+    write_json(output / "download_receipt.json", {"schema": "public-bc-download-v3", **compatibility_receipt(),
                "teacher_seats": len(rows), "unique_games": len({key[0] for key in rows}),
                "limit_per_teacher": limit, "selection": "outcome-independent episode hash, seed 51",
+               "excluded_seed_values": [0],
                "index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest()})
 
 
@@ -261,12 +342,17 @@ def main() -> None:
     fetch.add_argument("--out", type=Path, required=True)
     fetch.add_argument("--limit-per-teacher", type=int, default=100)
     fetch.add_argument("--delay", type=float, default=1.0)
+    clean = commands.add_parser("filter-zero-seed", help="exclude seed=0 episodes from the existing index in place")
+    clean.add_argument("--out", type=Path, required=True, help="download directory containing teacher-seats.jsonl")
     args = parser.parse_args()
     if args.command == "discover" and not 1 <= args.top_teams <= 200:
         parser.error("top-teams must be between 1 and 200")
     if args.command == "download" and (args.limit_per_teacher < 1 or args.delay < 0 or not math.isfinite(args.delay)):
         parser.error("limit-per-teacher must be positive and delay finite and nonnegative")
     try:
+        if args.command == "filter-zero-seed":
+            print(json.dumps({"event": "filtered_seed_zero", **filter_zero_seed_index(args.out)}), flush=True)
+            return
         api = kaggle_api()
         if args.command == "discover":
             discover(api, args.competition, args.top_teams, args.out)

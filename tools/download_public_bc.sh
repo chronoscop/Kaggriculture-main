@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Public teacher snapshot -> full replays -> explicit teacher-seat BC index.
+# Public teacher snapshot -> full nonzero-seed replays -> teacher-seat BC index.
 set -euo pipefail
 
 BC_PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,6 +18,9 @@ if ! "$BC_PYTHON" -c 'from importlib.metadata import version; assert version("ka
 fi
 
 export PYTHONPATH="$BC_PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+# Apply the same seed=0 exclusion to old indexes before resuming. The downloader
+# also excludes new zero-seed replays without charging the per-teacher quota.
+"$BC_PYTHON" -m route_rl.replay_download filter-zero-seed --out "$BC_DATA_ROOT/public"
 # Kaggle 2.2.4's login command exits 1 when credentials already exist. Probe
 # usable authentication first so set -e does not stop a resumed download.
 if ! "$BC_PYTHON" - <<'PY'
