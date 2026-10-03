@@ -17,9 +17,22 @@ if ! "$BC_PYTHON" -c 'from importlib.metadata import version; assert version("ka
   "$BC_PYTHON" -m pip install 'kaggle==2.2.4'
 fi
 
-# The official client reuses an existing login. Otherwise it prints an OAuth URL.
-"$BC_KAGGLE" auth login --no-launch-browser
 export PYTHONPATH="$BC_PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+# Kaggle 2.2.4's login command exits 1 when credentials already exist. Probe
+# usable authentication first so set -e does not stop a resumed download.
+if ! "$BC_PYTHON" - <<'PY'
+import sys
+from route_rl.replay_download import kaggle_api
+
+try:
+    kaggle_api()
+except RuntimeError:
+    sys.exit(1)
+print("Kaggle authentication is ready; continuing with saved credentials.")
+PY
+then
+  "$BC_KAGGLE" auth login --no-launch-browser
+fi
 if [[ ! -f "$BC_DATA_ROOT/teachers.json" ]]; then
   "$BC_PYTHON" -m route_rl.replay_download discover \
     --top-teams "$BC_TOP_TEAMS" --out "$BC_DATA_ROOT/teachers.json"
