@@ -23,7 +23,7 @@
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[bc-gpu,replays]'
+python -m pip install -e '.[bc-gpu]'
 
 export CUDA_VISIBLE_DEVICES=0
 python -m route_rl.action_bc doctor
@@ -35,56 +35,37 @@ GPU 训练前，最后一条命令应显示 `CudaDevice`。`bc-gpu` 使用 JAX �
 如果使用 CPU，在创建并激活虚拟环境后，将安装和设备选择改为：
 
 ```bash
-python -m pip install -e '.[bc,replays]'
+python -m pip install -e '.[bc]'
 export JAX_PLATFORMS=cpu
 python -m route_rl.action_bc doctor
 ```
 
-固定依赖见 [pyproject.toml](pyproject.toml)：NumPy 2.5.3、JAX 0.11.1、Optax 0.2.8、kaggle-environments 1.32.7；下载使用 Kaggle CLI 2.2.4。
+固定依赖见 [pyproject.toml](pyproject.toml)：NumPy 2.5.3、JAX 0.11.1、Optax 0.2.8、kaggle-environments 1.32.7。回放下载脚本会在独立的 `.venv-bc-tools` 中安装 Kaggle CLI 2.2.4；训练使用上面激活的 `.venv`。
 
 ## BC 复现步骤
 
-### 1. 登录 Kaggle 并下载教师回放
+### 1. 下载教师回放
 
-先确保账户有比赛访问权限，然后登录：
-
-```bash
-kaggle auth login --no-launch-browser
-```
-
-按命令输出的链接完成浏览器授权。已有可用凭据时可跳过登录。
-
-冻结当前公开前 20 支队伍的教师清单，每队选择一个活跃提交，再下载每位教师最多 5 局：
+本项目使用的下载命令是：
 
 ```bash
-python -m route_rl.replay_download discover \
-  --top-teams 20 --out data/action_bc/teachers.json
-
-python -m route_rl.replay_download download \
-  --teachers data/action_bc/teachers.json \
-  --out data/action_bc/public --limit-per-teacher 5
+bash tools/download_public_bc.sh data/action_bc 20 100
 ```
 
-这是小规模起步数据。确认资源够用后，可重复下载命令扩大 `--limit-per-teacher`；下载器复用已有回放并去重。教师清单是下载时的排行榜快照，不能保证不同时间得到相同数据。复现同一次实验应保留原始清单、回放和索引。
+三个参数依次是数据根目录、首次发现的教师队伍数、每位教师的对局上限。脚本自动创建 `.venv-bc-tools`、安装下载依赖并检查 Kaggle 认证；需要登录时会输出浏览器授权链接。账户需有比赛访问权限。这一步可以在安装 BC 训练依赖前单独执行。
 
-也可以直接指定实际的 submission ID，重复 `--submission` 选择多个教师：
+首次运行冻结公开前 20 支队伍的教师快照，每队选择一个活跃提交，每位教师下载最多 100 局。重复运行会复用 `data/action_bc/teachers.json` 和已下载回放，并继续补足额度，不重新选择教师。100 是每位教师的独立对局上限，实际数量取决于公开且兼容的回放；一局可能贡献两个教师座位。
 
-```bash
-python -m route_rl.replay_download download \
-  --submission 56722220 --limit-per-teacher 5 \
-  --out data/action_bc/by_submission
-```
+输出索引为 `data/action_bc/public/teacher-seats.jsonl`，后续准备步骤直接读取此文件。脚本先清理旧索引中的 seed=0 对局，下载时也排除零种子、异常结束和不兼容版本，保留正常结束的胜、平、负。原始回放、跳过原因和下载记录保存在同一下载目录中。
 
-这条命令使用独立数据目录；后续 `prepare --index` 应改为 `data/action_bc/by_submission/teacher-seats.jsonl`。submission 是策略提交，episode 是一场对局，下载器会自动列举 episode。
-
-教师索引为 `public/teacher-seats.jsonl`；原始回放、跳过原因及下载记录也保存在下载目录中。教师座位从官方元数据确定，保留正常结束的胜、平、负回放；排除 seed=0、异常结束和不兼容版本。旧数据清理、认证和下载封装见 [BC 指南](docs/action_bc_pipeline.md#下载与数据选择)。
+教师清单是首次下载时的排行榜快照，不能保证不同时间得到相同数据；复现同一次实验应保留原始清单、回放和索引。需要按 submission ID 单独下载或处理旧索引时，见 [BC 指南](docs/action_bc_pipeline.md#下载与数据选择)。
 
 ### 2. 准备并检查缓存
 
 ```bash
 python -m route_rl.action_bc prepare \
   --index data/action_bc/public/teacher-seats.jsonl \
-  --out data/action_bc/prepared --workers 4
+  --out data/action_bc/prepared --workers 16
 
 python -m route_rl.action_bc audit-cache \
   --cache data/action_bc/prepared/cache

@@ -6,15 +6,25 @@ BC 主流程已实现：公开回放 → 教师座位索引 → 特征/标签缓
 
 ## 下载与数据选择
 
-标准命令使用 README 中激活的 `.venv`，并安装 `.[bc,replays]` 或 `.[bc-gpu,replays]`。`discover` 冻结查询时的教师清单；`download` 接受 `--teachers` 或可重复的 `--submission`，二选一。`--limit-per-teacher` 计算每个教师的独立对局数，一局两个教师座位可以产生两条轨迹。
-
-也可使用独立下载封装，不安装 JAX：
+与 README 一致，使用以下脚本下载回放：
 
 ```bash
-bash tools/download_public_bc.sh data/action_bc 20 5
+bash tools/download_public_bc.sh data/action_bc 20 100
 ```
 
-它在 `.venv-bc-tools` 中安装 Kaggle CLI 2.2.4，检查认证，必要时提示浏览器登录；教师快照已存在时复用它，下载记录支持重复运行。三个参数依次是数据根目录、首次发现的教师队伍数、每位教师的对局上限。使用 Python ≥3.12 的环境执行该脚本；训练仍按 README 单独安装 BC 依赖。
+它在 `.venv-bc-tools` 中安装 Kaggle CLI 2.2.4，检查认证，必要时提示浏览器登录；先清理旧索引中的零种子局，再发现或复用教师快照并下载。三个参数依次是数据根目录、首次发现的教师队伍数、每位教师的对局上限。此处每位教师最多 100 局，重复执行会复用原快照和回放，继续补足额度。脚本默认第三个参数是 5；复现这里的下载规模必须显式传入 `100`。
+
+下载不需要 JAX，也不要求预先在训练环境安装 Kaggle CLI。脚本用 `python3` 创建下载环境；请确保该解释器可创建 venv。后续预处理、训练和评估使用 README 中的 Python 3.12 `.venv`，安装 `.[bc]` 或 `.[bc-gpu]`。
+
+如需绕过排行榜快照、直接选择 submission，可使用脚本已创建的下载环境：
+
+```bash
+PYTHONPATH=src .venv-bc-tools/bin/python -m route_rl.replay_download download \
+  --submission 56722220 --limit-per-teacher 100 \
+  --out data/action_bc/by_submission
+```
+
+`--submission` 可以重复；也可以用 `--teachers` 传入显式教师清单，两种方式二选一。此例后续 `prepare --index` 应改为 `data/action_bc/by_submission/teacher-seats.jsonl`。submission 是策略提交，episode 是一场对局；额度计算每个教师的独立对局数，一局两个教师座位可以产生两条轨迹。
 
 下载器：
 
