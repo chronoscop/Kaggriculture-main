@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | `sampling.py`、`inference.py` | `actions/masks.py`、`actions/sequential.py` 的合法支持与条件概率；神经推理的固定形状接口 | 使用已安装的官方 Python 规则处理己方动作前缀，保存实际合法集合和采样概率；推理执行同一顺序。对手隐藏库存不进入支持集合。 |
 | `rollout.py` | 双座位独立历史、固定输入与完整赛季采集 | 从实际完整终局构造胜=1、平=0.5、负=0；cash 仅用于诊断。 |
-| `native/action_engine`、`native_backend.py`、`build_action_native.py` | 参考 RustBatchEnv、并行环境/特征、public tracker 和 NumPy buffer 接口 | 自有 namespace 与构建；增加官方-prefix 支持、NOOP 槽保留、精确绝对 SELL；`2×games` 同步 JAX 输入。源码/二进制身份校验，保留 Python 校验 backend。 |
+| `native/action_engine`、`native_backend.py`、`build_action_native.py` | 从固定 commit 迁入 RustBatchEnv、并行环境/特征、public tracker 和 NumPy buffer 接口 | 改用本项目模块名与构建入口；增加官方-prefix 支持、NOOP 槽保留、精确绝对 SELL；保留 `2×games` 同步 JAX 输入。源码/二进制身份校验，保留 Python 校验 backend。 |
 | `economic_rules.py`、`sampling.py` | Final B 的条件动作选择与生产窗口/仓库规则 | 保留己方真实前缀，强制夜间销售先占订单槽；存在 mask 与 policy mask 分开，强制/外部因素不计 actor/KL/熵。未移植 A 的置信度重排和自动种子补单。 |
 | `season_search/`、`controllers.py` | Final A 的 C++ 搜索器与最后一天接管 | 自有资产、连续观察记忆、明确神经 fallback；内部评分映射为未校准的预计终局得分，不加入现金辅助 reward；二进制/配置进入 continuation 身份。 |
 | `action_teacher.py`、`candidate.py` | 规划器示范、冻结策略配不同控制器的思路 | 实际完整官方执行标签、整 seed 留出、原 BC 分割兼容、公开示范合并/泄漏检查；候选不改权重、不自动训练或部署。 |
@@ -14,7 +14,7 @@
 | `pipeline.py`、`provenance.py` | critic 独立预热、循环更新和候选快照思路 | 预热冻结 actor 与 encoder；固定 BC teacher；自身源码与种子审计；继续策略带版本；所有训练产物保持候选。 |
 | `packaging.py`、`tools/package_pipeline.py` | 本地策略导出、tar 包、文件校验清单 | 独立 source release；policy 包按检查点动作合同选择 BC 或 PPO 执行器，保留推理计算 dtype，移除优化器和训练状态，不自动提交比赛。 |
 
-没有采用参考方案的现金奖励或现金差 PPO 学习目标，没有迁入分布式/多卡自定义内核、Net2Net、额外市场/土地辅助训练目标。现金仍可作为公开状态或预测模型输入；critic 学习终局比赛得分。季末搜索以公开现金差预测经离散 logistic 不确定性映射为预计胜/平/负得分；该模型未校准，固定尺度映射通常保持现金差排序，不能宣称改变排序或提供强度改进。规则与搜索开关没有本项目胜率消融结果。
+固定参考源码的 PPO 同样使用终局胜/平/负，尺度为 `+1/0/−1`；本项目改为 `1/0.5/0` 并使用 sigmoid 得分 critic，两者的胜负排序相同。参考搜索的现金差预测不是其 PPO 奖励，本项目也没有引入现金辅助奖励。没有迁入分布式/多卡自定义内核、Net2Net、额外市场/土地辅助训练目标。现金仍可作为公开状态或预测模型输入；critic 学习终局比赛得分。季末搜索以公开现金差预测经离散 logistic 不确定性映射为预计胜/平/负得分；该模型未校准，固定尺度映射通常保持现金差排序，不能宣称改变排序或提供强度改进。规则与搜索开关没有本项目胜率消融结果。
 
 现有 plan/event 已实现批量生产、经济路线和两阶段转换，本 PPO 分支不把早期 mixed 的规模限制当作当前原因。DECEM 回放只支持连续生产、条件续种/转产、共享材料与工作路线、现金周转四类行为检查，不揭示其训练算法。此次补入的是 BC 后的完整赛季自博弈、实际条件概率、终局信用分配和独立候选对局；连通性测试不能证明上述经营能力已经学会。
 

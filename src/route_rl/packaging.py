@@ -22,7 +22,7 @@ PPO_OBJECTIVE_CONTRACT = "terminal-match-score-1-0.5-0-v1"
 MANIFEST_NAME = "bundle-manifest.json"
 SOURCE_DIRECTORIES = ("src", "tools", "docs", "tests", "native", "agents/farm2945_resilient_response",
                       "third_party/kaggriculture-simulation")
-SOURCE_SUFFIXES = frozenset((".py", ".json", ".md", ".rs", ".toml", ".lock", ".cpp", ".inc", ".c", ".h", ".sh", ".txt"))
+SOURCE_SUFFIXES = frozenset((".py", ".json", ".md", ".svg", ".rs", ".toml", ".lock", ".cpp", ".inc", ".c", ".h", ".sh", ".txt"))
 SOURCE_NAMES = frozenset(("LICENSE", "NOTICE", "Makefile", ".gitignore"))
 EXCLUDED_DIRECTORIES = frozenset((".git", ".aws", ".codex", ".agents", "__pycache__", "target", "build", "dist",
                                   "runs", "data", "replay", "models", "venv", ".venv", "node_modules",

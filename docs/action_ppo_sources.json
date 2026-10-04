@@ -359,7 +359,7 @@
   "learning_objective_contract": "terminal-match-score-1-0.5-0-v1",
   "bc_shared_components": "docs/action_bc_sources.json",
   "not_imported": [
-    "reference cash-based rewards and cash-margin learning targets",
+    "cash auxiliary rewards and cash-margin PPO learning targets (neither is the fixed reference PPO terminal objective)",
     "Final A confidence-ordered post-sampling action repair and automatic seed purchase",
     "Net2Net model depth growth",
     "multi-host/distributed custom kernels",

@@ -345,7 +345,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m route_rl.action_ppo train \
 
 ## 最终交付整理与策略打包
 
-本次本地源码交付包位于 `dist/kaggriculture-pipeline-v0.7.0-review.tar.gz`；可在新路径重新打包：
+本次本地源码交付包位于 `dist/kaggriculture-pipeline-v0.7.0-documented.tar.gz`；可在新路径重新打包：
 
 ```bash
 python tools/package_pipeline.py source \
@@ -386,6 +386,8 @@ docs/                  BC 指南、来源记录和实验历史
 `data/`、`models/`、`runs/`、`replay/` 和构建产物被 Git 忽略；提交源码不会备份训练数据、权重或日志。
 
 - [BC 详细指南与常见问题](docs/action_bc_pipeline.md)
+- [完整训练方法与模型图解](docs/training_method.md)：从数据采集到 BC、critic、PPO、验收和交付，并比较参考 pipeline。
+- [从知道 BC 到形成强解法：认知复盘](docs/experiment_retrospective.md)：对照四篇公开方案，练习问题建模、教师与数据选择、实验判断和预算取舍。
 - [BC 代码来源与适配](docs/action_bc_sources.md)，[逐文件来源清单](docs/action_bc_sources.json)
 - [PPO 详细指南](docs/action_ppo_pipeline.md)，[PPO 来源与适配](docs/action_ppo_sources.md)
 - [本次实现验证记录](docs/pipeline_validation.json)：执行一致性与打包检查，包含尚未进行的正式实验。
