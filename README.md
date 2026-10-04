@@ -130,6 +130,18 @@ JAX_PLATFORMS=cpu PYTHONPATH=src python -m route_rl.action_bc evaluate \
 
 16 局对应 8 个连续种子，每个种子交换座位，完整执行到第 720 个状态。报告中的 `score_rate` 按胜=1、平=0.5、负=0 汇总；现金用于诊断。输出还包括逐局记录 `final-farm2945.games.json`。
 
+也可使用从 `agents/submission_farm2952_verified.tar.gz` 解压的 farm2952 对手；入口为 `agents/farm2952_verified/main.py`，许可证、NOTICE 和校验记录保存在同一目录：
+
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH=src python -m route_rl.action_bc evaluate \
+  --run runs/action_bc_own_public_stream \
+  --opponent agents/farm2952_verified/main.py \
+  --seed 1600000000 --games 16 \
+  --out runs/action_bc_own_public_stream_eval/final-farm2952.json
+```
+
+此命令沿用 farm2945 评估的种子与交换座位设置，输出 `final-farm2952.json` 和 `final-farm2952.games.json`。
+
 训练期间，可在 `epoch-1-policy.pkl` 出现后另开终端评估：
 
 ```bash
@@ -176,7 +188,7 @@ JAX_PLATFORMS=cpu PYTHONPATH=src python -m route_rl.action_ppo doctor
 
 ```bash
 mkdir -p models
-cp --no-clobber runs/action_bc_own_public_stream/final_student_jax.pkl \
+cp --update=none runs/action_bc_own_public_stream/final_student_jax.pkl \
   models/action_bc_own_frozen.pkl
 ```
 
@@ -326,7 +338,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m route_rl.action_bc train \
 等待 adaptation 的 `final_student_jax.pkl` 生成后，固定新 teacher，再进入新的 critic/PPO run：
 
 ```bash
-cp --no-clobber runs/action_bc_teacher_adapt/final_student_jax.pkl \
+cp --update=none runs/action_bc_teacher_adapt/final_student_jax.pkl \
   models/action_bc_teacher_frozen.pkl
 
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m route_rl.action_ppo warmup \

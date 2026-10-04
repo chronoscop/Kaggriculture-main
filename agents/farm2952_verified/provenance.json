@@ -1,0 +1,10 @@
+{
+  "name": "farm2952_verified",
+  "archive": "agents/submission_farm2952_verified.tar.gz",
+  "archive_sha256": "cb651d89a1d6915af4fd8fe046523faadd1fccf1f3f701837e0b3efe8b07fa0e",
+  "sha256": {
+    "main.py": "2f668d1c4a2797b82aaf78a6dd35eb9270500aae31ce5c881331727745c7586f",
+    "LICENSE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "NOTICE.txt": "480a20ba1b5a88aee8e593f3541c4cd5699a1d03ea98907f7fa50021694839d6"
+  }
+}

@@ -1,0 +1,137 @@
+Farm2945 Harvest Counter, 24 September 2026. Apache-2.0.
+This revision modifies the user-provided Farm2945 dynamic-species agent.
+Farm2945 still generates and executes OUR production and worker policy.
+The exact separately uploaded V64 Harvest Ledger controller is embedded
+as a licensed, isolated OPPONENT PREDICTOR, not as our replacement policy.
+The predictor propagates a hypothetical opponent private state from the
+known standard empty initial stock using public observations and predicted
+actions. It does not read the real opponent private state, replay seeds,
+future actions or engine internals. Public-account mismatch disables it.
+New work: condition-aware purchase ordering and supply-calendar checks;
+verified inventory-preserving WHEAT/FERTILIZER market responses with
+same-turn full-settlement comparison and complete baseline fallback.
+Adapted public mechanisms include seed budgeting, an early idle wheat
+cycle and sale-block pricing, in addition to the complete opponent model.
+All embedded upstream source notices are retained. No claim of independent
+authorship is made for inherited production routes or the public model.
+Public references credited by the supplied Harvest notebook include
+tetsutani/demand-preserving-turn-sale-timing and the upstream sources
+listed in the preserved Harvest notice below.
+
+Historical Farm2945 notices follow. Statements about a prior version not
+packaging opponent code describe THAT PRIOR VERSION, not this revision;
+this revision DOES package the public Harvest predictor inside main.py.
+
+2945 Farm Market Portfolio candidate, September 2026.
+Derived from the user-provided farm2945_adaptive_market_candidate.
+Original 2945 Farm and public-agent author notices are retained in main.py.
+New work: conditional fertilizer execution families, bounded same-turn portfolio,
+public-race sales reservations, and assignment-based sale-slot selection.
+Conceptual reference for exact lockstep and empty sale-slot compaction:
+user-provided V54 notebookdb6965aa8e.ipynb (Pipe-16/Metav4 lineage).
+No complete farming route or productive opening from V54 was transplanted.
+Prior notices include Ahmed Berat Ozer, Thomas Tschinkel, Dmitrii Gluzdov,
+Nathan Jacob and the upstream contributors named in main.py.
+Apache License 2.0. This is an experimental candidate, not an official leaderboard certification.
+
+2945 Boss Response candidate, September 2026.
+Derived from the user's farm2945_market_portfolio_candidate.
+New modifications: observed race-evidence transfer; spot liquidation of on-hand
+cash goods not covered by raw-tape SELLs; pure-sale input-product assignment
+and receipt learning. Tomato rest-day mechanism adapted from the supplied
+V54 / Pipe-16 public lineage, whose source credits are retained below.
+No complete V54 farming route, opening, opponent file, replay or test seed is packaged.
+
+Supplied V54 NOTICE:
+Local v54 derivative, 2026-09-20. Direct source: https://www.kaggle.com/code/nathanjacob/kaggriculture-pipe16-idle-workers
+All original source notices retained. Apache-2.0.
+Lean Flock: Ahmed Berat Ozer; Metav4 farm and sheep/crew efficiency: Thomas Tschinkel; productive opening: Dmitrii Gluzdov, adapted by Nathan Jacob.
+Upstream includes yhay81, prvsiyan, aurax7, tetsutani, Rayk Kretzschmar, degnonguidi, leoprovorov, destbreso, lucifer19, salemali7, and Kaggle environment contributors.
+Local changes: explicit complete agent export; optional external sell-library path disabled for V54. No claim of independent production plans or original public evaluation reproduction.
+
+2026-09-23 local derivative: midseason inventory-neutral market candidate search; fixed-price seed and hire obligations preserved.
+
+
+Complete supplied Harvest NOTICE (verbatim):
+Final market order revision, 22 September 2026. Apache-2.0.
+
+The complete inherited source and every original embedded notice are retained byte-for-byte in main.py. Upstream public source: https://www.kaggle.com/code/haideptry/the-2965-master-hybrid-engine
+
+Kaggriculture route-replay chassis (pure Python, stdlib only).
+
+A *route* is a pre-computed tape of 719 Kaggle-format actions
+``{"farmer": [op, ...], "hands": [[op, ...], ...], "market": [[order, item, qty], ...]}``.
+The chassis replays the tape chosen by a caller-supplied ``router`` and wraps it
+in small reactive layers (each independently switchable via ``settings``):
+
+    hand_align            pad/truncate hands to the real hand count      (fieldbook_logic)
+    weed_repair           DIG a weed that blocks PLANT/BUILD, replay      (tetsutani + task spec)
+    sell_lead             sell next step's lots one step early            (fieldbook _lead_sale)
+    front_run             sell before the opponent's scheduled SELL       (hook; opponent_plan)
+    budget_guard          fund each 72-step block's purchases             (six_day_budget_guard.hpp)
+    room_guard            keep shed <= 99 at hour 23                      (tetsutani)
+    clamp_sells           trim SELL orders to the projected shed          (tetsutani)
+    dead_stock            sell stock the route will never sell            (tetsutani)
+    terminal_liquidation  step >= 718: sell the whole projected shed      (fieldbook _terminal_sale)
+
+Engine facts (verified against kaggle_environments 1.32.7, env_1_32_7.py):
+  observation["farms"][p] = {"money", "tiles"[y][x], "farmer"[x,y], "hands"[[x,y]..],
+                             "unlocked_quadrants", "hires_today"}
+  tiles: None (empty) | "LOCKED" | {"kind": WEED|COOP|PASTURE|PLANT, "crop"/"animal", ...}
+  observation["private"] = {"shed": {item: n}, "seeds": {crop: n}, "inventories": [{}...]}
+  observation["market"] = {"inventory": {...}, "prices": {...}}
+  observation["town"] = {"unlocked_shops": [...]}
+  Agents act on steps 0..718 (interpreter marks DONE once step >= episodeSteps-2).
+
+The appended experimental wrapper reapplies the inherited contiguous SELL-block ordering after the final sale-advance and queue layers.
+
+Local v64 2026-09-24: selected timing reference, explicit entry alias and offline packaging. All upstream notices retained.
+
+
+Farm2945 Reactive Counter modifications, 2026-09-24:
+The player's policy remains Farm2945. The public Harvest Ledger and the
+user-supplied kaggriculture-shop-router-reactive-v7.ipynb are included only as
+isolated opponent hypotheses. They are not a source of real hidden inventory.
+Added a verified public-state hypothesis bank and early-capital market response
+for the reactive-v7 hypothesis. Unknown or mismatching opponents cause abstention.
+Reactive V7 header credits: aurax7, sdy623/jaxa623, Ahmed Berat Ozer,
+Rayk Kretzschmar, yhay81, thomastschinkel, tetsutani, destbreso; the original
+V7 source and its Apache-2.0 notices are preserved in the embedded payload.
+The inherited V7 frontload/sale-advance portions also credit Van / Claude.
+All earlier author notices remain intact.
+
+Embedded V7 SHA256: e221f4875daff8b03e8f0ec7c86bd3a2a72c0768b049d4c25064abd5301a532b
+
+
+FARM2945 RESILIENT RESPONSE MODIFICATIONS (2026-09-25)
+Derived from the user-provided General Response, preserving upstream authors and Apache-2.0 terms.
+Changes: net-only uncertain opening; stage-first terminal sheep harvest; bounded joint cash-sale swaps using public net-flow feedback; actual native crop-cycle seed readiness.
+No new opponent identity, hidden inventory, replay future action, or map seed is a policy input.
+This is not a general-purpose full-farm dynamic planner and not a promise of universal wins.
+
+
+Farm2946 incremental modifications, 2026-09-26
+--------------------------------------------------
+This distribution retains the user-supplied Farm2945 agent and all existing
+upstream notices. The Farm2946 additions implement current-state-validated
+redundant-slot recovery, input-preserving warehouse deposits, bounded public-
+supply-aware cash inventory, fixed liquidation deadlines, transient purchase
+capacity checks, emitted-action accounting refresh, and crop-yield forecasts
+that include already-scheduled future fertilization and water/decay events.
+
+The new logic uses only the agent's current observation and its own native
+production schedule. Evaluation replay files, episode identifiers and seeds
+used by the local test harness are not packaged or consulted by this logic.
+No newly copied opponent policy is included by these modifications.
+The existing Apache-2.0 and other upstream notices above remain applicable.
+
+Farm2947 modifications (2026-09-27): protect next-turn native planting seed contracts; reclaim provably compressible idle tail slots for loss-aware cargo delivery; require positive baseline yield and a conservative benefit margin for optional wheat-to-carrot substitution. Upstream license and notices retained. No uploaded replay or episode identifiers included in the added policy.
+
+Farm2950 additions: end-of-day warehouse working-capital closure; bounded
+animal overflow salvage; scenario-tested cash-order promotion with wheat
+slot anchors. Original local modifications; all prior notices retained.
+
+
+Farm2950.1 entrypoint hotfix: deletes the prior public agent binding immediately
+before its final definition to satisfy Kaggle last-callable insertion-order
+selection. Missing observation.step is normalized from day/hour. No Farm2950 economic decision logic was changed.
