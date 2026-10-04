@@ -36,6 +36,10 @@ critic 阶段保持 BC actor 与 Transformer 主干完全冻结，只更新 valu
 
 PPO 从该 critic 策略建立新优化器，保留原 BC 作为固定 KL teacher。默认 clip=0.2，单位与市场熵系数各 0.0015，teacher KL=0.2，Huber value loss 权重 2，Adam epsilon=1e−5，梯度范数裁剪 5，学习率 5e−5；学习率预热与衰减使用优化器步数。critic 默认学习率 1e−4。对应 [PPO 配置](../src/route_rl/ppo/configs/ppo.json) 与 [critic 配置](../src/route_rl/ppo/configs/critic.json) 是本项目支持的设置。
 
+当前 [README 的 PPO 命令](../README.md#bc-完成后critic--ppo) 显式使用 `--compute-dtype float32` 和 `JAX_DEFAULT_MATMUL_PRECISION=highest`；配置文件默认仍为 BF16。`collected behavior log probability mismatch` 是更新前的行为概率一致性校验，最大绝对误差超过 `0.0002` 时在任何 PPO 梯度更新前停止。A40/JAX 0.11.1 上，当前六层 checkpoint 的 4 步、4 局双座位前向对照中，BF16 最大误差约 `0.139`，默认矩阵精度的 FP32 约 `0.0188`，FP32 加 `highest` 后约 `0.0000114`。该对照只验证数值一致性，不证明完整训练可完成或经济/比赛得分提高。
+
+已有 critic 可继续作为新 FP32 PPO run 的初始化；dtype 变化需要新的输出目录。`compute_dtype` 存入 checkpoint，`JAX_DEFAULT_MATMUL_PRECISION` 当前不进入 checkpoint 或 resume 身份，因此训练、续训、评估和最终策略运行都需显式保持相同的 `highest` 设置。打包入口不会将这个环境变量固化到生成的 `main.py`。
+
 每轮重新采集当前参数的完整对局，计算优势/return 后按成对座位打乱 minibatch。全局标准化优势只使用本轮训练样本；末尾 batch 的 padding 不参与损失或统计。critic/actor 共享主干在 PPO 阶段会一起更新；冻结 warmup 避免初始 critic 拟合扰动 BC，KL 和梯度裁剪不能保证以后完全没有梯度干扰或漂移。
 
 运行设置、模型、初始化文件、teacher、源码、目标及执行合同共同决定 resume 身份。再次执行同一命令自动恢复最近完整 rollout-update，`--updates` 是累计目标且只能增加。改 batch/dtype/games/config/源码/teacher/初始化需要新 run；不要将 PPO state 当 BC state，也不要将 inference policy 当旧优化器原样续训。中途未提交的一轮会从上一检查点重新采集。已有指标/策略/完成记录而丢失 latest optimizer state 时拒绝原目录从零重启；需恢复原 state 或使用新 run。评估和 critic 交接同时核对 state 的 integration 身份。

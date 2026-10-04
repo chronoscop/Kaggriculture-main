@@ -327,6 +327,8 @@ actor 项的平均只覆盖有效神经行，critic 覆盖有效实际行。固�
 | LR warmup / decay / 最小比例 | 240 / 150,000 个优化器步 / 0.25 |
 | 计算 / 并行 | BF16，单进程、单设备 |
 
+上表保留配置文件的默认值；当前六层 checkpoint 的 PPO 推荐命令见 [README](../README.md)：显式使用 `--compute-dtype float32` 和 `JAX_DEFAULT_MATMUL_PRECISION=highest`，并建立新 run。32 条实际采集记录的短前向对照中，BF16 和默认 FP32 的概率重算均未通过 `0.0002` 容差，FP32 加 `highest` 的最大误差为 `0.0000114441`；这只验证概率一致性，未验证完整训练或比赛收益。checkpoint 保存计算 dtype，但不会保存或自动恢复这个 JAX 环境设置；续训、评估及部署进程都需在导入 JAX 前显式设置 `highest`，打包命令中的环境变量也不会写入策略包入口。
+
 PPO 阶段同时更新 actor、共享主干和 value。每轮 5,752 行、minibatch=32、epoch=1，对应 180 个 Adam 步；最后一批 24 行有效、8 行 padding。CLI `--updates 100` 是累计 100 次完整“采集→更新”轮数，不是 100 个 Adam 步；学习率计划中的 240/150,000 则按 Adam 步计数。配置见 [ppo.json](../src/route_rl/ppo/configs/ppo.json)。
 
 每轮保存 `latest_ppo_state.pkl` 和可独立评估的 `policy-update-N.pkl`。相同配置重跑原命令、仅增加 `--updates`，恢复最近完整更新边界；采样随机序列根据配置 seed 与已完成轮次重建，中断的未提交轮次重新采集。

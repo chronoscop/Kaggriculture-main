@@ -205,17 +205,23 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m route_rl.action_ppo warmup \
 
 每轮默认采集 4 场训练局、2 场固定独立验证局，均使用完整 720 状态。训练使用 GAE return、验证使用真实终局 score 的预测误差；先保留未拟合的 iteration 0，再选择 best critic。默认 patience=8，可能在累计目标前停止。`policy_with_critic.pkl` 保留同一冻结 actor，只换 value head；它不是对战胜率提升的证据。
 
-然后从 best critic 开始完整 PPO：
+然后从 best critic 开始完整 PPO。下面显式使用 FP32 和 `highest` 矩阵精度，并建立新的输出目录：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m route_rl.action_ppo train \
+CUDA_VISIBLE_DEVICES=0 JAX_DEFAULT_MATMUL_PRECISION=highest PYTHONPATH=src \
+python -m route_rl.action_ppo train \
   --critic-run runs/action_critic_own \
   --initial runs/action_critic_own/policy_with_critic.pkl \
   --teacher models/action_bc_own_frozen.pkl \
-  --out runs/action_ppo_own --updates 100
+  --compute-dtype float32 \
+  --out runs/action_ppo_own_fp32_highest --updates 100
 ```
 
-PPO 每轮默认 4 场当前策略双座位自博弈，即 5,752 env steps；同一步将 8 个座位一起送给 JAX，Rust 批量处理环境、特征、库存历史和合法前缀；minibatch=32、rollout epochs=1、BF16。默认设置见 [critic 配置](src/route_rl/ppo/configs/critic.json) 和 [PPO 配置](src/route_rl/ppo/configs/ppo.json)。`--games` 增大批量也会增加完整 rollout 的 RAM 和显存占用。100 轮是累计命令示例，不代表已测收益或耗时。
+PPO 每轮默认 4 场当前策略双座位自博弈，即 5,752 env steps；同一步将 8 个座位一起送给 JAX，Rust 批量处理环境、特征、库存历史和合法前缀；minibatch=32、rollout epochs=1。[critic 配置](src/route_rl/ppo/configs/critic.json) 和 [PPO 配置](src/route_rl/ppo/configs/ppo.json) 的默认 dtype 仍为 BF16，上述 PPO 命令显式覆盖为 FP32。`--games` 增大批量也会增加完整 rollout 的 RAM 和显存占用。100 轮是累计命令示例，不代表已测收益或耗时。
+
+`collected behavior log probability mismatch` 表示采样时记录的联合 log probability 与更新前重算的值相差超过 `0.0002`，校验在任何 PPO 梯度更新之前执行。A40/JAX 0.11.1 上，当前六层 checkpoint 的 4 步、4 局双座位前向对照中，BF16 最大误差约 `0.139`，默认矩阵精度的 FP32 约 `0.0188`；FP32 加 `JAX_DEFAULT_MATMUL_PRECISION=highest` 后约 `0.0000114`，通过该校验。这是数值一致性的短对照，完整训练与比赛效果仍需验证。
+
+已有 `runs/action_critic_own` 可继续作为初始化；改变 PPO dtype 必须使用新 run，例如上面的 `runs/action_ppo_own_fp32_highest`。`compute_dtype` 会写入 checkpoint，但 `JAX_DEFAULT_MATMUL_PRECISION` 目前不会写入 checkpoint 或 resume 身份。训练、续训、评估和最终策略运行时都应显式保持 `highest`；下面的评估命令已带上该设置。
 
 每轮 `metrics.jsonl` 的 `rollout_diagnostics` 记录 `collection_seconds` 和 `collection_env_steps_per_second`，按双方座位步数统计完整采集，包含环境准备、首次 JIT、特征、支持集、推理、存储和可选搜索；不是只测模拟器 step 的速度。
 
@@ -230,13 +236,14 @@ PPO 每轮默认 4 场当前策略双座位自博弈，即 5,752 env steps；同
 冻结一个已保存候选，与原 BC baseline 分别对 farm2945 在相同种子换座：
 
 ```bash
-JAX_PLATFORMS=cpu PYTHONPATH=src python -m route_rl.action_ppo evaluate \
-  --run runs/action_ppo_own \
-  --policy runs/action_ppo_own/policy-update-100.pkl \
+JAX_PLATFORMS=cpu JAX_DEFAULT_MATMUL_PRECISION=highest PYTHONPATH=src \
+python -m route_rl.action_ppo evaluate \
+  --run runs/action_ppo_own_fp32_highest \
+  --policy runs/action_ppo_own_fp32_highest/policy-update-100.pkl \
   --baseline models/action_bc_own_frozen.pkl \
   --opponent agents/farm2945_resilient_response/main.py \
   --seed 1600000000 --games 16 --phase screen \
-  --out runs/action_ppo_own_eval/update-100-screen.json
+  --out runs/action_ppo_own_fp32_highest_eval/update-100-screen.json
 ```
 
 `--games 16` 是每策略 16 场，candidate 加 baseline 共 32 场。也可用 `runs/action_critic_own/policy_with_critic.pkl` 作为 baseline，比较相同 masked execution 下的学习变化。必须保留 baseline 文件身份，不能混称两种比较。
@@ -244,14 +251,15 @@ JAX_PLATFORMS=cpu PYTHONPATH=src python -m route_rl.action_ppo evaluate \
 初筛 paired match-score delta > 0 后，用另一批 seeds 确认同一候选、baseline 和 opponent：
 
 ```bash
-JAX_PLATFORMS=cpu PYTHONPATH=src python -m route_rl.action_ppo evaluate \
-  --run runs/action_ppo_own \
-  --policy runs/action_ppo_own/policy-update-100.pkl \
+JAX_PLATFORMS=cpu JAX_DEFAULT_MATMUL_PRECISION=highest PYTHONPATH=src \
+python -m route_rl.action_ppo evaluate \
+  --run runs/action_ppo_own_fp32_highest \
+  --policy runs/action_ppo_own_fp32_highest/policy-update-100.pkl \
   --baseline models/action_bc_own_frozen.pkl \
   --opponent agents/farm2945_resilient_response/main.py \
   --seed 1700000000 --games 32 --phase confirmation \
-  --screen-report runs/action_ppo_own_eval/update-100-screen.json \
-  --out runs/action_ppo_own_eval/update-100-confirmation.json
+  --screen-report runs/action_ppo_own_fp32_highest_eval/update-100-screen.json \
+  --out runs/action_ppo_own_fp32_highest_eval/update-100-confirmation.json
 ```
 
 初筛/确认 seeds 不得用于 BC、critic 或 PPO 数据；入口也拒绝未来训练保留范围。确认输出仍为 `candidate_only`，不替换已接受部署。对称自博弈平均 score、loss 或现金增加不能作为晋级依据。此处示例面板不是统计显著性或总体胜率保证。
@@ -346,14 +354,16 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m route_rl.action_ppo warmup \
   --initial models/action_bc_teacher_frozen.pkl \
   --out runs/action_critic_teacher_adapt --updates 100
 
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m route_rl.action_ppo train \
+CUDA_VISIBLE_DEVICES=0 JAX_DEFAULT_MATMUL_PRECISION=highest PYTHONPATH=src \
+python -m route_rl.action_ppo train \
   --critic-run runs/action_critic_teacher_adapt \
   --initial runs/action_critic_teacher_adapt/policy_with_critic.pkl \
   --teacher models/action_bc_teacher_frozen.pkl \
-  --out runs/action_ppo_teacher_adapt --updates 100
+  --compute-dtype float32 \
+  --out runs/action_ppo_teacher_adapt_fp32_highest --updates 100
 ```
 
-随后按上面的配对初筛/独立确认步骤评估；`--run` 改为 `runs/action_ppo_teacher_adapt`，候选改为其中保存的 `policy-update-N.pkl`，baseline 明确选择新 teacher 或该 run 的初始 critic，报告使用新的输出目录。需要将季末搜索纳入训练时，两阶段都加 `--season-search`。当前 BC 缓存、训练目录和 accepted 文件不覆盖；这些命令由你选择时机执行。
+随后按上面的配对初筛/独立确认步骤评估，并保持 `JAX_DEFAULT_MATMUL_PRECISION=highest`；`--run` 改为 `runs/action_ppo_teacher_adapt_fp32_highest`，候选改为其中保存的 `policy-update-N.pkl`，baseline 明确选择新 teacher 或该 run 的初始 critic，报告使用新的输出目录。需要将季末搜索纳入训练时，两阶段都加 `--season-search`。当前 BC 缓存、训练目录和 accepted 文件不覆盖；这些命令由你选择时机执行。
 
 ## 最终交付整理与策略打包
 
@@ -373,11 +383,13 @@ python tools/package_pipeline.py verify \
 
 ```bash
 PYTHONPATH=src python tools/package_pipeline.py submission \
-  --policy runs/action_ppo_own/policy-update-100.pkl \
+  --policy runs/action_ppo_own_fp32_highest/policy-update-100.pkl \
   --out dist/kaggriculture-policy.tar.gz
 ```
 
 也支持本项目 BC、经济规则和季末控制器候选。入口按 checkpoint 的执行合同生成 `main.py`；搜索候选包含已核对的 `terminal_search.so`，不包含优化器或训练数据。策略包要求目标环境提供固定 NumPy/JAX；PPO/经济推理还要求官方 `kaggle-environments==1.32.7`。编译库须与目标 Linux 平台兼容，依赖与计时仍需目标环境验收；具体记录见 manifest。源码交付不伪造训练完成的比赛权重，也不执行比赛提交。
+
+上述 FP32 候选运行时还需设置 `JAX_DEFAULT_MATMUL_PRECISION=highest`。当前打包入口不会把这个环境变量固化到 `main.py`，仅在打包命令前设置它也不会让策略包自动保留该配置。
 
 ## 目录与文档
 
