@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "route-rl-action-engine"
+version = "0.1.0"
+description = "Rust port of the kaggriculture engine (RustEnv, FastEnv-compatible API)"
+requires-python = ">=3.10"
+
+[tool.maturin]
+features = ["python"]
+module-name = "route_rl_action_engine"

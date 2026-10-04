@@ -19,4 +19,4 @@
 
 新的数据契约为 `public-full-action-bc-v3`，policy 契约为 `route-rl-full-action-policy-v1`。旧包装器缓存、旧动作 checkpoint、原生 event `.json` 权重均不会被静默续用；已下载的原始回放可复用到新准备目录。
 
-这次没有接入公开方案的 PPO、自博弈采集、critic 拟合、启发式补课、模型扩深或部署晋级。后续需要在本仓库逐步实现这些环节。
+本记录描述最初整合的 BC 部件。后续已在独立模块接入 Rust 批采集、critic 拟合、PPO、经济规则、可选季末搜索与教师示范闭环，见 [PPO 来源与适配](action_ppo_sources.md) 和 [PPO 指南](action_ppo_pipeline.md)。BC 原推理保持上述定义；模型扩深未迁入，候选仍需独立确认后由用户审查部署。

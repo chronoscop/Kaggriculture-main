@@ -5,6 +5,7 @@ import argparse
 from collections import Counter
 import hashlib
 from importlib import metadata
+import inspect
 import json
 from pathlib import Path
 import subprocess
@@ -15,6 +16,12 @@ from .replay_rules import compatibility_receipt, replay_seed
 CONTRACT = "public-full-action-bc-v3"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 CONFIG_ROOT = PACKAGE_ROOT / "full_action/configs"
+COMPATIBLE_CACHE_ENCODINGS = {
+    # Verified before the streaming-reader fix. Only reader/trainer behavior
+    # changed; this fingerprint also pins the unchanged encoder and split.
+    "03b9765544aa514b07719a2ff1399816469f86b18a7a93b78700608f3b398355":
+        "d42de9e72d52a0035f5da43b7a29c0ff78d171045d41a866913f414f3e1a7c1b",
+}
 
 
 def sha256(path: Path) -> str:
@@ -32,6 +39,35 @@ def source_identity() -> dict:
     hashes = {str(path.relative_to(PACKAGE_ROOT)): sha256(path) for path in sorted(files)}
     return {"implementation": "route_rl.full_action", "reference_checkout_required": False,
             "files_sha256": hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()}
+
+
+def encoding_identity() -> str:
+    names = ("replay_prepare.py", "replay_rules.py", "replay_download.py",
+             "full_action/catalog.py", "full_action/quantities.py", "full_action/sell_quantity.py",
+             "full_action/legality.py", "full_action/features.py", "full_action/inventory_tracker.py",
+             "full_action/tracker_constants.py", "full_action/labels.py")
+    paths = [PACKAGE_ROOT / name for name in names]
+    paths.extend(CONFIG_ROOT.glob("*.json"))
+    hashes = {str(path.relative_to(PACKAGE_ROOT)): sha256(path) for path in sorted(paths)}
+    for name in ("validation_episode", "inspect_index"):
+        hashes[f"action_bc.{name}"] = hashlib.sha256(inspect.getsource(globals()[name]).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
+
+
+def cache_compatibility(preparation: dict, reuse: bool) -> dict:
+    if preparation["contract"] != CONTRACT:
+        raise ValueError("incompatible cache contract; rebuild in a new preparation directory")
+    if preparation["source"] == source_identity():
+        return {"mode": "source-match"}
+    recorded = preparation["source"]
+    expected = COMPATIBLE_CACHE_ENCODINGS.get(recorded.get("files_sha256"))
+    if (reuse and recorded.get("implementation") == "route_rl.full_action"
+            and recorded.get("reference_checkout_required") is False
+            and expected is not None and expected == encoding_identity()):
+        return {"mode": "explicit-compatible-cache-reuse", "recorded_source": recorded,
+                "encoding_sha256": expected, "reader": "streaming-npz-v1"}
+    raise ValueError("cache source changed; for the verified pre-streaming cache use --reuse-compatible-cache; "
+                     "other encoding changes require a new preparation directory")
 
 
 def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None:
@@ -121,7 +157,7 @@ def audit_cache(cache: Path) -> dict:
     import numpy as np
 
     index = json.loads((cache / "index.json").read_text())
-    seen, splits, hashes, decoded_bytes = {}, Counter(), {}, 0
+    seen, splits, hashes, decoded_bytes, largest_trajectory_bytes = {}, Counter(), {}, 0, 0
     valid_labels = Counter()
     for row in index["episodes"]:
         identity = int(row["episode_id"]), int(row["seat"])
@@ -146,35 +182,48 @@ def audit_cache(cache: Path) -> dict:
                 if not np.all((values == -100) | ((values >= 0) & (values < maximum))):
                     raise ValueError(f"invalid {name} action IDs: {path}")
                 valid_labels[name] += int(np.sum(values >= 0))
-            decoded_bytes += features.nbytes + labels.nbytes
+            trajectory_bytes = features.nbytes + labels.nbytes
+            decoded_bytes += trajectory_bytes
+            largest_trajectory_bytes = max(largest_trajectory_bytes, trajectory_bytes)
         hashes[row["key"]] = sha256(path)
         splits[row["split"]] += 719
     if set(splits) != {"train", "validation"} or any(count == 0 for count in valid_labels.values()):
         raise ValueError("cache needs both splits and valid unit/market labels")
     return {"index_sha256": sha256(cache / "index.json"),
             "arrays_sha256": hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(),
-            "samples": dict(splits), "valid_labels": dict(valid_labels), "decoded_bytes": decoded_bytes}
+            "samples": dict(splits), "valid_labels": dict(valid_labels), "decoded_bytes": decoded_bytes,
+            "largest_trajectory_bytes": largest_trajectory_bytes}
 
 
 def train(args) -> None:
     preparation = json.loads((args.cache / "pipeline.json").read_text())
     source = source_identity()
-    if preparation["source"] != source or preparation["contract"] != CONTRACT:
-        raise ValueError("cache encoding source changed; rebuild in a new preparation directory")
+    compatibility = cache_compatibility(preparation, getattr(args, "reuse_compatible_cache", False))
+    window = getattr(args, "shuffle_window", 16)
+    if window < 1:
+        raise ValueError("shuffle window must be positive")
     config = json.loads((CONFIG_ROOT / "bc.json").read_text())
-    config.update(epochs=args.epochs, batch_per_gpu=args.batch_size, compute_dtype=args.compute_dtype)
+    config.update(epochs=args.epochs, batch_per_gpu=args.batch_size, compute_dtype=args.compute_dtype,
+                  dataset_loading="streaming-npz-v1", shuffle_contract="trajectory-window-v1",
+                  shuffle_window_trajectories=window)
     cache = audit_cache(args.cache)
     print(json.dumps({"event": "cache_audit", **cache}), flush=True)
-    memory_info = Path("/proc/meminfo")
-    if memory_info.exists():
-        available = next((int(line.split()[1]) * 1024 for line in memory_info.read_text().splitlines()
-                          if line.startswith("MemAvailable:")), None)
-        if available is not None and cache["decoded_bytes"] > available * 0.8:
-            raise ValueError(f"BC trainer loads all tensors into host RAM ({cache['decoded_bytes'] / 2**30:.1f} GiB); "
-                             "use a smaller teacher subset or a host with more RAM")
+    from .full_action.memory import host_memory_status
+
+    memory = host_memory_status()
+    resident_budget = 2 * window * cache.get("largest_trajectory_bytes", 0)
+    batch_budget = args.batch_size * 264 * 124 * 4 * 3
+    required = resident_budget + batch_budget + 4 * 2**30  # Reserve for JAX/compiler/optimizer host overhead.
+    print(json.dumps({"event": "host_memory", **memory, "trajectory_buffer_budget_bytes": resident_budget,
+                      "estimated_host_budget_bytes": required, "cache_compatibility": compatibility}), flush=True)
+    available = memory["effective_available_bytes"]
+    if available is not None and required > available * 0.8:
+        raise ValueError(f"streaming BC host buffer budget is {required / 2**30:.1f} GiB, "
+                         f"effective available memory is {available / 2**30:.1f} GiB; "
+                         "reduce --shuffle-window or free container memory")
     identity = {"contract": CONTRACT, "source": source, "initial_sha256": sha256(args.initial),
                 "cache": cache, "settings": {key: value for key, value in config.items() if key != "epochs"},
-                "preparation": preparation, "deployment": "candidate_only"}
+                "preparation": preparation, "cache_compatibility": compatibility, "deployment": "candidate_only"}
     receipt = args.out / "integration.json"
     if args.out.exists() and any(args.out.iterdir()):
         if not receipt.exists() or json.loads(receipt.read_text()) != identity:
@@ -236,6 +285,9 @@ def main() -> None:
     learn.add_argument("--epochs", type=int, default=2)
     learn.add_argument("--batch-size", type=int, default=320)
     learn.add_argument("--compute-dtype", choices=("float32", "bfloat16"), default="bfloat16")
+    learn.add_argument("--shuffle-window", type=int, default=16, help="trajectories per bounded shuffle window")
+    learn.add_argument("--reuse-compatible-cache", action="store_true",
+                       help="explicitly reuse the verified pre-streaming cache without changing its labels")
     check = commands.add_parser("audit-cache", help="validate labels, shapes, splits and checksums")
     check.add_argument("--cache", type=Path, required=True)
     match = commands.add_parser("evaluate", help="paired fresh-seed candidate evaluation")

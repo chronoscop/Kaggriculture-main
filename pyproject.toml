@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kaggriculture-route-rl"
-version = "0.5.0"
-description = "Rust planning experiments and a full-action replay BC training branch"
+version = "0.7.0"
+description = "Project-owned BC, Rust batched PPO, economic execution rules, season search and teacher generation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
@@ -19,9 +19,14 @@ replays = ["kaggle==2.2.4"]
 route-rl-evaluate = "route_rl.evaluate:main"
 route-rl-replays = "route_rl.replay_download:main"
 route-rl-action-bc = "route_rl.action_bc:main"
+route-rl-action-ppo = "route_rl.action_ppo:main"
+route-rl-action-teacher = "route_rl.action_teacher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 "route_rl.full_action" = ["configs/*.json"]
+
+"route_rl.ppo" = ["configs/*.json", "_native/*.so", "_native/build.json"]
+"route_rl.season_search" = ["*.cpp", "*.inc", "*.so", "*.json", "LICENSE*"]

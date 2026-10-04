@@ -15,7 +15,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from route_rl.full_action.dataset import IGNORE_LABEL, ReplayDataset, file_sha256
+from route_rl.full_action.dataset import (DATA_LOADING_CONTRACT, SHUFFLE_CONTRACT,
+                                          IGNORE_LABEL, ReplayDataset, file_sha256)
 from .checkpoints import load_training_source as host_checkpoint
 from route_rl.full_action.metrics import aggregate, first_local_replica
 from route_rl.full_action.bc_objective import make_steps
@@ -52,6 +53,9 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
     initial_sha = file_sha256(args.initial)
     cache_sha = file_sha256(args.cache / "index.json")
     coefficients = [args.unit_entropy, args.market_entropy, args.teacher_kl]
+    window = getattr(args, "shuffle_window_trajectories", 16)
+    data_contract = {"loading": DATA_LOADING_CONTRACT, "shuffle": SHUFFLE_CONTRACT,
+                     "window_trajectories": window}
     if any(not np.isfinite(x) or x < 0 for x in coefficients):
         raise ValueError("regularization coefficients must be finite and nonnegative")
     if latest.exists():
@@ -61,6 +65,8 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
             raise ValueError("BC resume identity mismatch")
         if saved.get("regularization") != coefficients:
             raise ValueError("BC resume regularization mismatch")
+        if saved.get("data_contract") != data_contract:
+            raise ValueError("BC data-loading/shuffle contract changed; use a new run directory")
         params, state, epoch = saved["params"], saved["optimizer_state"], saved["epoch"]
     train_step, validation_step = make_steps(
         model, jnp.bfloat16 if args.compute_dtype == "bfloat16" else jnp.float32, optimizer, *coefficients
@@ -73,8 +79,8 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
 
     params, state = distributed(params), distributed(state)
     teacher = distributed(initial["state"]["params"])
-    training = ReplayDataset(args.cache, "train", processes, rank)
-    validation = ReplayDataset(args.cache, "validation", processes, rank)
+    training = ReplayDataset(args.cache, "train", processes, rank, window)
+    validation = ReplayDataset(args.cache, "validation", processes, rank, window)
     print(
         json.dumps(
             {
@@ -85,6 +91,7 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
                 "batch_per_gpu": batch_size,
                 "completed_epochs": epoch,
                 "regularization": coefficients,
+                "data_contract": data_contract,
             }
         ),
         flush=True,
@@ -94,17 +101,13 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
         started = time.monotonic()
         summary = {}
         for name, dataset, learning in (("train", training, True), ("validation", validation, False)):
-            indices = np.arange(dataset.size)
-            if learning:
-                np.random.default_rng(np.random.SeedSequence([args.seed, epoch, rank])).shuffle(indices)
+            rng = np.random.default_rng(np.random.SeedSequence([args.seed, epoch, rank])) if learning else None
             metrics = []
-            maximum_rows = int(np.max(multihost_utils.process_allgather(np.asarray(len(indices)))))
-            for offset in range(0, maximum_rows, batch_size):
-                selected = indices[offset : offset + batch_size]
-                batch = dataset.batch(selected if len(selected) else indices[:1], batch_size)
+            processed = 0
+            for step, (batch, count) in enumerate(dataset.batches(batch_size, rng)):
                 for key in ("unit_action", "market_action"):
-                    batch[key][len(selected) :] = IGNORE_LABEL
-                batch["sample_mask"] = (np.arange(batch_size) < len(selected)).astype(np.float32)
+                    batch[key][count:] = IGNORE_LABEL
+                batch["sample_mask"] = (np.arange(batch_size) < count).astype(np.float32)
                 batch = jax.tree.map(lambda value: value[None], batch)
                 if processes > 1:
                     batch = update.to_global(batch)
@@ -116,19 +119,22 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
                 if not np.isfinite(np.asarray(row["loss"])).all():
                     raise RuntimeError("nonfinite BC loss")
                 metrics.append(row)
-                if offset % (100 * batch_size) == 0:
+                if step % 100 == 0:
                     print(
                         json.dumps(
                             {
                                 "event": "batch",
                                 "epoch": epoch,
                                 "split": name,
-                                "rows": offset,
+                                "rows": processed,
                                 "loss": float(np.asarray(row["loss"]).item()),
                             }
                         ),
                         flush=True,
                     )
+                processed += count
+            if processed != dataset.size:
+                raise RuntimeError("BC epoch did not visit every replay row exactly once")
             summary[name] = aggregate(metrics)
         host_params = first_local_replica(params)
         boundary = {
@@ -142,6 +148,7 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
             "shuffle_seed": [args.seed, epoch],
             "model_config": model.to_dict(),
             "regularization": coefficients,
+            "data_contract": data_contract,
         }
         if rank == 0:
             atomic_pickle(latest, boundary)
@@ -169,6 +176,7 @@ def run_training(initial: Path, cache: Path, output: Path, config: dict) -> None
                 "entropy_coefficients": coefficients[:2],
                 "teacher_kl_coefficient": args.teacher_kl,
                 "teacher_kl_direction": "initial_teacher || student",
+                "data_contract": data_contract,
                 "teacher_policy_sha256": policy_hash(first_local_replica(teacher)),
             },
             indent=2,

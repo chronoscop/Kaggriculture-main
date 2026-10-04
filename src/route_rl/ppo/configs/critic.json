@@ -1,0 +1,19 @@
+{
+  "collection_backend": "rust-batch",
+  "action_selection_contract": "official-prefix-economic-full-action-ppo-v2",
+  "season_controller": null,
+  "games": 4,
+  "validation_games": 2,
+  "minibatch_size": 32,
+  "epochs": 1,
+  "compute_dtype": "bfloat16",
+  "seed": 51,
+  "environment_seed_start": 20000000,
+  "training_seed_limit": 29000000,
+  "validation_seed_start": 30000000,
+  "validation_seed_limit": 39000000,
+  "patience": 8,
+  "learning_rate": 0.0001,
+  "gamma": 1.0,
+  "gae_lambda": 0.97
+}

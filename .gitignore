@@ -19,3 +19,8 @@ third_party/kaggriculture-simulation/gauntlets/
 replay/
 native/target/
 kaggriculture-solution/
+native/action_engine/target/
+src/route_rl/ppo/_native/*.so
+src/route_rl/ppo/_native/build.json
+src/route_rl/season_search/*.so
+src/route_rl/season_search/*.build.json

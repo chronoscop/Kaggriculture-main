@@ -1,0 +1,379 @@
+{
+  "repository": "https://github.com/msdsm/kaggriculture-solution",
+  "revision": "84057a0fda4238ccdebc46f9bf5496c6c4b2e00d",
+  "reviewed_sources": [
+    {
+      "source": "python/kaggriculture/training/ppo.py",
+      "source_sha256": "a06168bf5151e25f04ff0eff3d7bb72b5d4d2225b83e1139ab8fba477e59ccfc",
+      "project_files": [
+        "src/route_rl/ppo/pipeline.py"
+      ],
+      "adaptation": "bounded self-play/update staging, frozen reference and separate candidate snapshots"
+    },
+    {
+      "source": "python/kaggriculture/training/objectives.py",
+      "source_sha256": "b91a231819a06a194f0fb15f5745fc102592e53389acefee6f2527641fd6a11a",
+      "project_files": [
+        "src/route_rl/ppo/objective.py",
+        "src/route_rl/ppo/trainer.py"
+      ],
+      "adaptation": "clipped policy ratio, full-distribution teacher KL, entropy, Huber critic, Adam and learning-rate schedule"
+    },
+    {
+      "source": "python/kaggriculture/training/rollout.py",
+      "source_sha256": "5359bc4307be23da43ce262d43c21d2549eeadeb6f9df12a0c632218db196cd8",
+      "project_files": [
+        "src/route_rl/ppo/rollout.py",
+        "src/route_rl/ppo/objective.py"
+      ],
+      "adaptation": "seat histories, fixed-shape collection and complete-game GAE"
+    },
+    {
+      "source": "python/kaggriculture/training/critic.py",
+      "source_sha256": "d9bdc4c8f28ef4ddfb3884e9b8cbfdb6663a54901ee69d2da4805b1a03e917f1",
+      "project_files": [
+        "src/route_rl/ppo/trainer.py",
+        "src/route_rl/ppo/pipeline.py"
+      ],
+      "adaptation": "freeze policy encoder and train only a separate value head during warmup"
+    },
+    {
+      "source": "python/kaggriculture/actions/masks.py",
+      "source_sha256": "b95dcecd125220b457279332dc2b6b87752b889d97010ef200abf82051a30d68",
+      "project_files": [
+        "src/route_rl/ppo/sampling.py"
+      ],
+      "adaptation": "observation-based valid action support"
+    },
+    {
+      "source": "python/kaggriculture/actions/sequential.py",
+      "source_sha256": "637c474d5343f51db8587cc0826101d15130b3db41559a2077e6762e1a390a70",
+      "project_files": [
+        "src/route_rl/ppo/sampling.py"
+      ],
+      "adaptation": "fixed-order conditional action support and actual selected probabilities"
+    },
+    {
+      "source": "python/kaggriculture/agents/neural.py",
+      "source_sha256": "e9ddeeb46c4e7d7e700da299d7e5dcb2234f7a2c61e1898b3cf502d8ce6c783a",
+      "project_files": [
+        "src/route_rl/ppo/inference.py"
+      ],
+      "adaptation": "checkpoint-aware fixed-shape inference; shared existing BC encoder/model"
+    },
+    {
+      "source": "scripts/package_submission.py",
+      "source_sha256": "6bf57fcf33c41452db7c361dcbf984ddbb4131f2bcf0e5b6346aed838cf6a8aa",
+      "project_files": [
+        "src/route_rl/packaging.py",
+        "tools/package_pipeline.py"
+      ],
+      "adaptation": "local source and candidate tar archive workflow with integrity inventory"
+    },
+    {
+      "source": "scripts/export_policy.py",
+      "source_sha256": "e2ff5313d262ab3ad60aa842ad85fcb5f53cd7f5e795dd7b24ab9199952512f2",
+      "project_files": [
+        "src/route_rl/packaging.py"
+      ],
+      "adaptation": "inference-only policy export idea; own checkpoint validation"
+    },
+    {
+      "source": "configs/ppo.json",
+      "source_sha256": "c82379db4d10d6ec6e5771b06a1069f2766df515d34b654f194fc13c3e9b6f99",
+      "project_files": [
+        "src/route_rl/ppo/configs/ppo.json"
+      ],
+      "adaptation": "initial clipping, frozen teacher, entropy, learning rate and GAE defaults"
+    },
+    {
+      "source": "python/kaggriculture/search/search_policy.py",
+      "source_sha256": "3bfe62832922b6cc72c4cd2c7a1196d102fd231dbe8c9f5a6f39385cc556f7cf",
+      "project_files": [
+        "src/route_rl/season_search/search_policy.py"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/search_config.json",
+      "source_sha256": "855051fdb464ca578ddc3fa74be7b7dcce0a1b2cba3b9f18505cfffeb2ae8bee",
+      "project_files": [
+        "src/route_rl/season_search/search_config.json"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/terminal_search.cpp",
+      "source_sha256": "1f9ee8eb769577d9c907af0b2e8ca7676e42dd71003dc2c38b3968246ba363ad",
+      "project_files": [
+        "src/route_rl/season_search/terminal_search.cpp"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/reference_engine.py",
+      "source_sha256": "19d4c8107ea696deb5df0a36c086711e0c1edf1fbb3863ffe725e9d47a66ca90",
+      "project_files": [
+        "src/route_rl/season_search/reference_engine.py"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/inventory_tracker.py",
+      "source_sha256": "d7ec266085717ea1537b794579bbf450fbacdfaf40b512a4e488d6c93cd7ded5",
+      "project_files": [
+        "src/route_rl/season_search/inventory_tracker.py"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/tracker_constants.py",
+      "source_sha256": "1a0b9c9138f3642e8e098e837ecfdb1a83af98fa859b71fab253541d0b94a9db",
+      "project_files": [
+        "src/route_rl/season_search/tracker_constants.py"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/future_methods.inc",
+      "source_sha256": "ed7f345b74c0521e4700ce851ee8e8d975d51bb47512e821b59ebdea32a38a62",
+      "project_files": [
+        "src/route_rl/season_search/future_methods.inc"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/market_timeline.inc",
+      "source_sha256": "cf17fa4fb8392847668e1e39394e64c3abe20bfc1002f2fc7966d3fd377ba798",
+      "project_files": [
+        "src/route_rl/season_search/market_timeline.inc"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/preparation_methods.inc",
+      "source_sha256": "c239b30d8d35eb9026db8586989545ba9ae3b0415eb3d7037cd19b5efec283e0",
+      "project_files": [
+        "src/route_rl/season_search/preparation_methods.inc"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/search_methods.inc",
+      "source_sha256": "9474b9f24deb405fbeb857639257babda9839d3d240beb45f449037cca0e6c1c",
+      "project_files": [
+        "src/route_rl/season_search/search_methods.inc"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/storage_methods.inc",
+      "source_sha256": "79f52459089d9d4dda4a6139f84a5c27fcad3afef35093eedac6456a8b6b475a",
+      "project_files": [
+        "src/route_rl/season_search/storage_methods.inc"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/search/LICENSE.kaggle-environments",
+      "source_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "project_files": [
+        "src/route_rl/season_search/LICENSE.kaggle-environments"
+      ],
+      "adaptation": "Owned namespace; official public observations only; terminal-margin forecast converted to explicit expected win/draw/loss score; versioned native ABI and binary provenance"
+    },
+    {
+      "source": "python/kaggriculture/heuristics/handoff.py",
+      "source_sha256": "dee6b3842534105689f5dac587431c2bdf3ff1891ad02bbe932e775d2ca9f526",
+      "project_files": [
+        "src/route_rl/ppo/controllers.py"
+      ],
+      "adaptation": "Final-day bounded handoff with continuous existing observer memory, explicit neural fallback and a separate candidate contract"
+    },
+    {
+      "source": "scripts/build_search.py",
+      "source_sha256": "dcbb590f43d5aa42046c543aafc547d5324c1334f6224d3af92f39d39e3cdad8",
+      "project_files": [
+        "tools/build_season_search.py"
+      ],
+      "adaptation": "Local C++17 compilation with source/compiler/binary receipt; no runtime compilation"
+    },
+    {
+      "source": "scripts/collect_search_replays.py",
+      "source_sha256": "36f168848185ea63c85202bdd2278f23b71a5b1de2f47f2f97de6d0acf81c82c",
+      "project_files": [
+        "src/route_rl/action_teacher.py"
+      ],
+      "adaptation": "Actionable seed/failed-replay scenario selection, full official games, actual executed request records, whole-seed holdouts and immutable BC-compatible mixed indexes"
+    },
+    {
+      "source": "native/engine/Cargo.lock",
+      "source_sha256": "ae31d72783dc46363e5a8f840601ed36593e2764f56a2477c66157f591f72bae",
+      "project_files": [
+        "native/action_engine/Cargo.lock"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/Cargo.toml",
+      "source_sha256": "d09a6520c0a6e2308bcc58dded1c770ebdd94dbb77b57d38ea73d326ee466068",
+      "project_files": [
+        "native/action_engine/Cargo.toml"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/pyproject.toml",
+      "source_sha256": "89370a008d80646cba66f6264087f53839accb02a69509b0894638922dba8bae",
+      "project_files": [
+        "native/action_engine/pyproject.toml"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/catalog.rs",
+      "source_sha256": "4b8b0f2e184993a90f85728eeeb76ccb2b6269103b0bd92c807a05008b32d4a4",
+      "project_files": [
+        "native/action_engine/src/catalog.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/engine.rs",
+      "source_sha256": "66e97264c372b761e67d51ef46d5a3b707fe0111bd1e723e3198b5bf09646cdf",
+      "project_files": [
+        "native/action_engine/src/engine.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/exp28_features.rs",
+      "source_sha256": "1374866e7571fac1aaa7a404d5cd5dbc6e8bf84edb0c686de3782186416860a7",
+      "project_files": [
+        "native/action_engine/src/exp28_features.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/features.rs",
+      "source_sha256": "383bc3362060f8a50e16dd8d3c27fbee46f8e9c9d29b4088c2bd8c14ffb1e713",
+      "project_files": [
+        "native/action_engine/src/features.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/fixed_tape_features.rs",
+      "source_sha256": "58d652dcb8854f1f665e2180afaefeda1aa608875797016a242af87dec52af7f",
+      "project_files": [
+        "native/action_engine/src/fixed_tape_features.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/legal_mask_tests.rs",
+      "source_sha256": "e1543000734519d0bb689ea1eb5cefccfee5b1dd1a0f83c3df60d10ac37fe914",
+      "project_files": [
+        "native/action_engine/src/legal_mask_tests.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/legal_masks.rs",
+      "source_sha256": "50cde1a53cd0b6e1477e1cc79fdc6b27d9d598caa192bc3773640669b2e003f5",
+      "project_files": [
+        "native/action_engine/src/legal_masks.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/lib.rs",
+      "source_sha256": "8e34386471302c5773b89cc013a8ac869cbcdd42e92eec5451fb06eb894464a3",
+      "project_files": [
+        "native/action_engine/src/lib.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/patch_masks.rs",
+      "source_sha256": "646d55308a017f7e01904ab7bd55195354687248424c12a4b75fc5ffbd78c633",
+      "project_files": [
+        "native/action_engine/src/patch_masks.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/patch_sales.rs",
+      "source_sha256": "5b94bf3df682525a197fe1e77146f6be79009962c94c232e8e561a33db9eb9b4",
+      "project_files": [
+        "native/action_engine/src/patch_sales.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/py_api.rs",
+      "source_sha256": "39d2e6671f2b35021f8919826a4f330fc5be50f59bc135742dfa11cdf953e7bb",
+      "project_files": [
+        "native/action_engine/src/py_api.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/py_random.rs",
+      "source_sha256": "68ad3a91a1d576758ea529239ff6c241948c532418b801e7bbf6929368b48b3a",
+      "project_files": [
+        "native/action_engine/src/py_random.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/state.rs",
+      "source_sha256": "9f72529cf2538fe9f8370d8cc9d1de46760047d87d79a8167ec20277c491b834",
+      "project_files": [
+        "native/action_engine/src/state.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    },
+    {
+      "source": "native/engine/src/tracker.rs",
+      "source_sha256": "db827462a731ec9e0bdd9602e19609e237e1ade953c75674511f6230dab602f8",
+      "project_files": [
+        "native/action_engine/src/tracker.rs"
+      ],
+      "adaptation": "Owned module namespace, batched simulation/features/public tracker; project prefix supports and exact request execution are additional code."
+    }
+  ],
+  "license_observation": {
+    "repository_wide_license_file_present": false,
+    "notice_file": "THIRD_PARTY_NOTICES.md",
+    "original_code_relicensed_by_this_project": false
+  },
+  "runtime_package": "route_rl.ppo",
+  "runtime_reference_checkout_required": false,
+  "policy_contract": "route-rl-full-action-policy-v1",
+  "action_selection_contract": "official-prefix-economic-full-action-ppo-v2",
+  "supported_action_selection_contracts": [
+    "official-prefix-full-action-ppo-v1",
+    "official-prefix-economic-full-action-ppo-v2"
+  ],
+  "learning_objective_contract": "terminal-match-score-1-0.5-0-v1",
+  "bc_shared_components": "docs/action_bc_sources.json",
+  "not_imported": [
+    "reference cash-based rewards and cash-margin learning targets",
+    "Final A confidence-ordered post-sampling action repair and automatic seed purchase",
+    "Net2Net model depth growth",
+    "multi-host/distributed custom kernels",
+    "adaptive entropy/purchase/land auxiliary controllers"
+  ],
+  "owned_additions": [
+    "native/action_engine/src/owned_prefix.rs",
+    "src/route_rl/ppo/native_backend.py",
+    "src/route_rl/ppo/economic_rules.py",
+    "src/route_rl/ppo/execution.py",
+    "src/route_rl/ppo/candidate.py",
+    "src/route_rl/ppo/controllers.py",
+    "src/route_rl/action_teacher.py",
+    "tools/build_action_native.py",
+    "tools/build_season_search.py"
+  ]
+}

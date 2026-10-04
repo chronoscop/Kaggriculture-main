@@ -1,0 +1,22 @@
+[package]
+name = "route-rl-action-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[lib]
+name = "route_rl_action_engine"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python = ["dep:numpy", "dep:pyo3"]
+
+[dependencies]
+pyo3 = { version = "0.23", optional = true, features = ["abi3-py310", "extension-module"] }
+numpy = { version = "0.23", optional = true }
+rayon = "1.10"
+half = "2.6"
+
+[profile.release]
+lto = true

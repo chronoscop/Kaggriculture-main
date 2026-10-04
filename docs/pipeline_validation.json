@@ -1,0 +1,78 @@
+{
+  "kind": "implementation-validation-only",
+  "pipeline": "route-rl-full-action-ppo-v2",
+  "release": "0.7.0",
+  "bc_source": {
+    "implementation": "route_rl.full_action",
+    "reference_checkout_required": false,
+    "files_sha256": "c090cee471be20087a7cce570bd7ea5214379f8074f84cebb0451f4fd9425f63"
+  },
+  "ppo_source": {
+    "implementation": "route_rl.ppo",
+    "reference_checkout_required": false,
+    "files_sha256": "f79be5e8604896a8a8c9ab4a1fe1e3f6a0def5908a7b91bee09136c2415dd37a"
+  },
+  "objective": "terminal-match-score-1-0.5-0-v1",
+  "runtime_reference_checkout_required": false,
+  "dependencies": {
+    "jax": "0.11.1",
+    "numpy": "2.5.3",
+    "optax": "0.2.8",
+    "kaggle-environments": "1.32.7"
+  },
+  "tests": {
+    "unique_current_python_tests": 100,
+    "bc_regressions": 27,
+    "ppo_integration_and_execution": 62,
+    "season_search_teacher_and_combine": 5,
+    "packaging": 6,
+    "rust_engine_and_feature_tests": 22,
+    "all_listed_checks_passed": true,
+    "device": "cpu; CUDA disabled"
+  },
+  "collection": {
+    "backend": "rust-batch",
+    "contract": "owned-rust-batch-collection-v1",
+    "resolver_version": "1.32.7",
+    "module": "route_rl_action_engine",
+    "execution_base": "official-prefix-full-action-ppo-v1",
+    "source_sha256": "0a89d42b68eefc5e03acbea679ca3533a2c47c98a9115c68ee336f9c23570e15",
+    "binary_sha256": "bbd040a135c4b29851ff06eaaa993c0a1135ccd81e260bf9a81d56e07b0edf08"
+  },
+  "season_controller": {
+    "contract": "owned-final-day-search-expected-score-v1",
+    "objective": "public-margin-logistic-expected-terminal-score-v1",
+    "config": {
+      "start_day": 29,
+      "search_seconds": 0.25,
+      "min_overage": 10.0,
+      "reserve_seconds": 3.0,
+      "uncertainty_scale": 2000.0,
+      "objective": "public-margin-logistic-expected-terminal-score-v1",
+      "fallback": "neural"
+    },
+    "binary_sha256": "0ddf32c9719ae11a64a178c2283e3b249879598b7fb5d3f447c727d5c39f72da",
+    "source_sha256": "fd08dd554c9c8c48368a93ed15ae44368fb5838e42777f190ca63a26ec7881a1",
+    "config_sha256": "974df783ba22c85fed2545046473e5742874a22101c0ef10f60ec6f9bf41cf02"
+  },
+  "complete_official_game_check": {
+    "recorded_steps": 720,
+    "transitions_per_seat": 719,
+    "both_seats": "DONE",
+    "scope": "full-season productive teacher tape differential, synchronous multi-game native collector, forced rule support, actual final-day handoff and isolated packaged execution"
+  },
+  "source_only_native_rebuild": "passed in isolated /tmp with only owned crate/build tool and offline Cargo",
+  "wheel_validation": {
+    "platform": "CPython 3.12 / Linux x86_64",
+    "native_assets_included": true,
+    "isolated_load_and_features": "passed"
+  },
+  "formal_ppo_training_started": false,
+  "formal_teacher_generation_started": false,
+  "competition_policy_weights_in_source_release": false,
+  "economic_improvement_evidence": false,
+  "search_expected_score_model": "uncalibrated public-margin logistic mapping; fixed-scale monotonic ranking",
+  "target_competition_container_dependencies_and_large_model_timing": "not validated",
+  "candidate_deployment": "manual review after paired independent confirmation",
+  "collection_throughput_diagnostics": "complete collection seconds and seat env-steps/sec, including setup/JIT; no performance comparison"
+}
