@@ -7,6 +7,7 @@ Matplotlib is needed only to regenerate the documentation figures.
 from __future__ import annotations
 
 import argparse
+import io
 from pathlib import Path
 
 import matplotlib
@@ -63,7 +64,7 @@ def arrow(ax, start, end, *, label=None, curve=0, color="#6b7889", dashed=False)
 
 def overview():
     fig, ax = canvas("From public replays to a reviewed candidate",
-                     "Owned pipeline v0.7.0 | Training objective: terminal win / draw / loss = 1 / 0.5 / 0",
+                     "Project pipeline | Training objective: terminal win / draw / loss = 1 / 0.5 / 0",
                      height=10)
     xs = [.5, 4.3, 8.1, 11.9]
     cards = [
@@ -101,7 +102,7 @@ def overview():
 
 def architecture():
     fig, ax = canvas("Shared entity Transformer: actor + critic",
-                     "Current bootstrap: 6 blocks, width 256 | Optional 10m preset: 12 blocks, same width",
+                     "Bootstrap preset: 6 blocks, width 256 | Optional 10m preset: 12 blocks, same width",
                      height=11)
     box(ax, .45, 7.65, 4.0, 2.05, "A  Public observation + history",
         "Own / opponent board and units\nPublic market, clock and money\nRule-based inventory tracker\nNo private opponent inventory", color="data")
@@ -172,7 +173,14 @@ def main():
     for name, make in [("training_pipeline", overview), ("model_architecture", architecture),
                        ("ppo_execution", rollout)]:
         fig = make()
-        fig.savefig(args.out_dir / f"{name}.svg", metadata={"Date": None})
+        destination = args.out_dir / f"{name}.svg"
+        buffer = io.StringIO()
+        fig.savefig(buffer, format="svg", metadata={"Date": None})
+        normalize = lambda value: "\n".join(line.rstrip() for line in value.splitlines()) + "\n"
+        rendered = normalize(buffer.getvalue())
+        # Preserve unchanged figures and keep changed SVGs free of line-end spaces.
+        if not destination.exists() or normalize(destination.read_text()) != rendered:
+            destination.write_text(rendered)
         if args.preview_dir:
             fig.savefig(args.preview_dir / f"{name}.png", dpi=110)
         plt.close(fig)

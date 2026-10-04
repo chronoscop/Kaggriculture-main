@@ -1,6 +1,6 @@
 # 完整动作 BC 指南
 
-BC 主流程已实现：公开回放 → 教师座位索引 → 特征/标签缓存 → JAX 训练 → 留出验证 → 官方环境完整对局评估。安装与连续运行命令见 [README](../README.md#bc-复现步骤)。本指南补充数据契约、资源要求、续训和故障处理。
+BC 主流程已实现：公开回放 → 教师座位索引 → 特征/标签缓存 → JAX 训练 → 留出验证 → 官方环境完整对局评估。安装与连续运行命令见 [README](../README.md#bc下载准备训练与评估)。本指南补充数据契约、资源要求、续训和故障处理。
 
 实现位于 `src/route_rl/action_bc.py`、`replay_download.py`、`replay_prepare.py` 与 `full_action/`，不需要 `kaggriculture-solution/` 参考目录。critic 拟合、自博弈、PPO 更新和策略打包由独立的 `route_rl.ppo` / `route_rl.packaging` 提供，见 [PPO 指南](action_ppo_pipeline.md)；当前 BC 行为与指纹保持原定义，候选不自动部署。代码来源见 [来源记录](action_bc_sources.md)。
 
@@ -162,4 +162,4 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m route_rl.action_bc train \
 
 本文使用系统 `python`。排查时确认命令运行在仓库根目录，`PYTHONPATH=src`，且当前解释器已安装 BC 依赖；另开终端评估时也应保留这些设置。
 
-BC 完成后的 PPO 使用本项目独立入口：固定 BC actor/主干拟合 critic → 当前策略双座位自博弈及真实合法采样概率 → PPO 更新与固定 BC KL → 训练外配对初筛与独立确认。命令见 [README](../README.md#bc-完成后critic--ppo)，执行语义与来源见 [PPO 指南](action_ppo_pipeline.md)。不要把 PPO 策略交给旧 BC greedy 评估入口；两者的 execution contract 不同。
+BC 完成后的 PPO 使用本项目独立入口：固定 BC actor/主干拟合 critic → 当前策略双座位自博弈及真实合法采样概率 → PPO 更新与固定 BC KL → 训练外配对初筛与独立确认。命令见 [README](../README.md#critic-与-ppo)，执行语义与来源见 [PPO 指南](action_ppo_pipeline.md)。不要把 PPO 策略交给旧 BC greedy 评估入口；两者的 execution contract 不同。
